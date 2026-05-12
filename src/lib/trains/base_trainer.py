@@ -21,6 +21,8 @@ class ModleWithLoss(torch.nn.Module):
 
         # 根据网络输出和ground truth计算loss
         loss, loss_stats = self.loss.forward(outputs=outputs, batch=batch)
+        loss_stats = {k: v.unsqueeze(0) if isinstance(v, torch.Tensor) and v.dim() == 0 else v
+                      for k, v in loss_stats.items()}
 
         return outputs[-1], loss.unsqueeze(0), loss_stats
 
