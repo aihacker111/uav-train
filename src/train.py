@@ -5,7 +5,7 @@ from __future__ import print_function
 import os
 
 import numpy as np
-os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+os.environ['CUDA_DEVICE_ORDER'] = '0,1'
 import torch
 import random
 # my_devs = '0,1'
