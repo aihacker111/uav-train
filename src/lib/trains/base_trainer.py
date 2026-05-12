@@ -22,7 +22,7 @@ class ModleWithLoss(torch.nn.Module):
         # 根据网络输出和ground truth计算loss
         loss, loss_stats = self.loss.forward(outputs=outputs, batch=batch)
 
-        return outputs[-1], loss, loss_stats
+        return outputs[-1], loss.unsqueeze(0), loss_stats
 
 
 class BaseTrainer(object):
