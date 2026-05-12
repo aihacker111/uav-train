@@ -6,6 +6,7 @@ import time
 import torch
 from progress.bar import Bar
 from lib.utils.utils import AverageMeter
+from lib.models.data_parallel import DataParallel
 
 
 class ModleWithLoss(torch.nn.Module):
