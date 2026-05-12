@@ -34,7 +34,7 @@ def load_lwdetr_backbone(model, ckpt_path):
     Checkpoint format: {'model': {'backbone.0.encoder.*': tensor, ...}}
     Only encoder weights are loaded; projector and transformer are discarded.
     """
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     src = checkpoint.get('model', checkpoint)
 
     prefix = 'backbone.0.encoder.'
@@ -52,7 +52,7 @@ def load_lwdetr_backbone(model, ckpt_path):
 
 def load_model(model, model_path, optimizer=None, resume=False, lr=None, lr_step=None):
     start_epoch = 0
-    checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)
+    checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage, weights_only=False)
     if 'epoch' in checkpoint:
         print('loaded {}, epoch {}'.format(model_path, checkpoint['epoch']))
 
