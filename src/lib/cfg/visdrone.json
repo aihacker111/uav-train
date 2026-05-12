@@ -1,0 +1,13 @@
+{
+    "root": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019",
+    "train": {
+        "visdrone_train": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.train",
+        "visdrone_val":   "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.val"
+    },
+    "test_emb": {
+        "visdrone": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.train"
+    },
+    "test": {
+        "visdrone": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.train"
+    }
+}
