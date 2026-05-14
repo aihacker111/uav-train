@@ -11,7 +11,7 @@ class opts(object):
         self.parser = argparse.ArgumentParser()
 
         # basic experiment setting
-        self.parser.add_argument('--task', default='mot', help='mot')
+        self.parser.add_argument('--task', default='mot', help='mot | hybrid')
         self.parser.add_argument('--dataset', default='jde', help='jde')
         self.parser.add_argument('--exp_id', default='default')
         self.parser.add_argument('--test', action='store_true')
@@ -62,7 +62,8 @@ class opts(object):
         self.parser.add_argument('--arch',
                                  default='lwdetr_tiny',
                                  help='model architecture. Currently supported: '
-                                      'lwdetr_tiny | lwdetr_small | lwdetr_base')
+                                      'lwdetr_tiny | lwdetr_small | lwdetr_base | '
+                                      'hybrid_tiny | hybrid_small | hybrid_base')
         self.parser.add_argument('--head_conv',
                                  type=int,
                                  default=-1,
@@ -75,8 +76,8 @@ class opts(object):
                                  help='LR multiplier for ViT backbone (relative to head LR).')
         self.parser.add_argument('--freeze_backbone_epochs',
                                  type=int,
-                                 default=5,
-                                 help='Number of epochs to freeze ViT backbone before fine-tuning.')
+                                 default=0,
+                                 help='Number of epochs to freeze ViT backbone before fine-tuning. 0 = no freeze.')
         self.parser.add_argument('--backbone_weights',
                                  type=str,
                                  default='',
@@ -219,6 +220,16 @@ class opts(object):
         self.parser.add_argument('--data_dir',
                                  type=str,
                                  default='/media/jianbo/ioe/UAVdata')
+
+        # hybrid model loss weights
+        self.parser.add_argument('--bbox_weight', type=float, default=5.0,
+                                 help='DETR L1 box loss weight (hybrid task).')
+        self.parser.add_argument('--giou_weight', type=float, default=2.0,
+                                 help='DETR GIoU loss weight (hybrid task).')
+        self.parser.add_argument('--stage1_weight', type=float, default=1.0,
+                                 help='Weight for CenterNet stage-1 loss (hybrid task).')
+        self.parser.add_argument('--stage2_weight', type=float, default=1.0,
+                                 help='Weight for DETR stage-2 loss (hybrid task).')
 
         # loss
         self.parser.add_argument('--mse_loss',  # default: false
@@ -379,25 +390,21 @@ class opts(object):
         if opt.task == 'mot':
             opt.heads = {'hm': opt.num_classes,
                          'wh': 2 if not opt.cat_spec_wh else 2 * opt.num_classes,
-                         'id': opt.reid_dim
-                             }
-            # opt.heads = {'hm': opt.num_classes,
-            #              'wh': 2 if not opt.cat_spec_wh else 2 * opt.num_classes,
-            #              'id': opt.reid_dim
-            #                  }
-
-
+                         'id': opt.reid_dim}
             if opt.reg_offset:
                 opt.heads.update({'reg': 2})
+            if opt.id_weight > 0:
+                opt.nID_dict = dataset.nID_dict
 
-            # opt.nID = dataset.nID
-
-            # 用nID_dict取代nID
+        elif opt.task == 'hybrid':
+            # HybridCenterNetDETR builds its own heads from HybridModelConfig;
+            # heads dict is unused but populated to keep the pipeline uniform.
+            opt.heads = {}
             if opt.id_weight > 0:
                 opt.nID_dict = dataset.nID_dict
 
         else:
-            assert 0, 'task not defined!'
+            raise ValueError(f'Unknown task: {opt.task!r}. Supported: mot | hybrid')
 
         print('heads: ', opt.heads)
         return opt
@@ -405,15 +412,19 @@ class opts(object):
     def init(self, args=''):
         opt = self.parse(args)
 
-        use_imagenet_norm = 'lwdetr' in opt.arch
+        use_imagenet_norm = 'lwdetr' in opt.arch or 'hybrid' in opt.arch
+        _common = {
+            'default_input_wh': [opt.input_wh[1], opt.input_wh[0]],
+            'num_classes': len(opt.reid_cls_ids.split(',')),
+            'mean': [0.485, 0.456, 0.406] if use_imagenet_norm else [0.408, 0.447, 0.470],
+            'std':  [0.229, 0.224, 0.225] if use_imagenet_norm else [0.289, 0.274, 0.278],
+            'dataset': 'jde',
+            'nID': 14455,
+            'nID_dict': {},
+        }
         default_dataset_info = {
-            'mot': {'default_input_wh': [opt.input_wh[1], opt.input_wh[0]],  # [608, 1088], [320, 640]
-                    'num_classes': len(opt.reid_cls_ids.split(',')),  # 1
-                    'mean': [0.485, 0.456, 0.406] if use_imagenet_norm else [0.408, 0.447, 0.470],
-                    'std': [0.229, 0.224, 0.225] if use_imagenet_norm else [0.289, 0.274, 0.278],
-                    'dataset': 'jde',
-                    'nID': 14455,
-                    'nID_dict': {}},
+            'mot':    _common,
+            'hybrid': _common,
         }
 
         class Struct:

@@ -52,8 +52,12 @@ class LoadImages:
                                                        1].lower() in image_format, self.files))
             elif os.path.isfile(path):
                 self.files = [path]
+            else:
+                raise FileNotFoundError(f'[LoadImages] Path not found: {path}')
         elif type(path) == list:
             self.files = path
+        else:
+            self.files = []
 
         self.nF = len(self.files)  # number of image files
         self.width = img_size[0]
@@ -175,13 +179,8 @@ class LoadImagesAndLabels:  # for training
                  path,
                  img_size=(1088, 608),
                  augment=False,
-                 transforms=None):
-        """
-        :param path:
-        :param img_size:
-        :param augment:
-        :param transforms:
-        """
+                 transforms=None,
+                 pil_transform=None):
         with open(path, 'r') as file:
             self.img_files = file.readlines()
             self.img_files = [x.replace('\n', '') for x in self.img_files]
@@ -199,6 +198,7 @@ class LoadImagesAndLabels:  # for training
 
         self.augment = augment
         self.transforms = transforms
+        self.pil_transform = pil_transform  # PIL-based pre-letterbox transforms
 
     def __getitem__(self, files_index):
         img_path = self.img_files[files_index]
@@ -206,103 +206,117 @@ class LoadImagesAndLabels:  # for training
         return self.get_data(img_path, label_path)
 
     def get_data(self, img_path, label_path, width=None, height=None):
-        """
-        图像数据格式转换, 增强; 标签格式化
-        :param img_path:
-        :param label_path:
-        :param height:
-        :param width:
-        :return:
-        """
-        # 输入网络的图像分辨率
         if height is None or width is None:
             height = self.height
             width = self.width
 
-        # 读取图片数据为numpy array格式, 3通道顺序为BGR
-        img = cv2.imread(img_path)  # cv(numpy): BGR
+        img = cv2.imread(img_path)  # BGR
         if img is None:
             raise ValueError('File corrupt {}'.format(img_path))
 
-        augment_hsv = True
-        if self.augment and augment_hsv:
-            # SV augmentation by 50%
+        # Load labels early — needed before PIL transforms
+        if os.path.isfile(label_path):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                labels_0 = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 6)
+        else:
+            labels_0 = np.zeros((0, 6), dtype=np.float32)
+
+        # HSV saturation/value jitter
+        if self.augment:
             fraction = 0.50
             img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
             S = img_hsv[:, :, 1].astype(np.float32)
             V = img_hsv[:, :, 2].astype(np.float32)
-
             a = (random.random() * 2 - 1) * fraction + 1
             S *= a
             if a > 1:
                 np.clip(S, a_min=0, a_max=255, out=S)
-
             a = (random.random() * 2 - 1) * fraction + 1
             V *= a
             if a > 1:
                 np.clip(V, a_min=0, a_max=255, out=V)
-
             img_hsv[:, :, 1] = S.astype(np.uint8)
             img_hsv[:, :, 2] = V.astype(np.uint8)
             cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
 
-        h, w, _ = img.shape
-        img, ratio, pad_w, pad_h = letterbox(img, height=height, width=width)  # resizing and padding
+        # PIL-based spatial augmentations (pre-letterbox, on original resolution)
+        if self.augment and self.pil_transform is not None:
+            import PIL.Image
+            h0, w0 = img.shape[:2]
+            img_pil = PIL.Image.fromarray(img[:, :, ::-1])  # BGR → RGB PIL
 
-        # Load labels
-        if os.path.isfile(label_path):
-            with warnings.catch_warnings():  # No warnings for empty label file(txt)
-                warnings.simplefilter("ignore")
-                labels_0 = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 6)
+            if len(labels_0) > 0:
+                boxes_xyxy = np.stack([
+                    w0 * (labels_0[:, 2] - labels_0[:, 4] / 2),
+                    h0 * (labels_0[:, 3] - labels_0[:, 5] / 2),
+                    w0 * (labels_0[:, 2] + labels_0[:, 4] / 2),
+                    h0 * (labels_0[:, 3] + labels_0[:, 5] / 2),
+                ], axis=1).astype(np.float32)
+                target = {
+                    'boxes': torch.tensor(boxes_xyxy),
+                    'labels': torch.tensor(labels_0[:, :2]),  # cls_id, track_id
+                    'size': torch.tensor([h0, w0]),
+                }
+            else:
+                target = {
+                    'boxes': torch.zeros((0, 4), dtype=torch.float32),
+                    'labels': torch.zeros((0, 2), dtype=torch.float32),
+                    'size': torch.tensor([h0, w0]),
+                }
 
-                # reformat xywh to pixel xyxy(x1, y1, x2, y2) format
-                labels = labels_0.copy()  # deep copy
-                labels[:, 2] = ratio * w * (labels_0[:, 2] - labels_0[:, 4] / 2) + pad_w  # x1
-                labels[:, 3] = ratio * h * (labels_0[:, 3] - labels_0[:, 5] / 2) + pad_h  # y1
-                labels[:, 4] = ratio * w * (labels_0[:, 2] + labels_0[:, 4] / 2) + pad_w  # x2
-                labels[:, 5] = ratio * h * (labels_0[:, 3] + labels_0[:, 5] / 2) + pad_h  # y2
+            img_pil, target = self.pil_transform(img_pil, target)
+            img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+            h0, w0 = img.shape[:2]
+
+            if len(target['boxes']) > 0:
+                boxes = target['boxes'].numpy()
+                cls_trk = target['labels'].numpy()
+                labels_0 = np.zeros((len(boxes), 6), dtype=np.float32)
+                labels_0[:, :2] = cls_trk
+                labels_0[:, 2] = (boxes[:, 0] + boxes[:, 2]) / 2.0 / w0   # cx norm
+                labels_0[:, 3] = (boxes[:, 1] + boxes[:, 3]) / 2.0 / h0   # cy norm
+                labels_0[:, 4] = (boxes[:, 2] - boxes[:, 0]) / w0          # w norm
+                labels_0[:, 5] = (boxes[:, 3] - boxes[:, 1]) / h0          # h norm
+            else:
+                labels_0 = np.zeros((0, 6), dtype=np.float32)
+
+        h, w = img.shape[:2]
+        img, ratio, pad_w, pad_h = letterbox(img, height=height, width=width)
+
+        # Convert labels to pixel xyxy relative to letterboxed image
+        if len(labels_0) > 0:
+            labels = labels_0.copy()
+            labels[:, 2] = ratio * w * (labels_0[:, 2] - labels_0[:, 4] / 2) + pad_w  # x1
+            labels[:, 3] = ratio * h * (labels_0[:, 3] - labels_0[:, 5] / 2) + pad_h  # y1
+            labels[:, 4] = ratio * w * (labels_0[:, 2] + labels_0[:, 4] / 2) + pad_w  # x2
+            labels[:, 5] = ratio * h * (labels_0[:, 3] + labels_0[:, 5] / 2) + pad_h  # y2
         else:
             labels = np.array([])
 
-        # Augment image and labels
+        # Random affine (rotation, scale, translate) on fixed-size image
         if self.augment:
             img, labels, M = random_affine(img, labels,
                                            degrees=(-5, 5),
                                            translate=(0.10, 0.10),
                                            scale=(0.50, 1.20))
 
-        plot_flag = False
-        if plot_flag:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(50, 50))
-            plt.imshow(img[:, :, ::-1])
-            plt.plot(labels[:, [2, 4, 4, 2, 2]].T,
-                     labels[:, [3, 3, 5, 5, 3]].T, '.-')
-            plt.axis('off')
-            plt.savefig('test.jpg')
-            time.sleep(10)
-
         num_labels = len(labels)
         if num_labels > 0:
-            # convert xyxy to xywh(center_x, center_y, b_w, b_h)
             labels[:, 2:6] = xyxy2xywh(labels[:, 2:6].copy())
-
-            # normalize to 0~1
             labels[:, 2] /= width
             labels[:, 3] /= height
             labels[:, 4] /= width
             labels[:, 5] /= height
-        if self.augment:
-            # random left-right flip
-            lr_flip = True
-            if lr_flip & (random.random() > 0.5):
+
+        # Horizontal flip only when NOT using pil_transform (which already includes it)
+        if self.augment and self.pil_transform is None:
+            if random.random() > 0.5:
                 img = np.fliplr(img)
                 if num_labels > 0:
                     labels[:, 2] = 1 - labels[:, 2]
 
-        img = np.ascontiguousarray(img[:, :, ::-1])  # BGR to RGB
+        img = np.ascontiguousarray(img[:, :, ::-1])  # BGR → RGB
 
         if self.transforms is not None:
             img = self.transforms(img)
@@ -464,15 +478,8 @@ class JointDataset(LoadImagesAndLabels):  # for training
                  paths,
                  img_size=(1088, 608),
                  augment=False,
-                 transforms=None):
-        """
-        :param opt:
-        :param root:
-        :param paths:
-        :param img_size:
-        :param augment:
-        :param transforms:
-        """
+                 transforms=None,
+                 pil_transform=None):
         self.opt = opt
         # dataset_names = paths.keys()
         self.img_files = OrderedDict()
@@ -545,12 +552,13 @@ class JointDataset(LoadImagesAndLabels):  # for training
             for k, v in last_idx_dict.items():
                 self.nID_dict[k] = int(v)  # 每个类别的tack ids数量
 
-        self.nds = [len(x) for x in self.img_files.values()]  # 每个子训练集(MOT15, MOT20...)的图片数
-        self.cds = [sum(self.nds[:i]) for i in range(len(self.nds))]  # 当前子数据集前面累计图片总数?
-        self.nF = sum(self.nds)  # 用于训练的所有子训练集的图片总数
-        self.max_objs = opt.K  # 每张图最多检测跟踪的目标个数
+        self.nds = [len(x) for x in self.img_files.values()]
+        self.cds = [sum(self.nds[:i]) for i in range(len(self.nds))]
+        self.nF = sum(self.nds)
+        self.max_objs = opt.K
         self.augment = augment
         self.transforms = transforms
+        self.pil_transform = pil_transform
 
         print('dataset summary')
         print(self.tid_num)
@@ -597,6 +605,16 @@ class JointDataset(LoadImagesAndLabels):  # for training
 
         # 图片中实际标注的目标数
         num_objs = labels.shape[0]
+
+        # --- DETR-format targets (normalized cxcywh, kept before feature-map scaling)
+        _is_hybrid = getattr(self.opt, 'task', '') == 'hybrid'
+        if _is_hybrid:
+            if num_objs > 0:
+                _detr_boxes  = torch.from_numpy(labels[:, 2:6].copy()).float()
+                _detr_labels = torch.from_numpy(labels[:, 0].copy()).long()
+            else:
+                _detr_boxes  = torch.zeros((0, 4), dtype=torch.float32)
+                _detr_labels = torch.zeros((0,),   dtype=torch.long)
 
         # --- GT of detection
         hm = np.zeros((self.num_classes, output_h, output_w), dtype=np.float32)  # C×H×W: heat-map通道数即类别数
@@ -687,5 +705,22 @@ class JointDataset(LoadImagesAndLabels):  # for training
                    'ind': ind,
                    'reg_mask': reg_mask}
 
+        # DETR-format targets — only emitted for hybrid task; collate_fn assembles into a list
+        if _is_hybrid:
+            ret['targets'] = {'boxes': _detr_boxes, 'labels': _detr_labels}
+
         return ret  # 返回一个字典(第一次见识这样的getitem)
 
+
+def hybrid_collate_fn(batch):
+    """
+    Custom collate for hybrid training.  All keys except 'targets' are stacked
+    normally; 'targets' (DETR format, variable number of GT per image) is kept
+    as a plain Python list of dicts so the Hungarian matcher can iterate over it.
+    """
+    from torch.utils.data.dataloader import default_collate
+    targets = [b['targets'] for b in batch]
+    other   = [{k: v for k, v in b.items() if k != 'targets'} for b in batch]
+    collated = default_collate(other)
+    collated['targets'] = targets
+    return collated

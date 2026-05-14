@@ -39,7 +39,7 @@ class MCTrack(MCBaseTrack):
         self.cls_id = cls_id
 
         # wait activate
-        self._tlwh = np.asarray(tlwh, dtype=np.float)
+        self._tlwh = np.asarray(tlwh, dtype=np.float64)
 
         self.kalman_filter = None
         self.mean, self.covariance = None, None
@@ -53,7 +53,7 @@ class MCTrack(MCBaseTrack):
         self.features = deque([], maxlen=buff_size)  # 指定了限制长度
         self.alpha = 0.9
 
-        self.curr_tlwh = np.asarray(tlwh, dtype=np.float)
+        self.curr_tlwh = np.asarray(tlwh, dtype=np.float64)
 
         self.tlwh_deque = deque([], maxlen=30)
 
@@ -722,6 +722,219 @@ class MCJDETracker(object):
                 [track.track_id for track in removed_tracks_dict[cls_id]]))
 
         return output_tracks_dict
+
+
+# ── HybridMCJDETracker ────────────────────────────────────────────────────────
+
+def _detr_boxes_to_orig_xyxy(
+    boxes_norm: np.ndarray,   # (K, 4) cxcywh normalized in [0,1] of net input
+    net_w: int, net_h: int,
+    orig_w: int, orig_h: int,
+) -> np.ndarray:
+    """Convert stage-2 normalized cxcywh → pixel xyxy in original image space."""
+    scale = min(net_w / orig_w, net_h / orig_h)
+    pad_w = (net_w - orig_w * scale) / 2.0
+    pad_h = (net_h - orig_h * scale) / 2.0
+
+    cx = boxes_norm[:, 0] * net_w
+    cy = boxes_norm[:, 1] * net_h
+    w  = boxes_norm[:, 2] * net_w
+    h  = boxes_norm[:, 3] * net_h
+
+    x1 = np.clip((cx - w / 2 - pad_w) / scale, 0, orig_w)
+    y1 = np.clip((cy - h / 2 - pad_h) / scale, 0, orig_h)
+    x2 = np.clip((cx + w / 2 - pad_w) / scale, 0, orig_w)
+    y2 = np.clip((cy + h / 2 - pad_h) / scale, 0, orig_h)
+    return np.stack([x1, y1, x2, y2], axis=-1).astype(np.float32)
+
+
+class HybridMCJDETracker(MCJDETracker):
+    """
+    MCJDETracker adapted for HybridCenterNetDETR.
+
+    Detection extraction uses the stage-2 DETR output (refined boxes +
+    per-query ReID embeddings) instead of the CenterNet heatmap pipeline.
+    The Kalman-filter / association loop is identical to MCJDETracker except
+    that `reid_motion*` calls (which require a spatial feature map) are
+    replaced with a neutral multiplier (dist_off = 1.0), falling back to
+    pure IoU + embedding-distance matching.
+    """
+
+    def update_tracking(self, im_blob: torch.Tensor, img_0: np.ndarray) -> defaultdict:
+        self.frame_id += 1
+        if self.frame_id == 1:
+            MCTrack.init_count(self.opt.num_classes)
+
+        activated_tracks_dict  = defaultdict(list)
+        refined_tracks_dict    = defaultdict(list)
+        lost_tracks_dict       = defaultdict(list)
+        removed_tracks_dict    = defaultdict(list)
+        output_tracks_dict     = defaultdict(list)
+
+        height, width = img_0.shape[0], img_0.shape[1]
+        net_height, net_width = im_blob.shape[2], im_blob.shape[3]
+
+        # ── Step 1: forward pass, extract stage-2 detections ─────────────────
+        with torch.no_grad():
+            output = self.model(im_blob)          # dict: {stage1, stage2, ...}
+            stage2 = output['stage2']
+
+            boxes_norm = stage2.boxes[0].cpu().numpy()    # (K, 4) cxcywh [0,1]
+            logits     = stage2.logits[0].cpu().numpy()   # (K, C)
+            reid_raw   = stage2.reid[0].cpu().numpy()     # (K, reid_dim)
+
+        # Sigmoid scores and L2-normalize reid
+        scores     = 1.0 / (1.0 + np.exp(-logits))       # (K, C)
+        norms      = np.linalg.norm(reid_raw, axis=-1, keepdims=True)
+        reid_normed = reid_raw / (norms + 1e-8)           # (K, reid_dim)
+
+        # Convert boxes to original image pixel xyxy
+        xyxy_orig = _detr_boxes_to_orig_xyxy(
+            boxes_norm, net_width, net_height, width, height)  # (K, 4)
+
+        # ── Step 2: per-class tracking loop ──────────────────────────────────
+        for cls_id in range(self.opt.num_classes):
+            cls_scores = scores[:, cls_id]   # (K,)
+
+            remain     = cls_scores > self.opt.conf_thres
+            inds_low   = cls_scores > 0.1
+            inds_second = np.logical_and(inds_low, ~remain)
+
+            def _make_tracks(mask):
+                if not mask.any():
+                    return []
+                dets  = np.concatenate([xyxy_orig[mask], cls_scores[mask, None]], axis=-1)
+                feats = reid_normed[mask]
+                return [
+                    MCTrack(MCTrack.tlbr_to_tlwh(d[:4]), d[4], f,
+                            self.opt.num_classes, cls_id, 30)
+                    for d, f in zip(dets, feats)
+                ]
+
+            cls_detects        = _make_tracks(remain)
+            cls_detects_second = _make_tracks(inds_second)
+
+            # ── Kalman predict ───────────────────────────────────────────────
+            unconfirmed_dict    = defaultdict(list)
+            tracked_tracks_dict = defaultdict(list)
+            for track in self.tracked_tracks_dict[cls_id]:
+                if not track.is_activated:
+                    unconfirmed_dict[cls_id].append(track)
+                else:
+                    tracked_tracks_dict[cls_id].append(track)
+
+            MCTrack.multi_predict(self.lost_tracks_dict[cls_id])
+            MCTrack.multi_predict(tracked_tracks_dict[cls_id])
+
+            track_pool_dict = defaultdict(list)
+            track_pool_dict[cls_id] = join_tracks(
+                tracked_tracks_dict[cls_id], self.lost_tracks_dict[cls_id])
+
+            # ── First association (embedding + IoU) ──────────────────────────
+            dists    = matching.embedding_distance(track_pool_dict[cls_id], cls_detects)
+            dist_iou = matching.iou_distance(track_pool_dict[cls_id], cls_detects)
+            dist_iou = matching.fuse_score_three(dist_iou, dists, cls_detects)
+
+            matches, u_track, u_detection = matching.linear_assignment(dist_iou, thresh=0.6)
+            for i_tracked, i_det in matches:
+                track = track_pool_dict[cls_id][i_tracked]
+                det   = cls_detects[i_det]
+                if track.state == TrackState.Tracked:
+                    track.update(det, self.frame_id)
+                    activated_tracks_dict[cls_id].append(track)
+                else:
+                    track.re_activate(det, self.frame_id, new_id=False)
+                    refined_tracks_dict[cls_id].append(track)
+
+            # ── Second association (IoU only, remaining) ─────────────────────
+            cls_detects_u  = [cls_detects[i] for i in u_detection]
+            r_tracked      = [track_pool_dict[cls_id][i]
+                               for i in u_track if track_pool_dict[cls_id][i].state]
+            dist_iou2 = matching.iou_distance(r_tracked, cls_detects_u)
+            matches2, u_track2, u_det2 = matching.linear_assignment(dist_iou2, thresh=0.8)
+            for i_tracked, i_det in matches2:
+                track = r_tracked[i_tracked]
+                det   = cls_detects_u[i_det]
+                if track.state == TrackState.Tracked:
+                    track.update(det, self.frame_id)
+                    activated_tracks_dict[cls_id].append(track)
+                else:
+                    track.re_activate(det, self.frame_id, new_id=False)
+                    refined_tracks_dict[cls_id].append(track)
+
+            # ── Third association (low-score detections) ─────────────────────
+            second_tracked = [r_tracked[i] for i in u_track2]
+            dist_iou3 = matching.iou_distance(second_tracked, cls_detects_second)
+            matches3, u_track3, _ = matching.linear_assignment(dist_iou3, thresh=0.2)
+            for i_tracked, i_det in matches3:
+                track = second_tracked[i_tracked]
+                det   = cls_detects_second[i_det]
+                if track.state == TrackState.Tracked:
+                    track.update(det, self.frame_id)
+                    activated_tracks_dict[cls_id].append(track)
+                else:
+                    track.re_activate(det, self.frame_id, new_id=False)
+                    refined_tracks_dict[cls_id].append(track)
+
+            # Remaining unmatched → lost
+            for it in u_track3:
+                track = second_tracked[it]
+                if track.state != TrackState.Lost:
+                    track.mark_lost()
+                    lost_tracks_dict[cls_id].append(track)
+
+            # ── Unconfirmed tracks association ────────────────────────────────
+            cls_detects_final = [cls_detects_u[i] for i in u_det2]
+            dist_unc = matching.iou_distance(unconfirmed_dict[cls_id], cls_detects_final)
+            matches_u, u_unc, u_det_final = matching.linear_assignment(dist_unc, thresh=0.5)
+            for i_tracked, i_det in matches_u:
+                unconfirmed_dict[cls_id][i_tracked].update(cls_detects_final[i_det], self.frame_id)
+                activated_tracks_dict[cls_id].append(unconfirmed_dict[cls_id][i_tracked])
+            for it in u_unc:
+                unconfirmed_dict[cls_id][it].mark_removed()
+                removed_tracks_dict[cls_id].append(unconfirmed_dict[cls_id][it])
+
+            # ── Init new tracks ───────────────────────────────────────────────
+            for i_new in u_det_final:
+                track = cls_detects_final[i_new]
+                if track.score < self.det_thresh:
+                    continue
+                track.activate(self.kalman_filter, self.frame_id)
+                activated_tracks_dict[cls_id].append(track)
+
+            # ── Remove aged lost tracks ───────────────────────────────────────
+            for track in self.lost_tracks_dict[cls_id]:
+                if self.frame_id - track.end_frame > self.max_time_lost:
+                    track.mark_removed()
+                    removed_tracks_dict[cls_id].append(track)
+
+            # ── Update state ──────────────────────────────────────────────────
+            self.tracked_tracks_dict[cls_id] = [
+                t for t in self.tracked_tracks_dict[cls_id]
+                if t.state == TrackState.Tracked
+            ]
+            self.tracked_tracks_dict[cls_id] = join_tracks(
+                self.tracked_tracks_dict[cls_id], activated_tracks_dict[cls_id])
+            self.tracked_tracks_dict[cls_id] = join_tracks(
+                self.tracked_tracks_dict[cls_id], refined_tracks_dict[cls_id])
+
+            self.lost_tracks_dict[cls_id] = sub_tracks(
+                self.lost_tracks_dict[cls_id], self.tracked_tracks_dict[cls_id])
+            self.lost_tracks_dict[cls_id].extend(lost_tracks_dict[cls_id])
+            self.lost_tracks_dict[cls_id] = sub_tracks(
+                self.lost_tracks_dict[cls_id], self.removed_tracks_dict[cls_id])
+
+            self.removed_tracks_dict[cls_id].extend(removed_tracks_dict[cls_id])
+            self.tracked_tracks_dict[cls_id], self.lost_tracks_dict[cls_id] = \
+                remove_duplicate_tracks(
+                    self.tracked_tracks_dict[cls_id], self.lost_tracks_dict[cls_id])
+
+            output_tracks_dict[cls_id] = [
+                t for t in self.tracked_tracks_dict[cls_id] if t.is_activated
+            ]
+
+        return output_tracks_dict
+
 
 def join_tracks(t_list_a, t_list_b):
     """

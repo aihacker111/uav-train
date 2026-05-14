@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lib.models.decode import mot_decode
-from lib.models.losses import FocalLoss
-from lib.models.losses import RegL1Loss, RegLoss, NormRegL1Loss, RegWeightedL1Loss, \
+from lib.models.base_losses import FocalLoss
+from lib.models.base_losses import RegL1Loss, RegLoss, NormRegL1Loss, RegWeightedL1Loss, \
     ArcMarginFc, CircleLoss, convert_label_to_similarity, McFocalLoss, GHMC, TripletLoss
 from lib.models.utils import _sigmoid, _tranpose_and_gather_feat
 from lib.utils.post_process import ctdet_post_process

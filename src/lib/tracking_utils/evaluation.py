@@ -10,7 +10,7 @@ from lib.tracking_utils.io import read_results, unzip_objs
 class Evaluator(object):
 
     def __init__(self, data_root, seq_name, data_type):
-        self.data_root = '/media/jianbo/ioe/UAVdata/VisDrone2019/test-dev/annotations_car'
+        self.data_root = data_root
         self.seq_name = seq_name
         self.data_type = data_type
 

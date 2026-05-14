@@ -1,13 +1,13 @@
 {
-    "root": "/workspace/VisDrone2019",
+    "root": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019",
     "train": {
-        "visdrone_train": "/workspace/VisDrone2019/VisDrone.train",
-        "visdrone_val":   "/workspace/VisDrone2019/VisDrone.val"
+        "visdrone_train": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.train",
+        "visdrone_val": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.val"
     },
     "test_emb": {
-        "visdrone": "/workspace/VisDrone2019/VisDrone.train"
+        "visdrone": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.train"
     },
     "test": {
-        "visdrone": "/workspace/VisDrone2019/VisDrone.train"
+        "visdrone": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.train"
     }
 }

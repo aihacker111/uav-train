@@ -13,15 +13,55 @@ import numpy as np
 import torch
 
 from collections import defaultdict
-from lib.tracker.multitracker import MCJDETracker
+from lib.tracker.multitracker import MCJDETracker, HybridMCJDETracker
 from lib.tracking_utils import visualization as vis
 from lib.tracking_utils.log import logger
 from lib.tracking_utils.timer import Timer
 from lib.tracking_utils.evaluation import Evaluator
+from lib.utils.det_eval import DetectionEvaluator
 import lib.datasets.dataset.jde as datasets
 
 from lib.tracking_utils.utils import mkdir_if_missing
 from lib.opts import opts
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _tlwh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
+    """(N, 4) tlwh → xyxy"""
+    out = boxes.copy()
+    out[:, 2] += out[:, 0]
+    out[:, 3] += out[:, 1]
+    return out
+
+
+def load_gt_detections(ann_file: str) -> dict:
+    """
+    Read VisDrone/MOT ground-truth annotation file and return per-frame
+    detection boxes with class labels.
+
+    Format: frame_id, target_id, x, y, w, h, score, object_category, ...
+    object_category is 1-indexed (VisDrone: 1=pedestrian … 10=motor).
+    Returns {frame_id: [(tlwh, cls_id_0indexed), ...]}
+    """
+    frame_dets: dict = {}
+    if not osp.isfile(ann_file):
+        return frame_dets
+    with open(ann_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split(',')
+            if len(parts) < 8:
+                continue
+            fid = int(parts[0])
+            tlwh = tuple(float(x) for x in parts[2:6])
+            cls_id = int(float(parts[7])) - 1   # 1-indexed → 0-indexed
+            if cls_id < 0:
+                continue
+            frame_dets.setdefault(fid, []).append((np.array(tlwh, dtype=np.float32), cls_id))
+    return frame_dets
+
+
+# ── Core tracking / detection loop ────────────────────────────────────────────
 
 def write_results_dict(file_name, results_dict, data_type, num_classes=10):
     if data_type == 'mot':
@@ -47,6 +87,7 @@ def write_results_dict(file_name, results_dict, data_type, num_classes=10):
                     f.write(line)
     logger.info('save results to {}'.format(file_name))
 
+
 def eval_seq(opt,
              data_loader,
              data_type,
@@ -54,40 +95,65 @@ def eval_seq(opt,
              save_dir=None,
              show_image=True,
              frame_rate=30):
+    """
+    Run tracker on one sequence.
+
+    Returns:
+        (n_frames, avg_time, n_calls, frame_det_results)
+
+        frame_det_results : {frame_id: list of (tlwh, score, cls_id)}
+            — raw per-frame detections for mAP computation
+    """
     if save_dir:
         mkdir_if_missing(save_dir)
-    tracker = MCJDETracker(opt, frame_rate)
+
+    is_hybrid = 'hybrid' in opt.arch
+    tracker = HybridMCJDETracker(opt, frame_rate) if is_hybrid else MCJDETracker(opt, frame_rate)
+
     timer = Timer()
     results_dict = defaultdict(list)
+    frame_det_results: dict = {}   # {frame_id: [(tlwh, score, cls_id)]}
     frame_id = 0
+
     for path, img, img0 in data_loader:
         if frame_id % 30 == 0 and frame_id != 0:
-            logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1.0 / max(1e-5, timer.average_time)))
+            logger.info('Processing frame {} ({:.2f} fps)'.format(
+                frame_id, 1.0 / max(1e-5, timer.average_time)))
         frame_id += 1
-
 
         blob = torch.from_numpy(img).unsqueeze(0).to(opt.device)
         timer.tic()
         online_targets_dict = tracker.update_tracking(blob, img0)
         timer.toc()
-        online_tlwhs_dict = defaultdict(list)
-        online_ids_dict = defaultdict(list)
+
+        online_tlwhs_dict  = defaultdict(list)
+        online_ids_dict    = defaultdict(list)
         online_scores_dict = defaultdict(list)
+
         for cls_id in range(opt.num_classes):
             online_targets = online_targets_dict[cls_id]
             for track in online_targets:
-                tlwh = track.curr_tlwh
-                t_id = track.track_id
+                tlwh  = track.curr_tlwh
+                t_id  = track.track_id
                 score = track.score
                 if tlwh[2] * tlwh[3] > opt.min_box_area:
                     online_tlwhs_dict[cls_id].append(tlwh)
                     online_ids_dict[cls_id].append(t_id)
                     online_scores_dict[cls_id].append(score)
+
+        # Collect raw detections for mAP (before track-ID filtering)
+        frame_dets_this = []
+        for cls_id in range(opt.num_classes):
+            for tlwh, score in zip(online_tlwhs_dict[cls_id], online_scores_dict[cls_id]):
+                frame_dets_this.append((np.array(tlwh, dtype=np.float32), float(score), int(cls_id)))
+        frame_det_results[frame_id] = frame_dets_this
+
         for cls_id in range(opt.num_classes):
             results_dict[cls_id].append((frame_id,
                                          online_tlwhs_dict[cls_id],
                                          online_ids_dict[cls_id],
                                          online_scores_dict[cls_id]))
+
         if show_image or save_dir is not None:
             if frame_id > 0:
                 online_im: ndarray = vis.plot_tracks(image=img0,
@@ -102,8 +168,12 @@ def eval_seq(opt,
                 cv2.imshow('online_im', online_im)
             if save_dir is not None:
                 cv2.imwrite(os.path.join(save_dir, '{:05d}.jpg'.format(frame_id)), online_im)
+
     write_results_dict(result_f_name, results_dict, data_type)
-    return frame_id, timer.average_time, timer.calls
+    return frame_id, timer.average_time, timer.calls, frame_det_results
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(opt,
          data_root='',
@@ -116,46 +186,106 @@ def main(opt,
     result_root = os.path.join(data_root, '..', 'results', exp_name)
     mkdir_if_missing(result_root)
     data_type = 'mot'
+
+    use_imagenet_norm = 'lwdetr' in opt.arch or 'hybrid' in opt.arch
+
     accs = []
     n_frame = 0
     timer_avgs, timer_calls = [], []
+
+    det_ev = DetectionEvaluator(num_classes=opt.num_classes)  # accumulates across all seqs
+
     for seq in seqs:
         output_dir = os.path.join(
             data_root, '..', 'outputs', exp_name, seq) if save_images or save_videos else None
         logger.info('start seq: {}'.format(seq))
+
         dataloader = datasets.LoadImages(
-            osp.join(data_root, seq), opt.img_size)
+            osp.join(data_root, seq), opt.img_size,
+            use_imagenet_norm=use_imagenet_norm)
+
         result_filename = os.path.join(result_root, '{}.txt'.format(seq))
         frame_rate = 30
-        nf, ta, tc = eval_seq(opt, dataloader, data_type, result_filename,
-                              save_dir=output_dir, show_image=show_image, frame_rate=frame_rate)
-        n_frame += nf
+
+        nf, ta, tc, frame_det_results = eval_seq(
+            opt, dataloader, data_type, result_filename,
+            save_dir=output_dir, show_image=show_image, frame_rate=frame_rate)
+
+        n_frame       += nf
         timer_avgs.append(ta)
         timer_calls.append(tc)
+
+        # ── Detection mAP: compare predictions vs GT per frame ───────────────
+        ann_root = osp.join(osp.dirname(data_root), 'annotations')
+        ann_file = osp.join(ann_root, f'{seq}.txt')
+        gt_frame_dets = load_gt_detections(ann_file)
+
+        all_frame_ids = set(frame_det_results.keys()) | set(gt_frame_dets.keys())
+        for fid in sorted(all_frame_ids):
+            preds = frame_det_results.get(fid, [])
+            gts   = gt_frame_dets.get(fid, [])
+
+            if preds:
+                pb, ps, pl = zip(*preds)
+                pred_boxes  = _tlwh_to_xyxy(np.stack(pb))
+                pred_scores = np.array(ps, dtype=np.float32)
+                pred_labels = np.array(pl, dtype=np.int64)
+            else:
+                pred_boxes  = np.zeros((0, 4), dtype=np.float32)
+                pred_scores = np.zeros((0,),   dtype=np.float32)
+                pred_labels = np.zeros((0,),   dtype=np.int64)
+
+            if gts:
+                gb_list, gl_list = zip(*gts)
+                gt_boxes  = _tlwh_to_xyxy(np.stack(gb_list))
+                gt_labels = np.array(gl_list, dtype=np.int64)
+            else:
+                gt_boxes  = np.zeros((0, 4), dtype=np.float32)
+                gt_labels = np.zeros((0,),   dtype=np.int64)
+
+            det_ev.update(pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels)
+
+        # ── MOT tracking metrics ─────────────────────────────────────────────
         logger.info('Evaluate seq: {}'.format(seq))
-        evaluator = Evaluator(data_root, seq, data_type)
+        evaluator = Evaluator(ann_root, seq, data_type)
         accs.append(evaluator.eval_file(result_filename))
-    timer_avgs = np.asarray(timer_avgs)
+
+    # ── Speed ─────────────────────────────────────────────────────────────────
+    timer_avgs  = np.asarray(timer_avgs)
     timer_calls = np.asarray(timer_calls)
     all_time = np.dot(timer_avgs, timer_calls)
     avg_time = all_time / np.sum(timer_calls)
     logger.info('Time elapsed: {:.2f} seconds, FPS: {:.2f}'.format(
         all_time, 1.0 / avg_time))
+
+    # ── Tracking metrics (MOTA, MOTP, IDF1, …) ───────────────────────────────
     metrics = mm.metrics.motchallenge_metrics
-    mh = mm.metrics.create()
+    mh      = mm.metrics.create()
     summary = Evaluator.get_summary(accs, seqs, metrics)
     strsummary = mm.io.render_summary(
         summary,
         formatters=mh.formatters,
         namemap=mm.io.motchallenge_metric_names
     )
+    print('\n===== Tracking Metrics =====')
     print(strsummary)
     Evaluator.save_summary(summary, os.path.join(
         result_root, 'summary_{}.xlsx'.format(exp_name)))
 
+    # ── Detection metrics (mAP50, mAP50:95) ──────────────────────────────────
+    det_stats = det_ev.summarize()
+    print('\n===== Detection Metrics =====')
+    print(f"{'Metric':<20} {'Value':>8}")
+    print('-' * 30)
+    for k in ('mAP50:95', 'mAP50'):
+        print(f"{k:<20} {det_stats.get(k, 0.0):>8.4f}")
+    print('-' * 30)
+    for k, v in sorted(det_stats.items()):
+        if k.startswith('AP50_cls'):
+            print(f"  {k:<18} {v:>8.4f}")
+
 
 if __name__ == '__main__':
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
     opt = opts().init()
 
     if opt.test_visdrone:
@@ -184,7 +314,7 @@ if __name__ == '__main__':
     main(opt,
          data_root=data_root,
          seqs=seqs,
-         exp_name= 'save_name',
+         exp_name='save_name',
          show_image=False,
          save_images=True,
          save_videos=False)
