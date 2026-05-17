@@ -8,7 +8,7 @@ import json
 import random
 
 import numpy as np
-os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+# os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 import torch
 import torch.utils.data
 from torchvision.transforms import transforms as T
