@@ -99,6 +99,7 @@ class MCTrack(MCBaseTrack):
                 tracks[i].covariance = cov
 
 
+    @staticmethod
     def multi_gmc(stracks, H=np.eye(2, 3)):
         if len(stracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
@@ -447,6 +448,11 @@ class MCJDETracker(object):
         h_out = net_height // self.opt.down_ratio
         w_out = net_width // self.opt.down_ratio
 
+        # Global Motion Compensation — estimate camera warp from raw frame once per
+        # frame, then shift all Kalman means before association so drone camera
+        # movement doesn't look like object motion.
+        gmc_warp = self.gmc.apply(img_0)
+
         ''' Step 1: Network forward, get detections & embeddings'''
         with torch.no_grad():
             output = self.model.forward(im_blob)[-1]
@@ -491,7 +497,7 @@ class MCJDETracker(object):
             remain_inds = cls_dets[:, 4] > self.opt.conf_thres
 
             if cls_id == 4:
-                inds_low = cls_dets[:, 4] > 1
+                inds_low = cls_dets[:, 4] > 0.1  # van: same low-score threshold as truck/bus
             elif cls_id == 5 or cls_id==8:
                 inds_low = cls_dets[:, 4] > 0.1
             else:
@@ -536,6 +542,10 @@ class MCJDETracker(object):
             # Predict the current location with KF
             MCTrack.multi_predict(self.lost_tracks_dict[cls_id])
             MCTrack.multi_predict(tracked_tracks_dict[cls_id])
+
+            # Apply GMC warp to compensate for drone camera motion
+            MCTrack.multi_gmc(tracked_tracks_dict[cls_id], gmc_warp)
+            MCTrack.multi_gmc(self.lost_tracks_dict[cls_id], gmc_warp)
 
             track_pool_dict = defaultdict(list)
             track_pool_dict[cls_id] = join_tracks(tracked_tracks_dict[cls_id], self.lost_tracks_dict[cls_id])
@@ -748,6 +758,27 @@ def _detr_boxes_to_orig_xyxy(
     return np.stack([x1, y1, x2, y2], axis=-1).astype(np.float32)
 
 
+def _nms_numpy(boxes_xyxy: np.ndarray, scores: np.ndarray, iou_thr: float) -> np.ndarray:
+    """Fast CPU NMS — returns kept indices sorted by score."""
+    if len(boxes_xyxy) == 0:
+        return np.array([], dtype=np.int64)
+    x1, y1, x2, y2 = boxes_xyxy[:, 0], boxes_xyxy[:, 1], boxes_xyxy[:, 2], boxes_xyxy[:, 3]
+    areas = (x2 - x1).clip(0) * (y2 - y1).clip(0)
+    order = scores.argsort()[::-1]
+    keep  = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        ix1 = np.maximum(x1[i], x1[order[1:]])
+        iy1 = np.maximum(y1[i], y1[order[1:]])
+        ix2 = np.minimum(x2[i], x2[order[1:]])
+        iy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = (ix2 - ix1).clip(0) * (iy2 - iy1).clip(0)
+        iou   = inter / (areas[i] + areas[order[1:]] - inter + 1e-7)
+        order = order[1:][iou <= iou_thr]
+    return np.array(keep, dtype=np.int64)
+
+
 class HybridMCJDETracker(MCJDETracker):
     """
     MCJDETracker adapted for HybridCenterNetDETR.
@@ -793,12 +824,28 @@ class HybridMCJDETracker(MCJDETracker):
             boxes_norm, net_width, net_height, width, height)  # (K, 4)
 
         # ── Step 2: per-class tracking loop ──────────────────────────────────
+        nms_thr = getattr(self.opt, 'nms_thres', 0.4)
+
         for cls_id in range(self.opt.num_classes):
             cls_scores = scores[:, cls_id]   # (K,)
 
-            remain     = cls_scores > self.opt.conf_thres
-            inds_low   = cls_scores > 0.1
-            inds_second = np.logical_and(inds_low, ~remain)
+            inds_low    = cls_scores > 0.1
+            remain_pre  = cls_scores > self.opt.conf_thres
+            second_pre  = np.logical_and(inds_low, ~remain_pre)
+
+            # Class-wise NMS on predicted boxes to remove duplicate detections
+            # from multiple queries firing on the same object.
+            def _apply_nms(mask):
+                if not mask.any():
+                    return mask.copy()
+                idxs = np.where(mask)[0]
+                kept = _nms_numpy(xyxy_orig[idxs], cls_scores[idxs], nms_thr)
+                out  = np.zeros(len(cls_scores), dtype=bool)
+                out[idxs[kept]] = True
+                return out
+
+            remain      = _apply_nms(remain_pre)
+            inds_second = _apply_nms(second_pre)
 
             def _make_tracks(mask):
                 if not mask.any():

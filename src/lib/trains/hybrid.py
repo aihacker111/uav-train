@@ -30,7 +30,11 @@ class HybridTrainer(BaseTrainer):
     """
 
     def _get_losses(self, opt):
-        loss_stats = ['loss', 'loss_stage1', 'loss_stage2']
+        loss_stats = [
+            'loss',
+            'loss_s1', 'loss_hm', 'loss_wh', 'loss_reg',
+            'loss_s2', 'loss_cls', 'loss_bbox', 'loss_ciou', 'loss_consist',
+        ]
 
         reid_classifier = None
         if getattr(opt, 'id_weight', 0) > 0 and hasattr(opt, 'nID_dict') and opt.nID_dict:
@@ -44,7 +48,7 @@ class HybridTrainer(BaseTrainer):
             lambda_wh      = getattr(opt, 'wh_weight',     0.1),
             lambda_reg     = getattr(opt, 'off_weight',     1.0),
             lambda_bbox    = getattr(opt, 'bbox_weight',    5.0),
-            lambda_giou    = getattr(opt, 'giou_weight',    2.0),
+            lambda_ciou    = getattr(opt, 'giou_weight',    2.0),
             lambda_reid    = getattr(opt, 'id_weight',      1.0),
             lambda_stage1  = getattr(opt, 'stage1_weight',  1.0),
             lambda_stage2  = getattr(opt, 'stage2_weight',  1.0),

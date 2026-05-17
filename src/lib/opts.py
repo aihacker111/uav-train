@@ -38,13 +38,16 @@ class opts(object):
         self.parser.add_argument('--seed', type=int, default=317,
                                  help='random seed')  # from CornerNet
         self.parser.add_argument('--gen-scale',
-                                 type=bool,
+                                 action='store_true',
                                  default=True,
                                  help='Whether to generate multi-scales')
+        self.parser.add_argument('--no-gen-scale',
+                                 action='store_false',
+                                 dest='gen_scale',
+                                 help='Disable multi-scale generation')
         self.parser.add_argument('--is_debug',
-                                 type=bool,
-                                 default=False,  # 是否使用多线程加载数据, default: False
-                                 help='whether in debug mode or not')  # debug模式下只能使用单进程
+                                 action='store_true',
+                                 help='Enable debug mode (forces single-process data loading)')
 
         # log
         self.parser.add_argument('--print_iter', type=int, default=0,
@@ -111,10 +114,42 @@ class opts(object):
                                  type=float,
                                  default=7e-4,  # 1e-4, 7e-5, 5e-5, 3e-5
                                  help='learning rate for batch size 32.')
+        self.parser.add_argument('--lr_scale',
+                                 type=str,
+                                 default='linear',
+                                 choices=['linear', 'sqrt', 'none'],
+                                 help='Multi-GPU LR scaling rule. '
+                                      'linear: lr *= (gpus * batch_size) / base_batch_size  '
+                                      'sqrt:   lr *= sqrt(gpus * batch_size / base_batch_size)  '
+                                      'none:   no scaling (manual tuning).')
+        self.parser.add_argument('--base_batch_size',
+                                 type=int,
+                                 default=8,
+                                 help='Reference batch size the base --lr was tuned for '
+                                      '(single GPU). Used by --lr_scale.')
         self.parser.add_argument('--lr_step',
                                  type=str,
                                  default='10, 20',
                                  help='drop learning rate by 10.')
+        self.parser.add_argument('--clip_grad_norm',
+                                 type=float,
+                                 default=1.0,
+                                 help='Max gradient norm for clipping. '
+                                      '0 disables clipping. '
+                                      'Recommended: 1.0 for ViT/transformer backbones, '
+                                      'especially when LR is scaled up for multi-GPU.')
+        self.parser.add_argument('--cosine_lr',
+                                 action='store_true',
+                                 help='Use cosine LR schedule with linear warmup instead of step decay. '
+                                      'Recommended for ViT backbones.')
+        self.parser.add_argument('--warmup_iters',
+                                 type=int,
+                                 default=1000,
+                                 help='Number of iterations for linear LR warmup (cosine_lr only).')
+        self.parser.add_argument('--min_lr_ratio',
+                                 type=float,
+                                 default=0.01,
+                                 help='Minimum LR as fraction of base LR at end of cosine decay.')
         self.parser.add_argument('--num_epochs',
                                  type=int,
                                  default=30,  # 30, 10, 3, 1
@@ -266,9 +301,9 @@ class opts(object):
                                  default=128,  # 128, 256, 512
                                  help='feature dim for reid')
         self.parser.add_argument('--input-wh',
-                                 type=tuple,
-                                 default=(1088, 640),  # LW-DETR requires H divisible by 64: 640×1088
-                                 help='net input resolution (W, H)')
+                                 type=lambda s: tuple(int(x) for x in s.split(',')),
+                                 default=(832, 512),  # 512×832: ~45G GFLOPs vs 73G at 640×1088; both divisible by 64
+                                 help='net input resolution as W,H e.g. 832,512')
 
         # ----------------------1~10 object classes are what we need
         # pedestrian      (1),  --> 0
@@ -312,6 +347,14 @@ class opts(object):
         self.parser.add_argument('--tri',
                                  action='store_true')
 
+        self.parser.add_argument('--use_repeat_sampling',
+                                 action='store_true',
+                                 help='Use repeat factor sampling to over-sample rare classes.')
+        self.parser.add_argument('--repeat_thresh',
+                                 type=float,
+                                 default=0.001,
+                                 help='Frequency threshold t for repeat factor: rf=sqrt(t/f(c)).')
+
 
 
     def parse(self, args=''):
@@ -330,6 +373,9 @@ class opts(object):
         print('Fix size testing.' if opt.fix_res else 'Keep resolution testing.')
 
         opt.reg_offset = not opt.not_reg_offset
+
+        # Hybrid CenterNet head uses upsampled stride-4 feature → same down_ratio as MOT
+        # (CenterNetUpsampleNeck in model.py handles the stride-16 → stride-4 upsampling)
 
         if opt.head_conv == -1:  # init default head_conv
             opt.head_conv = 256 if 'dla' in opt.arch else 256

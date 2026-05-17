@@ -34,7 +34,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from .config import HybridModelConfig, ViTConfig
-from .neck import MultiScaleNeck
+from .neck import MultiScaleNeck, CenterNetUpsampleNeck
 from .heads import CenterNetHead, DETRHead
 from .query_gen import QueryGenerator
 from .decoder import HybridDecoder
@@ -88,8 +88,11 @@ class HybridCenterNetDETR(nn.Module):
         dec_cfg.num_feature_levels = neck_cfg.num_output_levels
 
         self.backbone = _build_vit(vit_cfg)
-        # Neck takes only the finest backbone feature (embed_dim channels)
-        self.neck     = MultiScaleNeck(vit_cfg.embed_dim, neck_cfg)
+        # Neck takes ALL ViT output features concatenated along the channel axis
+        neck_in_ch    = vit_cfg.embed_dim * vit_cfg.num_feature_levels
+        self.neck     = MultiScaleNeck(neck_in_ch, neck_cfg)
+        # Upsample stride-16 finest feature → stride-4 for small-object CenterNet
+        self.cn_upsample = CenterNetUpsampleNeck(neck_cfg.hidden_dim)
 
         self.centernet_head = CenterNetHead(neck_cfg.hidden_dim, cfg.centernet)
         self.query_gen      = QueryGenerator(neck_cfg.hidden_dim, cfg.query_gen)
@@ -101,15 +104,20 @@ class HybridCenterNetDETR(nn.Module):
         vit_features: List[Tensor] = self.backbone(x)
 
         # ── Multi-scale neck ──────────────────────────────────────────────────
-        neck_out = self.neck(vit_features)
-        # Finest-scale (highest resolution) feature for the CenterNet head
-        finest   = self.neck.finest_feature(vit_features)   # (B, D, H/16, W/16)
+        neck_out, finest_s16 = self.neck(vit_features)   # (NeckOut, B×D×H/16×W/16)
+        finest_s4            = self.cn_upsample(finest_s16)  # (B, D, H/4, W/4)
 
         # ── Stage 1: dense heatmap detection ─────────────────────────────────
-        cn_out = self.centernet_head(finest)   # CenterNetOutput
+        cn_out = self.centernet_head(finest_s4)   # CenterNetOutput
 
         # ── Query generation: heatmap peaks → DETR seeds ─────────────────────
-        queries = self.query_gen(cn_out.hm, finest)   # QueryBundle(B, K, ·)
+        # finest_s4 detached: Stage-2 gradients don't contaminate Stage-1.
+        # cn_out.wh passed so QueryGen initialises ref box sizes from Stage-1
+        # predictions instead of a fixed 0.05 default — better for VisDrone's
+        # wide object-size range (pedestrians ~1% to vehicles ~8% of image).
+        queries = self.query_gen(
+            cn_out.hm, finest_s4.detach(), wh_map=cn_out.wh,
+        )  # QueryBundle(B, K, ·)
 
         # ── Stage 2: DETR decoder refinement ─────────────────────────────────
         dec_out  = self.decoder(queries, neck_out)
@@ -160,6 +168,21 @@ class HybridCenterNetDETR(nn.Module):
         miss1, _ = self.backbone.load_state_dict(backbone_src, strict=False)
         print(f'[load_pretrained] backbone: {len(backbone_src)} tensors'
               + (f', {len(miss1)} missing' if miss1 else ''))
+
+        # ── Neck projector (backbone.0.projector.* → self.neck.proj0.*) ──────
+        _proj_prefix = 'backbone.0.projector.'
+        proj_src = {
+            k[len(_proj_prefix):]: v
+            for k, v in state.items() if k.startswith(_proj_prefix)
+        }
+        if proj_src:
+            proj_model = self.neck.proj0.state_dict()
+            ok_proj, skip_proj = self._compatible_state(proj_src, proj_model)
+            self.neck.proj0.load_state_dict(ok_proj, strict=False)
+            print(f'[load_pretrained] neck.proj0: {len(ok_proj)} tensors transferred'
+                  + (f', {len(skip_proj)} shape-mismatched (skipped)' if skip_proj else ''))
+            if skip_proj:
+                print(f'  skipped: {skip_proj[:4]}{"..." if len(skip_proj) > 4 else ""}')
 
         # ── Decoder ───────────────────────────────────────────────────────────
         decoder_src = {

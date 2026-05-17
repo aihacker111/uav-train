@@ -63,7 +63,7 @@ class DecoderConfig:
     #   linear1           (2048, 256) → dim_feedforward=2048
     # num_feature_levels is propagated at build time from NeckConfig.num_output_levels.
     hidden_dim: int         = 256
-    num_layers: int         = 6     # 3 from pretrained; layers 4-6 use fresh init
+    num_layers: int         = 3     # matches pretrained LW-DETR checkpoint exactly
     sa_nheads: int          = 8
     ca_nheads: int          = 16    # verified from checkpoint
     dim_feedforward: int    = 2048  # verified from checkpoint (was wrongly 1024)
@@ -76,7 +76,7 @@ class DecoderConfig:
 @dataclass
 class CenterNetHeadConfig:
     """Stage-1 dense detection head."""
-    head_conv: int   = 64
+    head_conv: int   = 32   # 64→32 halves first-conv FLOPs at stride-4 (saves ~19G GFLOPs)
     num_classes: int = 7
 
 
@@ -90,9 +90,9 @@ class DETRHeadConfig:
 
 @dataclass
 class QueryGenConfig:
-    top_k: int             = 500    # candidates extracted from heatmap
-    nms_kernel: int        = 3      # local-max NMS window
-    score_threshold: float = 0.01   # discard near-zero peaks
+    top_k: int             = 300    # candidates extracted from heatmap (500 is overkill for VisDrone)
+    nms_kernel: int        = 21     # local-max NMS window (21×21 = 84px at stride4, covers large objects)
+    score_threshold: float = 0.01  # discard near-zero peaks
 
 
 @dataclass

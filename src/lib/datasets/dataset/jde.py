@@ -469,8 +469,9 @@ class JointDataset(LoadImagesAndLabels):  # for training
     """
     joint detection and embedding dataset
     """
-    mean = None
-    std = None
+    # set per-instance in __init__ based on arch; class-level fallback kept for safety
+    mean = [0.408, 0.447, 0.470]
+    std  = [0.289, 0.274, 0.278]
 
     def __init__(self,
                  opt,
@@ -560,6 +561,10 @@ class JointDataset(LoadImagesAndLabels):  # for training
         self.transforms = transforms
         self.pil_transform = pil_transform
 
+        use_imagenet = 'lwdetr' in opt.arch or 'hybrid' in opt.arch
+        self.mean = [0.485, 0.456, 0.406] if use_imagenet else [0.408, 0.447, 0.470]
+        self.std  = [0.229, 0.224, 0.225] if use_imagenet else [0.289, 0.274, 0.278]
+
         print('dataset summary')
         print(self.tid_num)
 
@@ -573,6 +578,99 @@ class JointDataset(LoadImagesAndLabels):  # for training
                 for cls_id, start_idx in v.items():
                     print('Start index of dataset {} class {:d} is {:d}'
                           .format(k, int(cls_id), int(start_idx)))
+
+    def _compute_repeat_factors(self, thresh: float = 0.001) -> list:
+        """
+        Per-image repeat factors for class-balanced WeightedRandomSampler.
+
+        rf[i] = max_c sqrt(thresh / f(c))  where f(c) = fraction of images
+        containing class c.  rf is clamped to [1.0, ∞) so common-class-only
+        images are sampled at their natural rate and rare-class images are
+        over-sampled.
+        """
+        all_label_files = []
+        for ds_labels in self.label_files.values():
+            all_label_files.extend(ds_labels)
+
+        n_imgs = len(all_label_files)
+        cls_img_count = defaultdict(int)
+        cls_per_img = []
+
+        for lp in all_label_files:
+            cls_set = set()
+            if os.path.isfile(lp) and os.path.getsize(lp) > 0:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    lb = np.loadtxt(lp, dtype=np.float32).reshape(-1, 6)
+                for row in lb:
+                    c = int(row[0])
+                    if 0 <= c < self.num_classes:
+                        cls_set.add(c)
+            cls_per_img.append(cls_set)
+            for c in cls_set:
+                cls_img_count[c] += 1
+
+        cls_freq = {c: count / n_imgs for c, count in cls_img_count.items()}
+
+        repeat_factors = []
+        for cls_set in cls_per_img:
+            if cls_set:
+                rf = max(math.sqrt(thresh / max(cls_freq.get(c, thresh), 1e-9))
+                         for c in cls_set)
+            else:
+                rf = 1.0
+            repeat_factors.append(max(rf, 1.0))
+        return repeat_factors
+
+    def _raw_pil_sample(self, idx: int):
+        """Return (PIL.Image, target_dict) for index idx without any transforms.
+
+        Used as the sample_fn for CopyPaste / Mosaic augmentations so donor
+        images are always in their original, unaugmented state.
+        """
+        import PIL.Image
+        for i, c in enumerate(self.cds):
+            if idx >= c:
+                ds = list(self.label_files.keys())[i]
+                start_index = c
+        img_path   = self.img_files[ds][idx - start_index]
+        label_path = self.label_files[ds][idx - start_index]
+
+        img = cv2.imread(img_path)
+        if img is None:
+            blank = PIL.Image.new('RGB', (self.width, self.height))
+            empty = {
+                'boxes':  torch.zeros((0, 4), dtype=torch.float32),
+                'labels': torch.zeros((0, 2), dtype=torch.float32),
+                'size':   torch.tensor([self.height, self.width]),
+            }
+            return blank, empty
+
+        h0, w0 = img.shape[:2]
+        img_pil = PIL.Image.fromarray(img[:, :, ::-1])  # BGR → RGB
+
+        if os.path.isfile(label_path) and os.path.getsize(label_path) > 0:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                labels_0 = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 6)
+            boxes_xyxy = np.stack([
+                w0 * (labels_0[:, 2] - labels_0[:, 4] / 2),
+                h0 * (labels_0[:, 3] - labels_0[:, 5] / 2),
+                w0 * (labels_0[:, 2] + labels_0[:, 4] / 2),
+                h0 * (labels_0[:, 3] + labels_0[:, 5] / 2),
+            ], axis=1).astype(np.float32)
+            target = {
+                'boxes':  torch.tensor(boxes_xyxy),
+                'labels': torch.tensor(labels_0[:, :2]),
+                'size':   torch.tensor([h0, w0]),
+            }
+        else:
+            target = {
+                'boxes':  torch.zeros((0, 4), dtype=torch.float32),
+                'labels': torch.zeros((0, 2), dtype=torch.float32),
+                'size':   torch.tensor([h0, w0]),
+            }
+        return img_pil, target
 
     def __getitem__(self, idx):
         # 为子训练集计算起始index
@@ -610,11 +708,22 @@ class JointDataset(LoadImagesAndLabels):  # for training
         _is_hybrid = getattr(self.opt, 'task', '') == 'hybrid'
         if _is_hybrid:
             if num_objs > 0:
-                _detr_boxes  = torch.from_numpy(labels[:, 2:6].copy()).float()
-                _detr_labels = torch.from_numpy(labels[:, 0].copy()).long()
+                _valid_mask   = (labels[:, 0] >= 0) & (labels[:, 0] < self.num_classes)
+                _valid_labels = labels[_valid_mask]
+                if _valid_mask.any():
+                    _detr_boxes  = torch.from_numpy(_valid_labels[:, 2:6].copy()).float()
+                    _detr_labels = torch.from_numpy(_valid_labels[:, 0].copy()).long()
+                    # track IDs already have global dataset offset added above;
+                    # subtract 1 for 0-indexed; -1 means no valid track ID
+                    _detr_ids    = torch.from_numpy((_valid_labels[:, 1] - 1).copy()).long()
+                else:
+                    _detr_boxes  = torch.zeros((0, 4), dtype=torch.float32)
+                    _detr_labels = torch.zeros((0,),   dtype=torch.long)
+                    _detr_ids    = torch.full((0,), -1, dtype=torch.long)
             else:
                 _detr_boxes  = torch.zeros((0, 4), dtype=torch.float32)
                 _detr_labels = torch.zeros((0,),   dtype=torch.long)
+                _detr_ids    = torch.full((0,), -1, dtype=torch.long)
 
         # --- GT of detection
         hm = np.zeros((self.num_classes, output_h, output_w), dtype=np.float32)  # C×H×W: heat-map通道数即类别数
@@ -646,6 +755,8 @@ class JointDataset(LoadImagesAndLabels):  # for training
 
             # 检测目标的类别(索引从0开始, 0代表背景类别)
             cls_id = int(label[0])
+            if cls_id < 0 or cls_id >= self.num_classes:
+                continue
 
             bbox[[0, 2]] = bbox[[0, 2]] * output_w
             bbox[[1, 3]] = bbox[[1, 3]] * output_h
@@ -707,7 +818,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
 
         # DETR-format targets — only emitted for hybrid task; collate_fn assembles into a list
         if _is_hybrid:
-            ret['targets'] = {'boxes': _detr_boxes, 'labels': _detr_labels}
+            ret['targets'] = {'boxes': _detr_boxes, 'labels': _detr_labels, 'ids': _detr_ids}
 
         return ret  # 返回一个字典(第一次见识这样的getitem)
 
