@@ -6,64 +6,73 @@ def scatter(inputs, target_gpus, dim=0, chunk_sizes=None):
     r"""
     Scatter tensors and other objects across GPUs.
 
-    - torch.Tensor: split along `dim` using Scatter (respects chunk_sizes).
-    - list of dict (per-sample annotations): chunk the list by slicing so
-      each GPU gets the right number of complete per-image target dicts.
-      Recursing into each dict and splitting its tensors is wrong — it
-      would give every GPU all N dicts with object tensors halved.
-    - list / tuple of other types: recurse element-wise then zip.
-    - dict: recurse over items then reconstruct per-GPU dicts.
-    - primitive / other: broadcast (one reference per GPU).
+    - torch.Tensor          : split along `dim` via Scatter (respects chunk_sizes).
+    - list of dict          : chunk list by image count AND move each dict's tensors
+                              directly to the assigned GPU — avoids a wasteful
+                              GPU0→GPU_i cross-device hop that happens when the
+                              caller pre-moves all targets to the primary device.
+    - list of other types   : recurse element-wise then zip across GPUs.
+    - tuple                 : recurse element-wise then zip across GPUs.
+    - dict                  : recurse over (k, v) items, rebuild per-GPU dicts.
+    - primitive / other     : broadcast one reference to every GPU.
     """
     n_gpus = len(target_gpus)
 
-    def _chunk_sizes_list(n):
-        """Split n items across GPUs respecting chunk_sizes if given."""
+    def _list_sizes(n):
+        """How many items each GPU gets, proportional to chunk_sizes."""
         if chunk_sizes is not None:
-            # chunk_sizes are image counts; scale proportionally for lists
-            total = sum(chunk_sizes)
-            sizes, start = [], 0
-            for cs in chunk_sizes:
-                sz = round(n * cs / total)
-                sizes.append(sz)
-                start += sz
-            # fix rounding drift on last GPU
-            sizes[-1] = n - sum(sizes[:-1])
+            total  = sum(chunk_sizes)
+            sizes  = [round(n * cs / total) for cs in chunk_sizes]
+            sizes[-1] = n - sum(sizes[:-1])   # absorb rounding remainder
             return sizes
         base, rem = divmod(n, n_gpus)
         return [base + (1 if i < rem else 0) for i in range(n_gpus)]
 
     def scatter_map(obj):
+        # ── Tensor: use PyTorch's native Scatter which respects chunk_sizes ──────
         if torch.is_tensor(obj):
             return Scatter.apply(target_gpus, chunk_sizes, dim, obj)
 
+        # ── List ──────────────────────────────────────────────────────────────────
         if isinstance(obj, list):
             if not obj:
                 return [[] for _ in target_gpus]
-            # Per-sample annotation lists (list-of-dict): chunk at list level.
-            # Each GPU must receive complete target dicts for its images;
-            # splitting tensor contents inside each dict is incorrect.
+
+            # List-of-dict (per-sample annotations like DETR targets):
+            #   Chunk the *list* and move each chunk's tensors to the assigned GPU.
+            #   Splitting tensors *inside* each dict is incorrect — it would give
+            #   every GPU all N dicts with object-count tensors halved.
             if isinstance(obj[0], dict):
-                sizes  = _chunk_sizes_list(len(obj))
-                chunks, start = [], 0
-                for sz in sizes:
-                    chunks.append(obj[start:start + sz])
+                sizes   = _list_sizes(len(obj))
+                chunks  = []
+                start   = 0
+                for gpu_idx, sz in enumerate(sizes):
+                    dev   = target_gpus[gpu_idx]
+                    chunk = obj[start:start + sz]
+                    chunks.append([
+                        {k: v.to(dev, non_blocking=True) if torch.is_tensor(v) else v
+                         for k, v in d.items()}
+                        for d in chunk
+                    ])
                     start += sz
                 return chunks
-            # List of tensors or other — recurse element-wise then zip
+
+            # Generic list: recurse element-wise and zip across GPUs.
             return list(map(list, zip(*map(scatter_map, obj))))
 
+        # ── Tuple ─────────────────────────────────────────────────────────────────
         if isinstance(obj, tuple):
             if not obj:
                 return [() for _ in target_gpus]
             return list(zip(*map(scatter_map, obj)))
 
+        # ── Dict ──────────────────────────────────────────────────────────────────
         if isinstance(obj, dict):
             if not obj:
                 return [{} for _ in target_gpus]
             return list(map(type(obj), zip(*map(scatter_map, obj.items()))))
 
-        # Primitive / non-tensor: broadcast unchanged to every GPU
+        # ── Primitive / non-tensor: broadcast unchanged ───────────────────────────
         return [obj for _ in target_gpus]
 
     return scatter_map(inputs)

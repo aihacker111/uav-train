@@ -84,15 +84,13 @@ class BaseTrainer:
             data_time.update(time.time() - end)
 
             for k in batch:
-                if k == 'meta':
+                if k in ('meta', 'targets'):
+                    # meta:    CPU-only metadata, not needed on GPU
+                    # targets: list-of-dict DETR annotations; scatter_gather moves
+                    #          each chunk's tensors directly to the assigned GPU,
+                    #          so pre-moving everything to the primary device here
+                    #          would cause a wasteful GPU0→GPU_i cross-device hop.
                     pass
-                elif k == 'targets':
-                    # list of per-image dicts with variable-size tensors
-                    batch[k] = [
-                        {kk: vv.to(device=opt.device, non_blocking=True)
-                         for kk, vv in t.items()}
-                        for t in batch[k]
-                    ]
                 else:
                     batch[k] = batch[k].to(device=opt.device, non_blocking=True)
 

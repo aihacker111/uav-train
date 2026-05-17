@@ -220,18 +220,25 @@ class HybridLoss(nn.Module):
     # ── Stage-1 ────────────────────────────────────────────────────────────────
 
     def _stage1_loss(self, cn_out: CenterNetOutput, batch: dict) -> Dict[str, Tensor]:
-        loss_hm = centernet_focal_loss(cn_out.hm, batch['hm'])
+        dev = cn_out.hm.device
 
-        reg_mask = batch['reg_mask']       # (B, max_obj)
-        ind      = batch['ind']            # (B, max_obj)
+        # Scatter.apply moves batch tensors to the replica device, but add an
+        # explicit guard so this function is safe even if called without scatter.
+        hm       = batch['hm'].to(dev,       non_blocking=True)
+        reg_mask = batch['reg_mask'].to(dev, non_blocking=True)
+        ind      = batch['ind'].to(dev,      non_blocking=True)
+        gt_wh    = batch['wh'].to(dev,       non_blocking=True)
+        gt_reg   = batch['reg'].to(dev,      non_blocking=True)
+
+        loss_hm  = centernet_focal_loss(cn_out.hm, hm)
         n        = reg_mask.sum().clamp(min=1).float()
 
         pred_wh  = _gather_at_ind(cn_out.wh,  ind)   # (B, max_obj, 2)
         pred_reg = _gather_at_ind(cn_out.reg, ind)
 
         mask     = reg_mask.unsqueeze(-1).float()
-        loss_wh  = (F.l1_loss(pred_wh,  batch['wh'],  reduction='none') * mask).sum() / n
-        loss_reg = (F.l1_loss(pred_reg, batch['reg'], reduction='none') * mask).sum() / n
+        loss_wh  = (F.l1_loss(pred_wh,  gt_wh,  reduction='none') * mask).sum() / n
+        loss_reg = (F.l1_loss(pred_reg, gt_reg, reduction='none') * mask).sum() / n
 
         total = loss_hm + self.lambda_wh * loss_wh + self.lambda_reg * loss_reg
         return {'total': total, 'hm': loss_hm, 'wh': loss_wh, 'reg': loss_reg}
@@ -424,6 +431,8 @@ class HybridLoss(nn.Module):
         # Move per-image target dicts to the replica device once here so that
         # _stage2_loss, _reid_loss, and _consistency_loss all see the right device.
         dev = outputs['stage2'].logits.device
+        # scatter_gather already moved each chunk's tensors to the replica device,
+        # so this is a no-op safety guard for any caller that bypasses scatter.
         targets = [
             {k: v.to(dev, non_blocking=True) if isinstance(v, torch.Tensor) else v
              for k, v in t.items()}

@@ -8,146 +8,98 @@ from .scatter_gather import scatter_kwargs
 
 
 class _DataParallel(Module):
-    r"""Implements data parallelism at the module level.
+    r"""Custom DataParallel that uses our fixed scatter_gather.
 
-    This container parallelizes the application of the given module by
-    splitting the input across the specified devices by chunking in the batch
-    dimension. In the forward pass, the module is replicated on each device,
-    and each replica handles a portion of the input. During the backwards
-    pass, gradients from each replica are summed into the original module.
-
-    The batch size should be larger than the number of GPUs used. It should
-    also be an integer multiple of the number of GPUs so that each chunk is the
-    same size (so that each GPU processes the same number of samples).
-
-    See also: :ref:`cuda-nn-dataparallel-instead`
-
-    Arbitrary positional and keyword inputs are allowed to be passed into
-    DataParallel EXCEPT Tensors. All variables will be scattered on dim
-    specified (default 0). Primitive types will be broadcasted, but all
-    other types will be a shallow copy and can be corrupted if written to in
-    the model's forward pass.
-
-    Args:
-        module: module to be parallelized
-        device_ids: CUDA devices (default: all devices)
-        output_device: device location of output (default: device_ids[0])
-
-    Example::
-
-        >>> net = torch.nn.DataParallel(model, device_ids=[0, 1, 2])
-        >>> output = net(input_var)
+    Differences from torch.nn.DataParallel:
+    - scatter: correctly chunks list-of-dict targets (DETR annotations) to each
+      GPU rather than splitting tensors inside each per-image dict.
+    - gather:  handles (model_out, loss, loss_stats) tuples whose model_out may
+      contain dataclass objects (CenterNetOutput, DETROutput) that PyTorch's
+      built-in gather cannot recurse into.
     """
 
-    # TODO: update notes/cuda.rst when this class handles 8+ GPUs well
-
     def __init__(self, module, device_ids=None, output_device=None, dim=0, chunk_sizes=None):
-        super(_DataParallel, self).__init__()
+        super().__init__()
 
         if not torch.cuda.is_available():
-            self.module = module
-            self.device_ids = []
+            self.module      = module
+            self.device_ids  = []
             return
 
         if device_ids is None:
             device_ids = list(range(torch.cuda.device_count()))
         if output_device is None:
             output_device = device_ids[0]
-        self.dim = dim
-        self.module = module
-        self.device_ids = device_ids
-        self.chunk_sizes = chunk_sizes
+
+        self.dim           = dim
+        self.module        = module
+        self.device_ids    = device_ids
+        self.chunk_sizes   = chunk_sizes
         self.output_device = output_device
+
         if len(self.device_ids) == 1:
             self.module.cuda(device_ids[0])
 
     def forward(self, *inputs, **kwargs):
         if not self.device_ids:
             return self.module(*inputs, **kwargs)
-        inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids, self.chunk_sizes)
+
+        inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids)
         if len(self.device_ids) == 1:
             return self.module(*inputs[0], **kwargs[0])
+
         replicas = self.replicate(self.module, self.device_ids[:len(inputs)])
-        outputs = self.parallel_apply(replicas, inputs, kwargs)
+        outputs  = self.parallel_apply(replicas, inputs, kwargs)
         return self.gather(outputs, self.output_device)
 
     def replicate(self, module, device_ids):
         return replicate(module, device_ids)
 
-    def scatter(self, inputs, kwargs, device_ids, chunk_sizes):
-        return scatter_kwargs(inputs, kwargs, device_ids, dim=self.dim, chunk_sizes=self.chunk_sizes)
+    def scatter(self, inputs, kwargs, device_ids):
+        return scatter_kwargs(inputs, kwargs, device_ids,
+                              dim=self.dim, chunk_sizes=self.chunk_sizes)
 
     def parallel_apply(self, replicas, inputs, kwargs):
         return parallel_apply(replicas, inputs, kwargs, self.device_ids[:len(replicas)])
 
     def gather(self, outputs, output_device):
-        # outputs: list of per-replica return values from ModelWithLoss.forward,
-        # i.e. [(model_out_0, loss_0, stats_0), (model_out_1, loss_1, stats_1), ...]
-        #
-        # PyTorch's built-in gather recurses into dicts and hits CenterNetOutput /
-        # DETROutput dataclasses which are not tensors, tuples, or plain dicts —
-        # causing TypeError.  We only need tensors gathered for backprop and logging;
-        # model_out is never used by run_epoch during training, so take GPU-0's copy.
+        """Gather (model_out, loss, loss_stats) tuples from all GPU replicas.
+
+        PyTorch's built-in gather recurses into dicts and hits dataclass objects
+        (CenterNetOutput, DETROutput) which are neither tensors, plain dicts, nor
+        namedtuples — causing TypeError.
+
+        Strategy:
+        - loss scalar  : stack → (n_gpus,) on output_device; caller does .mean()
+        - loss_stats   : stack each key → (n_gpus,) on output_device
+        - model_out    : take GPU-0's copy (not used in training backward pass)
+        """
         if (outputs
                 and isinstance(outputs[0], (tuple, list))
                 and len(outputs[0]) == 3
                 and isinstance(outputs[0][1], torch.Tensor)
                 and isinstance(outputs[0][2], dict)):
+
             model_outs = [o[0] for o in outputs]
-            losses     = torch.cat([o[1].reshape(1).to(output_device) for o in outputs])
+            losses     = torch.stack([o[1].to(output_device) for o in outputs])
             stats_keys = outputs[0][2].keys()
             gathered_stats = {
-                k: torch.cat([o[2][k].reshape(1).to(output_device) for o in outputs])
+                k: torch.stack([o[2][k].to(output_device) for o in outputs])
                 for k in stats_keys
             }
             return model_outs[0], losses, gathered_stats
 
+        # Fallback: standard PyTorch gather (works for plain tensor/dict outputs)
         return gather(outputs, output_device, dim=self.dim)
 
 
-def data_parallel(module, inputs, device_ids=None, output_device=None, dim=0, module_kwargs=None):
-    r"""Evaluates module(input) in parallel across the GPUs given in device_ids.
+def DataParallel(module, device_ids=None, output_device=None, dim=0, chunk_sizes=None):
+    """Factory that always returns _DataParallel for multi-GPU, so that our
+    fixed scatter (list-of-dict chunking + device placement) and custom gather
+    (dataclass-safe) are always active.
 
-    This is the functional version of the DataParallel module.
-
-    Args:
-        module: the module to evaluate in parallel
-        inputs: inputs to the module
-        device_ids: GPU ids on which to replicate module
-        output_device: GPU location of the output  Use -1 to indicate the CPU.
-            (default: device_ids[0])
-    Returns:
-        a Variable containing the result of module(input) located on
-        output_device
+    Single-GPU path delegates to torch.nn.DataParallel (no scatter needed).
     """
-    if not isinstance(inputs, tuple):
-        inputs = (inputs,)
-
-    if device_ids is None:
-        device_ids = list(range(torch.cuda.device_count()))
-
-    if output_device is None:
-        output_device = device_ids[0]
-
-    inputs, module_kwargs = scatter_kwargs(inputs, module_kwargs, device_ids, dim)
-    if len(device_ids) == 1:
-        return module(*inputs[0], **module_kwargs[0])
-    used_device_ids = device_ids[:len(inputs)]
-    replicas = replicate(module, used_device_ids)
-    outputs = parallel_apply(replicas, inputs, module_kwargs, used_device_ids)
-    return gather(outputs, output_device, dim)
-
-
-def DataParallel(module,
-                 device_ids=None,
-                 output_device=None,
-                 dim=0,
-                 chunk_sizes=None):
-    # Always use _DataParallel so the fixed scatter_gather (which correctly
-    # chunks list-of-dict targets rather than splitting tensors inside each
-    # dict) is used regardless of whether chunk_sizes are equal or not.
-    # torch.nn.DataParallel's built-in scatter has the same list-of-dict
-    # bug and would break the hybrid matcher with multi-GPU training.
-    if device_ids is not None and len(device_ids) == 1:
+    if device_ids is not None and len(device_ids) <= 1:
         return torch.nn.DataParallel(module, device_ids, output_device, dim)
     return _DataParallel(module, device_ids, output_device, dim, chunk_sizes)
