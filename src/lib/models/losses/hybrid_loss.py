@@ -292,15 +292,6 @@ class HybridLoss(nn.Module):
         detr_out: DETROutput,
         targets:  List[dict],
     ) -> Dict[str, Tensor]:
-        # Targets arrive on CPU after DataParallel scatter chunking.
-        # Move all tensors inside each target dict to the replica's device
-        # so matcher, reid_loss, and consistency_loss all see the right device.
-        dev = detr_out.logits.device
-        targets = [
-            {k: v.to(dev, non_blocking=True) if isinstance(v, torch.Tensor) else v
-             for k, v in t.items()}
-            for t in targets
-        ]
         indices = self.matcher(detr_out.logits, detr_out.boxes, targets)
         d       = self._detr_layer_loss(detr_out.logits, detr_out.boxes, targets, indices)
         total   = d['total']
@@ -430,8 +421,17 @@ class HybridLoss(nn.Module):
         outputs: Dict[str, Any],
         batch:   dict,
     ) -> tuple[Tensor, Dict[str, Tensor]]:
+        # Move per-image target dicts to the replica device once here so that
+        # _stage2_loss, _reid_loss, and _consistency_loss all see the right device.
+        dev = outputs['stage2'].logits.device
+        targets = [
+            {k: v.to(dev, non_blocking=True) if isinstance(v, torch.Tensor) else v
+             for k, v in t.items()}
+            for t in batch['targets']
+        ]
+
         s1 = self._stage1_loss(outputs['stage1'], batch)
-        s2 = self._stage2_loss(outputs['stage2'], batch['targets'])
+        s2 = self._stage2_loss(outputs['stage2'], targets)
 
         total = self.lambda_stage1 * s1['total'] + self.lambda_stage2 * s2['total']
 
@@ -447,14 +447,14 @@ class HybridLoss(nn.Module):
             'loss_ciou': s2['ciou'],
         }
 
-        if self.reid_classifier is not None and 'ids' in batch['targets'][0]:
-            l_reid = self._reid_loss(outputs['stage2'], batch['targets'], s2['indices'])
+        if self.reid_classifier is not None and 'ids' in targets[0]:
+            l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])
             total  = total + self.lambda_reid * l_reid
             loss_stats['loss_reid'] = l_reid
 
         # Consistency loss: Stage-1 hm peaks at Stage-2 matched centres
         l_consist = self._consistency_loss(
-            outputs['stage1'], outputs['stage2'], batch['targets'], s2['indices'],
+            outputs['stage1'], outputs['stage2'], targets, s2['indices'],
         )
         total = total + self.lambda_consist * l_consist
         loss_stats['loss_consist'] = l_consist
