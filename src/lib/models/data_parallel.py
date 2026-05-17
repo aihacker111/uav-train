@@ -122,20 +122,11 @@ def DataParallel(module,
                  output_device=None,
                  dim=0,
                  chunk_sizes=None):
-    """
-    :param module:
-    :param device_ids:
-    :param output_device:
-    :param dim:
-    :param chunk_sizes:
-    :return:
-    """
-    if chunk_sizes is None:
-        return torch.nn.DataParallel(module, device_ids, output_device, dim)
-    standard_size = True
-    for i in range(1, len(chunk_sizes)):
-        if chunk_sizes[i] != chunk_sizes[0]:
-            standard_size = False
-    if standard_size:
+    # Always use _DataParallel so the fixed scatter_gather (which correctly
+    # chunks list-of-dict targets rather than splitting tensors inside each
+    # dict) is used regardless of whether chunk_sizes are equal or not.
+    # torch.nn.DataParallel's built-in scatter has the same list-of-dict
+    # bug and would break the hybrid matcher with multi-GPU training.
+    if device_ids is not None and len(device_ids) == 1:
         return torch.nn.DataParallel(module, device_ids, output_device, dim)
     return _DataParallel(module, device_ids, output_device, dim, chunk_sizes)
