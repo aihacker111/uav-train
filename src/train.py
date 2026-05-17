@@ -10,6 +10,7 @@ import random
 import numpy as np
 # os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 import torch
+import torch.distributed as dist
 import torch.utils.data
 from torchvision.transforms import transforms as T
 
@@ -62,10 +63,12 @@ def scale_lr_for_multigpu(optimizer, opt) -> float:
     Returns the scalar factor that was applied (>1 means scale-up).
     """
     method = getattr(opt, 'lr_scale', 'linear')
-    if method == 'none' or len(opt.gpus) <= 1:
+    # Use DDP world_size when distributed, otherwise fall back to len(opt.gpus)
+    num_gpus = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else len(opt.gpus)
+    if method == 'none' or num_gpus <= 1:
         return 1.0
 
-    effective_bs  = opt.batch_size * len(opt.gpus)
+    effective_bs  = opt.batch_size * num_gpus
     base_bs       = max(getattr(opt, 'base_batch_size', opt.batch_size), 1)
     ratio         = effective_bs / base_bs
 
@@ -78,17 +81,31 @@ def scale_lr_for_multigpu(optimizer, opt) -> float:
         pg['lr'] *= factor
 
     lrs = [f'{pg["lr"]:.2e}' for pg in optimizer.param_groups]
-    print(f'[LR scale] method={method}, gpus={len(opt.gpus)}, '
+    print(f'[LR scale] method={method}, gpus={num_gpus}, '
           f'effective_bs={effective_bs}, base_bs={base_bs}, '
           f'factor={factor:.4f}  ->  lrs={lrs}')
     return factor
 
 
 def run(opt):
+    # ── Distributed setup (torchrun sets LOCAL_RANK; fall back to single-GPU) ──
+    local_rank = int(os.environ.get('LOCAL_RANK', -1))
+    is_distributed = local_rank >= 0
+    if is_distributed:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl')
+        rank       = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank       = 0
+        world_size = 1
+        local_rank = 0
+
     torch.manual_seed(opt.seed)
     torch.backends.cudnn.benchmark = not opt.not_cuda_benchmark and not opt.test
 
-    print('Setting up data...')
+    if rank == 0:
+        print('Setting up data...')
     Dataset = get_dataset(opt.dataset, opt.task)
 
     data_config = json.load(open(opt.data_cfg))
@@ -123,15 +140,21 @@ def run(opt):
     train_dataset.pil_transform = build_aerial_mot_transforms(sample_fn=_sample_fn)
 
     opt = opts().update_dataset_info_and_set_heads(opt, train_dataset)
-    print('opt:\n', opt)
-    logger = Logger(opt)
+    if rank == 0:
+        print('opt:\n', opt)
+    logger = Logger(opt) if rank == 0 else None
 
-    # ── Optional repeat-factor sampling for class imbalance ─────────────────────
-    sampler = None
-    if getattr(opt, 'use_repeat_sampling', False) and hasattr(train_dataset, '_compute_repeat_factors'):
+    # ── Sampler: DistributedSampler for DDP, optional repeat-factor for single-GPU
+    train_sampler = None
+    if is_distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        if getattr(opt, 'use_repeat_sampling', False) and rank == 0:
+            print('WARNING: repeat_factor sampling is not supported in DDP mode; using DistributedSampler')
+    elif getattr(opt, 'use_repeat_sampling', False) and hasattr(train_dataset, '_compute_repeat_factors'):
         thresh = getattr(opt, 'repeat_thresh', 0.001)
         rf = train_dataset._compute_repeat_factors(thresh)
-        sampler = torch.utils.data.WeightedRandomSampler(
+        train_sampler = torch.utils.data.WeightedRandomSampler(
             weights=rf, num_samples=len(rf), replacement=True)
         print(f'RepeatFactorSampler: thresh={thresh}, '
               f'min_rf={min(rf):.2f}, max_rf={max(rf):.2f}, '
@@ -140,8 +163,8 @@ def run(opt):
     train_loader = torch.utils.data.DataLoader(
         dataset=train_dataset,
         batch_size=opt.batch_size,
-        shuffle=(sampler is None),
-        sampler=sampler,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=opt.num_workers,
         pin_memory=True,
         drop_last=True,
@@ -150,10 +173,10 @@ def run(opt):
         prefetch_factor=2 if opt.num_workers > 0 else None,
     )
 
-    # ── Validation dataset (optional) ────────────────────────────────────────────
+    # ── Validation dataset (optional, only on rank 0) ───────────────────────────
     val_loader = None
     val_interval = getattr(opt, 'val_intervals', 5)
-    if 'val' in data_config and data_config['val']:
+    if rank == 0 and 'val' in data_config and data_config['val']:
         val_dataset = Dataset(
             opt=opt,
             root=dataset_root,
@@ -175,10 +198,13 @@ def run(opt):
         print(f'Val dataset: {len(val_dataset)} images, eval every {val_interval} epochs')
 
     # ── Model ────────────────────────────────────────────────────────────────────
-    os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpus_str
-    opt.device = torch.device('cuda' if opt.gpus[0] >= 0 else 'cpu')
+    # torchrun assigns GPUs via LOCAL_RANK; setting CUDA_VISIBLE_DEVICES would conflict.
+    if not is_distributed:
+        os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpus_str
+    opt.device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 
-    print('Creating model...')
+    if rank == 0:
+        print('Creating model...')
     model = create_model(opt.arch, opt.heads, opt.head_conv,
                          reid_dim=getattr(opt, 'reid_dim', 256))
 
@@ -238,7 +264,8 @@ def run(opt):
               f'resumed_step={resumed_step}')
 
     # ── Training loop ────────────────────────────────────────────────────────────
-    print('Starting training...')
+    if rank == 0:
+        print('Starting training...')
     _global_step       = start_epoch * len(train_loader)
     _freeze_epochs     = getattr(opt, 'freeze_backbone_epochs', 0)
     _backbone_frozen   = False
@@ -251,6 +278,10 @@ def run(opt):
         print(f'Backbone frozen (resuming mid-freeze, unfreeze at epoch {_freeze_epochs + 1})')
 
     for epoch in range(start_epoch + 1, opt.num_epochs + 1):
+
+        # Sync epoch across workers so DistributedSampler shuffles consistently
+        if is_distributed:
+            train_sampler.set_epoch(epoch)
 
         # ── Backbone freeze / unfreeze ────────────────────────────────────────────
         if _freeze_epochs > 0 and hasattr(model, 'backbone'):
@@ -272,17 +303,17 @@ def run(opt):
         log_train, _ = trainer.train(epoch, train_loader)
         _global_step += len(train_loader)
 
-        logger.write(f'epoch {epoch:03d} | train |')
-        for k, v in log_train.items():
-            logger.scalar_summary(f'train_{k}', v, epoch)
-            logger.write(f' {k} {v:.4f} |')
-        # Log current LR for monitoring
-        cur_lr = optimizer.param_groups[-1]['lr']
-        logger.write(f' lr {cur_lr:.2e} |')
-        logger.write('\n')
+        if rank == 0:
+            logger.write(f'epoch {epoch:03d} | train |')
+            for k, v in log_train.items():
+                logger.scalar_summary(f'train_{k}', v, epoch)
+                logger.write(f' {k} {v:.4f} |')
+            cur_lr = optimizer.param_groups[-1]['lr']
+            logger.write(f' lr {cur_lr:.2e} |')
+            logger.write('\n')
 
-        # ── Periodic validation / mAP evaluation ────────────────────────────────
-        if val_loader is not None and epoch % val_interval == 0:
+        # ── Periodic validation / mAP evaluation (rank 0 only) ──────────────────
+        if rank == 0 and val_loader is not None and epoch % val_interval == 0:
             if hasattr(trainer, 'evaluate'):
                 val_stats = trainer.evaluate(epoch, val_loader, logger=logger)
                 logger.write(f'epoch {epoch:03d} | val   |')
@@ -290,23 +321,27 @@ def run(opt):
                     logger.write(f' {k} {v:.4f} |')
                 logger.write('\n')
 
-        # ── Always save last checkpoint ──────────────────────────────────────────
-        save_model(os.path.join(opt.save_dir, 'model_last.pth'), epoch, model, optimizer)
-
-        # ── Periodic checkpoint (every 5 epochs or at lr_step) ───────────────────
-        if epoch in opt.lr_step or epoch % 5 == 0:
-            save_model(os.path.join(opt.save_dir, f'model_{epoch}.pth'), epoch, model, optimizer)
+        # ── Checkpointing (rank 0 only) ──────────────────────────────────────────
+        if rank == 0:
+            save_model(os.path.join(opt.save_dir, 'model_last.pth'), epoch, model, optimizer)
+            if epoch in opt.lr_step or epoch % 5 == 0:
+                save_model(os.path.join(opt.save_dir, f'model_{epoch}.pth'), epoch, model, optimizer)
 
         # ── Step-decay (only when cosine scheduler is NOT used) ──────────────────
         if not use_cosine and epoch in opt.lr_step:
             decay = 0.1 ** (opt.lr_step.index(epoch) + 1)
             for pg in optimizer.param_groups:
                 pg['lr'] *= decay
-            print(f'Epoch {epoch}: LR × {decay}')
+            if rank == 0:
+                print(f'Epoch {epoch}: LR × {decay}')
 
-        logger.write('\n')
+        if rank == 0:
+            logger.write('\n')
 
-    logger.close()
+    if rank == 0:
+        logger.close()
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

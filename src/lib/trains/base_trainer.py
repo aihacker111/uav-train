@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Dict, Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from progress.bar import Bar
 
@@ -40,7 +42,17 @@ class BaseTrainer:
         self.optimizer.add_param_group({'params': self.loss.parameters(), 'lr': heads_lr})
 
     def set_device(self, gpus, chunk_sizes, device) -> None:
-        if len(gpus) > 1:
+        is_ddp = dist.is_available() and dist.is_initialized()
+        if is_ddp:
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            self.model_with_loss = self.model_with_loss.to(device)
+            self.model_with_loss = torch.nn.parallel.DistributedDataParallel(
+                self.model_with_loss,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=getattr(self.opt, 'find_unused_parameters', False),
+            )
+        elif len(gpus) > 1:
             self.model_with_loss = DataParallel(
                 self.model_with_loss,
                 device_ids=list(range(len(gpus))),
@@ -60,7 +72,8 @@ class BaseTrainer:
         if phase == 'train':
             model_with_loss.train()
         else:
-            if len(self.opt.gpus) > 1:
+            is_ddp = dist.is_available() and dist.is_initialized()
+            if is_ddp or len(self.opt.gpus) > 1:
                 model_with_loss = self.model_with_loss.module
             model_with_loss.eval()
             torch.cuda.empty_cache()
