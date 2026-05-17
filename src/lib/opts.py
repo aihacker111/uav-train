@@ -357,8 +357,8 @@ class opts(object):
 
         self.parser.add_argument("--local-rank",
                                  type=int,
-                                 default=1,
-                                 help="number of cpu threads to use during batch generation")
+                                 default=-1,
+                                 help="Local rank for distributed training. Set automatically by torchrun/distributed.launch.")
 
         self.parser.add_argument('--save_dir_result',
                                  default='Lun_6_test_track_try',

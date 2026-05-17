@@ -88,8 +88,12 @@ def scale_lr_for_multigpu(optimizer, opt) -> float:
 
 
 def run(opt):
-    # ── Distributed setup (torchrun sets LOCAL_RANK; fall back to single-GPU) ──
+    # ── Distributed setup ─────────────────────────────────────────────────────
+    # torchrun sets LOCAL_RANK env var; old torch.distributed.launch only passes
+    # --local-rank as a CLI arg (stored in opt.local_rank, default -1).
     local_rank = int(os.environ.get('LOCAL_RANK', -1))
+    if local_rank < 0:                    # env var not set — try CLI arg fallback
+        local_rank = opt.local_rank
     is_distributed = local_rank >= 0
     if is_distributed:
         torch.cuda.set_device(local_rank)
@@ -172,6 +176,9 @@ def run(opt):
         persistent_workers=(opt.num_workers > 0),  # prevent worker respawn stalls
         prefetch_factor=2 if opt.num_workers > 0 else None,
     )
+    print(f'[rank {rank}] dataset={len(train_dataset)} imgs, '
+          f'sampler={type(train_sampler).__name__}, '
+          f'batch_size={opt.batch_size}, steps/epoch={len(train_loader)}')
 
     # ── Validation dataset (optional, only on rank 0) ───────────────────────────
     val_loader = None
