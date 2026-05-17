@@ -1,13 +1,13 @@
 {
-    "root": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019",
+    "root": "/workspace/uav-train/VisDrone2019-7cls",
     "train": {
-        "visdrone_train": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.train",
-        "visdrone_val": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.val"
+        "visdrone_train": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.train",
+        "visdrone_val": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.val"
     },
     "test_emb": {
-        "visdrone": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.train"
+        "visdrone": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.train"
     },
     "test": {
-        "visdrone": "/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019/VisDrone.train"
+        "visdrone": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.train"
     }
 }
