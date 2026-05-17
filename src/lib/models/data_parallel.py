@@ -81,6 +81,27 @@ class _DataParallel(Module):
         return parallel_apply(replicas, inputs, kwargs, self.device_ids[:len(replicas)])
 
     def gather(self, outputs, output_device):
+        # outputs: list of per-replica return values from ModelWithLoss.forward,
+        # i.e. [(model_out_0, loss_0, stats_0), (model_out_1, loss_1, stats_1), ...]
+        #
+        # PyTorch's built-in gather recurses into dicts and hits CenterNetOutput /
+        # DETROutput dataclasses which are not tensors, tuples, or plain dicts —
+        # causing TypeError.  We only need tensors gathered for backprop and logging;
+        # model_out is never used by run_epoch during training, so take GPU-0's copy.
+        if (outputs
+                and isinstance(outputs[0], (tuple, list))
+                and len(outputs[0]) == 3
+                and isinstance(outputs[0][1], torch.Tensor)
+                and isinstance(outputs[0][2], dict)):
+            model_outs = [o[0] for o in outputs]
+            losses     = torch.cat([o[1].reshape(1) for o in outputs]).to(output_device)
+            stats_keys = outputs[0][2].keys()
+            gathered_stats = {
+                k: torch.cat([o[2][k].reshape(1) for o in outputs]).to(output_device)
+                for k in stats_keys
+            }
+            return model_outs[0], losses, gathered_stats
+
         return gather(outputs, output_device, dim=self.dim)
 
 
