@@ -94,10 +94,10 @@ class _DataParallel(Module):
                 and isinstance(outputs[0][1], torch.Tensor)
                 and isinstance(outputs[0][2], dict)):
             model_outs = [o[0] for o in outputs]
-            losses     = torch.cat([o[1].reshape(1) for o in outputs]).to(output_device)
+            losses     = torch.cat([o[1].reshape(1).to(output_device) for o in outputs])
             stats_keys = outputs[0][2].keys()
             gathered_stats = {
-                k: torch.cat([o[2][k].reshape(1) for o in outputs]).to(output_device)
+                k: torch.cat([o[2][k].reshape(1).to(output_device) for o in outputs])
                 for k in stats_keys
             }
             return model_outs[0], losses, gathered_stats
