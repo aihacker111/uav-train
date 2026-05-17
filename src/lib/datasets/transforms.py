@@ -7,9 +7,11 @@ Added augmentations:
   CopyPaste       — paste objects from a donor image to increase object density
   Mosaic          — 4-image 2×2 grid (needs dataset reference via sample_fn)
 """
+import io
 import random
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import cv2
 import numpy as np
 import PIL
 from numbers import Number
@@ -675,35 +677,319 @@ class Compose:
         return format_string
 
 
+# ── UAV real-world condition augmentations ────────────────────────────────────
+
+class RandomFog:
+    """
+    Uniform haze/fog augmentation for UAV footage.
+
+    Physics: I = (1 - a) * J + a * fog_color
+    where a (fog coefficient) models the thickness of the atmosphere between
+    the drone and the ground. UAV footage is especially prone to this because
+    even thin haze becomes visible at altitude.
+
+    For heavier fog, reduces contrast and washes out colors — which is exactly
+    what causes false negatives in small-object detection.
+    """
+    def __init__(
+        self,
+        fog_coeff_range: Tuple[float, float] = (0.1, 0.5),
+        fog_color: Tuple[int, int, int] = (210, 215, 220),
+        p: float = 0.3,
+    ) -> None:
+        self.fog_coeff_range = fog_coeff_range
+        self.fog_color       = fog_color
+        self.p               = p
+
+    def __call__(self, img: PIL.Image.Image, target):
+        if random.random() >= self.p:
+            return img, target
+        coeff    = random.uniform(*self.fog_coeff_range)
+        fog_layer = PIL.Image.new('RGB', img.size, self.fog_color)
+        img = PIL.Image.blend(img, fog_layer, alpha=coeff)
+        return img, target
+
+
+class RandomMotionBlur:
+    """
+    Directional motion blur to simulate drone camera pan/tilt/roll.
+
+    Unlike isotropic Gaussian blur, real motion blur has a dominant direction
+    (the camera's velocity vector projected onto the image plane). A random
+    angle kernel at random length is applied per image.
+
+    kernel_size_range: (min, max) blur length in pixels — odd values only.
+    """
+    def __init__(
+        self,
+        kernel_size_range: Tuple[int, int] = (5, 19),
+        p: float = 0.25,
+    ) -> None:
+        self.kernel_size_range = kernel_size_range
+        self.p                 = p
+
+    @staticmethod
+    def _make_kernel(size: int, angle_deg: float) -> np.ndarray:
+        kernel = np.zeros((size, size), dtype=np.float32)
+        mid    = size // 2
+        rad    = np.deg2rad(angle_deg)
+        cos_a, sin_a = np.cos(rad), np.sin(rad)
+        for i in range(size):
+            off = i - mid
+            x = int(round(mid + off * cos_a))
+            y = int(round(mid + off * sin_a))
+            if 0 <= x < size and 0 <= y < size:
+                kernel[y, x] = 1.0
+        s = kernel.sum()
+        return kernel / s if s > 0 else kernel
+
+    def __call__(self, img: PIL.Image.Image, target):
+        if random.random() >= self.p:
+            return img, target
+        lo, hi  = self.kernel_size_range
+        size    = random.randrange(lo, hi + 1, 2)   # odd
+        angle   = random.uniform(0.0, 180.0)
+        kernel  = self._make_kernel(size, angle)
+        img_np  = np.array(img, dtype=np.float32)
+        blurred = cv2.filter2D(img_np, ddepth=-1, kernel=kernel)
+        blurred = np.clip(blurred, 0, 255).astype(np.uint8)
+        return PIL.Image.fromarray(blurred), target
+
+
+class RandomJPEGCompression:
+    """
+    JPEG compression artifact augmentation for UAV wireless video links.
+
+    UAV video is almost always transmitted over a compressed RF link (H.264,
+    H.265, or JPEG over MAVLink). At low bitrates or long range, blocking and
+    ringing artifacts appear. This augmentation re-encodes the image at a
+    random JPEG quality, which teaches the model to be robust to these artifacts.
+
+    quality_range: (min, max) JPEG quality — lower = more artifacts.
+    """
+    def __init__(
+        self,
+        quality_range: Tuple[int, int] = (40, 85),
+        p: float = 0.3,
+    ) -> None:
+        self.quality_range = quality_range
+        self.p             = p
+
+    def __call__(self, img: PIL.Image.Image, target):
+        if random.random() >= self.p:
+            return img, target
+        quality = random.randint(*self.quality_range)
+        buf     = io.BytesIO()
+        img.save(buf, format='JPEG', quality=quality)
+        buf.seek(0)
+        return PIL.Image.open(buf).copy(), target
+
+
+class RandomSensorNoise:
+    """
+    Sensor noise augmentation for low-light and high-ISO UAV footage.
+
+    Combines Gaussian noise (read/thermal noise, dominant at high ISO) with
+    Poisson noise (photon shot noise, dominant in very low light). The result
+    simulates the grainy texture seen in night flights or heavily shaded scenes.
+
+    gaussian_std_range: per-channel additive Gaussian std (pixel units, 0–255).
+    poisson_scale:      if > 0, Poisson noise is also added (scaled by this factor).
+    """
+    def __init__(
+        self,
+        gaussian_std_range: Tuple[float, float] = (5.0, 25.0),
+        poisson_scale: float = 0.08,
+        p: float = 0.25,
+    ) -> None:
+        self.gaussian_std_range = gaussian_std_range
+        self.poisson_scale      = poisson_scale
+        self.p                  = p
+
+    def __call__(self, img: PIL.Image.Image, target):
+        if random.random() >= self.p:
+            return img, target
+        img_np = np.array(img, dtype=np.float32)
+        # Gaussian read noise
+        std    = random.uniform(*self.gaussian_std_range)
+        img_np = img_np + np.random.normal(0.0, std, img_np.shape).astype(np.float32)
+        # Poisson shot noise (only sometimes, simulating very low light)
+        if self.poisson_scale > 0 and random.random() < 0.5:
+            img_scaled = np.clip(img_np, 0, 255) / 255.0
+            img_np = img_np + np.random.poisson(img_scaled * self.poisson_scale / self.poisson_scale) \
+                             * self.poisson_scale * 255.0
+        img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+        return PIL.Image.fromarray(img_np), target
+
+
+class RandomSunGlare:
+    """
+    Sun glare / lens flare augmentation for backlit UAV scenes.
+
+    Drones flying toward the sun or over reflective surfaces (water, glass
+    rooftops) frequently suffer from localized overexposure that saturates the
+    sensor and hides objects underneath. This augmentation places a soft
+    elliptical bright region at a random location, simulating the effect.
+
+    Objects under the glare are not removed from labels — the model must learn
+    to detect through partial glare.
+    """
+    def __init__(
+        self,
+        intensity_range: Tuple[float, float] = (0.3, 0.7),
+        p: float = 0.15,
+    ) -> None:
+        self.intensity_range = intensity_range
+        self.p               = p
+
+    def __call__(self, img: PIL.Image.Image, target):
+        if random.random() >= self.p:
+            return img, target
+        img_np    = np.array(img, dtype=np.float32)
+        h, w      = img_np.shape[:2]
+        cx        = random.randint(0, w)
+        cy        = random.randint(0, h)
+        rx        = random.randint(w // 10, w // 3)
+        ry        = random.randint(h // 10, h // 3)
+        Y, X      = np.ogrid[:h, :w]
+        dist      = ((X - cx) / rx) ** 2 + ((Y - cy) / ry) ** 2
+        mask      = np.exp(-dist * 2.0)[:, :, np.newaxis]   # Gaussian falloff
+        intensity = random.uniform(*self.intensity_range)
+        img_np    = img_np + intensity * 255.0 * mask
+        img_np    = np.clip(img_np, 0, 255).astype(np.uint8)
+        return PIL.Image.fromarray(img_np), target
+
+
+class RandomNightMode:
+    """
+    Night-mode simulation for KPI: night detection ≥ 70% of daytime mAP.
+
+    Combines three effects present in real low-light UAV footage:
+      1. Luminance reduction (0.05–0.35× of original) — simulates dusk/night scenes.
+      2. High-ISO Gaussian read noise (std 10–30 px) on top of the dark image.
+      3. Partial desaturation (optional) — low-light cameras lose color saturation
+         and shift toward cooler tones; blend toward greyscale by 30–80%.
+
+    The 3-channel output format is preserved so the rest of the pipeline is
+    unaffected regardless of whether desaturation is applied.
+    """
+    def __init__(
+        self,
+        brightness_range: Tuple[float, float] = (0.05, 0.35),
+        noise_std_range:  Tuple[float, float] = (10.0, 30.0),
+        desaturate_p:     float = 0.5,
+        p:                float = 0.25,
+    ) -> None:
+        self.brightness_range = brightness_range
+        self.noise_std_range  = noise_std_range
+        self.desaturate_p     = desaturate_p
+        self.p                = p
+
+    def __call__(self, img: PIL.Image.Image, target):
+        if random.random() >= self.p:
+            return img, target
+        # Step 1: reduce luminance
+        factor = random.uniform(*self.brightness_range)
+        img_np = np.array(img, dtype=np.float32) * factor
+        # Step 2: high-ISO Gaussian read noise
+        std    = random.uniform(*self.noise_std_range)
+        img_np = img_np + np.random.normal(0.0, std, img_np.shape).astype(np.float32)
+        img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+        img    = PIL.Image.fromarray(img_np)
+        # Step 3: partial desaturation toward greyscale
+        if random.random() < self.desaturate_p:
+            grey  = F.to_grayscale(img, num_output_channels=3)
+            blend = random.uniform(0.3, 0.8)
+            img   = PIL.Image.blend(img, grey, alpha=blend)
+        return img, target
+
+
+class RandomOcclusionPatch:
+    """
+    Occlusion-patch augmentation for KPI: track retention ≥ 80% after appearance change.
+
+    Simulates subjects changing jackets, reversing direction, or being partially
+    blocked by other objects — the appearance-change events described in the KPI.
+
+    Randomly places 1–num_patches rectangular patches filled with a color sampled
+    from the image itself, so the patch blends with the scene rather than being an
+    obvious black square.  The model must learn that identity should survive even
+    when part of an object's appearance is replaced by a scene-consistent occluder.
+
+    patch_scale_range: (min, max) fraction of each image dimension covered per patch.
+    num_patches:       maximum number of patches applied (uniformly drawn from 1…N).
+    """
+    def __init__(
+        self,
+        patch_scale_range: Tuple[float, float] = (0.05, 0.20),
+        num_patches:       int   = 2,
+        p:                 float = 0.30,
+    ) -> None:
+        self.patch_scale_range = patch_scale_range
+        self.num_patches       = num_patches
+        self.p                 = p
+
+    def __call__(self, img: PIL.Image.Image, target):
+        if random.random() >= self.p:
+            return img, target
+        img_np = np.array(img, dtype=np.uint8).copy()
+        h, w   = img_np.shape[:2]
+        n      = random.randint(1, self.num_patches)
+        for _ in range(n):
+            ph = max(4, int(h * random.uniform(*self.patch_scale_range)))
+            pw = max(4, int(w * random.uniform(*self.patch_scale_range)))
+            y0 = random.randint(0, max(0, h - ph))
+            x0 = random.randint(0, max(0, w - pw))
+            # Fill color sampled from a random scene pixel (scene-consistent occluder)
+            ry    = random.randint(0, h - 1)
+            rx    = random.randint(0, w - 1)
+            color = img_np[ry, rx].tolist()
+            img_np[y0:y0 + ph, x0:x0 + pw] = color
+        return PIL.Image.fromarray(img_np), target
+
+
 # ── recommended pipeline for aerial MOT (VisDrone) ──────────────────────────
 
 def build_aerial_mot_transforms(sample_fn=None):
     """
-    PIL-based pre-letterbox augmentation for aerial MOT (VisDrone 1920×1080).
+    PIL-based pre-letterbox augmentation for aerial MOT (VisDrone 1920x1080).
 
-    Design constraints:
-    - ScaleBiasedCrop: zoom-in biased crop to make small objects larger.
-      Applied with p=0.4 before multi-scale resize so objects aren't shrunk
-      further.  min_scale=0.35 ensures at least 35% of the image is kept.
-    - CopyPaste / Mosaic (optional): require `sample_fn` from the dataset.
-      Pass sample_fn=lambda: dataset[random.randint(0, len(dataset)-1)].
-    - RandomResize only: simulate different drone altitudes.
-    - Horizontal flip only: vertical flip rarely seen in drone footage.
-    - ColorJitter / GaussianBlur / Grayscale: lighting / sensor variation.
-    - Letterbox (in jde.py) handles the final 608×1088 reshape.
+    Pipeline order is deliberate:
+      1. Spatial (flip, crop) — before any pixel-level distortion so boxes stay valid.
+      2. Density augmentation (CopyPaste) — paste objects before appearance distortion.
+      3. Appearance (color jitter, grayscale) — global photometric variation.
+      4. UAV real-world degradations (fog, motion blur, JPEG, noise, glare) — applied
+         after appearance so they compound realistically.
+      5. Multi-scale resize — final spatial rescale before letterbox.
+
+    Each UAV augmentation is independently gated by its own probability so the
+    combination is stochastic and the model sees clean images often enough to not
+    over-fit to degraded inputs.
     """
     transforms = [
+        # ── spatial ───────────────────────────────────────────────────────────
         RandomHorizontalFlip(p=0.5),
         ScaleBiasedCrop(min_scale=0.35, max_scale=0.85, beta_alpha=2.0, beta_beta=5.0, p=0.4),
+        # ── appearance ────────────────────────────────────────────────────────
         RandomColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15, p=0.8),
-        RandomGaussianBlur(kernel_size=5, sigma=(0.1, 1.5), p=0.3),
-        RandomGrayscale(p=0.15),
+        RandomGrayscale(p=0.25),           # p raised 0.15→0.25 for night KPI
+        RandomNightMode(brightness_range=(0.05, 0.35), noise_std_range=(10.0, 30.0), p=0.25),
+        # ── UAV real-world degradations ───────────────────────────────────────
+        RandomFog(fog_coeff_range=(0.1, 0.45), p=0.3),
+        RandomMotionBlur(kernel_size_range=(5, 17), p=0.25),
+        RandomJPEGCompression(quality_range=(45, 85), p=0.3),
+        RandomSensorNoise(gaussian_std_range=(5.0, 20.0), poisson_scale=0.06, p=0.2),
+        RandomSunGlare(intensity_range=(0.3, 0.65), p=0.15),
+        RandomOcclusionPatch(patch_scale_range=(0.05, 0.20), num_patches=2, p=0.30),
+        # ── kept last: isotropic blur + multi-scale resize ────────────────────
+        RandomGaussianBlur(kernel_size=5, sigma=(0.1, 1.5), p=0.2),
         RandomResize([576, 608, 640, 672, 704], max_size=1333),
     ]
 
     if sample_fn is not None:
-        # Insert CopyPaste before the final resize (works on PIL images)
-        transforms.insert(1, CopyPaste(sample_fn=sample_fn, max_objects=15, p=0.4))
+        # CopyPaste after the first crop but before appearance — objects are
+        # pasted while the image is still at original resolution and color.
+        transforms.insert(2, CopyPaste(sample_fn=sample_fn, max_objects=15, p=0.4))
 
     return Compose(transforms)
 
@@ -712,15 +998,21 @@ def build_mosaic_transforms(sample_fn):
     """
     Mosaic-first pipeline for aggressive small-object augmentation.
 
-    Use this as an alternative to build_aerial_mot_transforms when training
-    from scratch or when small-object recall is low.  Mosaic is applied first
-    (it needs the raw PIL image before any spatial transforms).
+    Use when training from scratch or when small-object recall is low.
+    Includes the same UAV degradation stack as build_aerial_mot_transforms.
     """
     return Compose([
         Mosaic(sample_fn=sample_fn, p=0.5),
         RandomHorizontalFlip(p=0.5),
         RandomColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15, p=0.8),
-        RandomGaussianBlur(kernel_size=5, sigma=(0.1, 1.5), p=0.3),
-        RandomGrayscale(p=0.15),
+        RandomGrayscale(p=0.25),           # p raised 0.15→0.25 for night KPI
+        RandomNightMode(brightness_range=(0.05, 0.35), noise_std_range=(10.0, 30.0), p=0.25),
+        RandomFog(fog_coeff_range=(0.1, 0.45), p=0.3),
+        RandomMotionBlur(kernel_size_range=(5, 17), p=0.25),
+        RandomJPEGCompression(quality_range=(45, 85), p=0.3),
+        RandomSensorNoise(gaussian_std_range=(5.0, 20.0), poisson_scale=0.06, p=0.2),
+        RandomSunGlare(intensity_range=(0.3, 0.65), p=0.15),
+        RandomOcclusionPatch(patch_scale_range=(0.05, 0.20), num_patches=2, p=0.30),
+        RandomGaussianBlur(kernel_size=5, sigma=(0.1, 1.5), p=0.2),
         RandomResize([576, 608, 640, 672, 704], max_size=1333),
     ])

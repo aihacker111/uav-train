@@ -28,7 +28,7 @@ _DEFAULT_CKPTS = {
     'lwdetr_small': '../lwdetr_coco_pretrained/LWDETR_small_60e_coco.pth',
 }
 
-_LWDETR_HEADS = {'hm': 7, 'wh': 2, 'reg': 2, 'id': 128}
+_LWDETR_HEADS = {'hm': 7, 'wh': 2, 'reg': 2, 'id': 256}
 
 
 # ── Parameter counting ────────────────────────────────────────────────────────
@@ -157,9 +157,9 @@ def parse_args():
     parser.add_argument('--ckpt', default='',
                         help='Path to pretrained checkpoint (.pth). '
                              'Leave empty to use defaults for lwdetr variants.')
-    parser.add_argument('--input-h', type=int, default=512,
+    parser.add_argument('--input-h', type=int, default=704,
                         help='Input height (must be divisible by 64)')
-    parser.add_argument('--input-w', type=int, default=832,
+    parser.add_argument('--input-w', type=int, default=1280,
                         help='Input width (must be divisible by 64)')
     parser.add_argument('--no-ckpt', action='store_true',
                         help='Skip pretrained weight loading entirely')

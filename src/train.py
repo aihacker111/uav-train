@@ -27,7 +27,7 @@ def build_transforms(use_imagenet_norm, augment):
     if use_imagenet_norm:
         ops.append(T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
     if augment:
-        ops.append(T.RandomErasing(p=0.3, scale=(0.02, 0.08), ratio=(0.3, 3.3), value=0))
+        ops.append(T.RandomErasing(p=0.3, scale=(0.05, 0.20), ratio=(0.3, 3.3), value=0))
     return T.Compose(ops)
 
 
