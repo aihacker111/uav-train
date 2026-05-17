@@ -263,8 +263,8 @@ def gen_track_dataset(src_root, dst_root, viz_root=None):
 if __name__ == '__main__':
     # ── Paths — adjust if needed ──────────────────────────────────────────────
     # Raw VisDrone MOT data (sequences/ + annotations/)
-    TRAIN_SRC = '/workspace/uav-train/VisDrone2019-MOT-train'
-    VAL_SRC   = '/workspace/uav-train/VisDrone2019-MOT-val'
+    TRAIN_SRC = '/workspace/uav-train/visdrone2019/VisDrone2019-MOT-train'
+    VAL_SRC   = '/workspace/uav-train/visdrone2019/VisDrone2019-MOT-val'
 
     # Output root (converted AMOT format)
     OUT_ROOT  = '/workspace/uav-train/VisDrone2019-7cls'
