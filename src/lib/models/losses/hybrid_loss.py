@@ -292,6 +292,15 @@ class HybridLoss(nn.Module):
         detr_out: DETROutput,
         targets:  List[dict],
     ) -> Dict[str, Tensor]:
+        # Targets arrive on CPU after DataParallel scatter chunking.
+        # Move all tensors inside each target dict to the replica's device
+        # so matcher, reid_loss, and consistency_loss all see the right device.
+        dev = detr_out.logits.device
+        targets = [
+            {k: v.to(dev, non_blocking=True) if isinstance(v, torch.Tensor) else v
+             for k, v in t.items()}
+            for t in targets
+        ]
         indices = self.matcher(detr_out.logits, detr_out.boxes, targets)
         d       = self._detr_layer_loss(detr_out.logits, detr_out.boxes, targets, indices)
         total   = d['total']
