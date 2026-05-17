@@ -551,13 +551,14 @@ def embedding_distance(tracks, detections, metric='cosine'):
 def fuse_score_three(iou_cost_matrix, id_sim_matrix, detections):
     if iou_cost_matrix.size == 0:
         return iou_cost_matrix
-    iou_sim   = 1 - iou_cost_matrix
-    id_sim    = 1 - id_sim_matrix
-    # Gate by detection confidence so low-score detections don't compete equally
-    # with high-confidence ones during association.
-    det_scores = np.array([det.score for det in detections])
-    det_scores = np.expand_dims(det_scores, axis=0).repeat(iou_cost_matrix.shape[0], axis=0)
-    fuse_sim  = iou_sim * id_sim * det_scores
+    iou_sim = 1 - iou_cost_matrix
+    id_sim = 1 - id_sim_matrix
+    # det_scores = np.array([det.score for det in detections])
+    # det_scores = np.expand_dims(det_scores, axis=0).repeat(iou_cost_matrix.shape[0], axis=0)
+    fuse_sim = iou_sim * id_sim
+    # fuse_sim = iou_sim * det_scores
+    # fuse_sim = iou_sim * id_sim
+    # fuse_sim = id_sim
     fuse_cost = 1 - fuse_sim
     return fuse_cost
 

@@ -99,7 +99,6 @@ class MCTrack(MCBaseTrack):
                 tracks[i].covariance = cov
 
 
-    @staticmethod
     def multi_gmc(stracks, H=np.eye(2, 3)):
         if len(stracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
@@ -448,11 +447,6 @@ class MCJDETracker(object):
         h_out = net_height // self.opt.down_ratio
         w_out = net_width // self.opt.down_ratio
 
-        # Global Motion Compensation — estimate camera warp from raw frame once per
-        # frame, then shift all Kalman means before association so drone camera
-        # movement doesn't look like object motion.
-        gmc_warp = self.gmc.apply(img_0)
-
         ''' Step 1: Network forward, get detections & embeddings'''
         with torch.no_grad():
             output = self.model.forward(im_blob)[-1]
@@ -497,7 +491,7 @@ class MCJDETracker(object):
             remain_inds = cls_dets[:, 4] > self.opt.conf_thres
 
             if cls_id == 4:
-                inds_low = cls_dets[:, 4] > 0.1  # van: same low-score threshold as truck/bus
+                inds_low = cls_dets[:, 4] > 1
             elif cls_id == 5 or cls_id==8:
                 inds_low = cls_dets[:, 4] > 0.1
             else:
@@ -542,10 +536,6 @@ class MCJDETracker(object):
             # Predict the current location with KF
             MCTrack.multi_predict(self.lost_tracks_dict[cls_id])
             MCTrack.multi_predict(tracked_tracks_dict[cls_id])
-
-            # Apply GMC warp to compensate for drone camera motion
-            MCTrack.multi_gmc(tracked_tracks_dict[cls_id], gmc_warp)
-            MCTrack.multi_gmc(self.lost_tracks_dict[cls_id], gmc_warp)
 
             track_pool_dict = defaultdict(list)
             track_pool_dict[cls_id] = join_tracks(tracked_tracks_dict[cls_id], self.lost_tracks_dict[cls_id])
