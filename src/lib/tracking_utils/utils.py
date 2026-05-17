@@ -409,7 +409,7 @@ def return_torch_unique_index(u, uv):
 def strip_optimizer_from_checkpoint(filename='weights/best.pt'):
     # Strip optimizer from *.pt files for lighter files (reduced by 2/3 size)
 
-    a = torch.load(filename, map_location='cpu')
+    a = torch.load(filename, map_location='cpu', weights_only=False)
     a['optimizer'] = []
     torch.save(a, filename.replace('.pt', '_lite.pt'))
 

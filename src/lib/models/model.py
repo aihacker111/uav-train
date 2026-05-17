@@ -54,7 +54,7 @@ def load_pretrained_backbone(model: nn.Module, ckpt_path: str) -> nn.Module:
     Only the ViT encoder weights are transferred; projector and transformer
     heads are intentionally skipped (different task / num_classes).
     """
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     src        = checkpoint.get('model', checkpoint)
     prefix     = 'backbone.0.encoder.'
     state      = {k[len(prefix):]: v for k, v in src.items() if k.startswith(prefix)}
@@ -83,7 +83,7 @@ def load_model(
     Shape mismatches are handled gracefully: mismatched tensors are replaced
     with the model's current random weights so training can continue.
     """
-    checkpoint  = torch.load(path, map_location='cpu')
+    checkpoint  = torch.load(path, map_location='cpu', weights_only=False)
     if 'epoch' in checkpoint:
         print(f'[load_model] {path}  (epoch {checkpoint["epoch"]})')
 

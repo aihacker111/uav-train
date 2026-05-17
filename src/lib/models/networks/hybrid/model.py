@@ -155,7 +155,7 @@ class HybridCenterNetDETR(nn.Module):
         Task-specific heads (class_embed, bbox_embed, reid_mlp) are always
         trained from scratch (different num_classes and task).
         """
-        ckpt  = torch.load(path, map_location='cpu')
+        ckpt  = torch.load(path, map_location='cpu', weights_only=False)
         state = ckpt.get('model', ckpt)
 
         # ── Backbone ──────────────────────────────────────────────────────────
