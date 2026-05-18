@@ -70,25 +70,31 @@ def load_pretrained_backbone(model: nn.Module, ckpt_path: str) -> nn.Module:
 
 
 def load_model(
-    model:     nn.Module,
-    path:      str,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    resume:    bool = False,
-    lr:        Optional[float] = None,
-    lr_step:   Optional[list]  = None,
+    model:      nn.Module,
+    path:       str,
+    optimizer:  Optional[torch.optim.Optimizer] = None,
+    resume:     bool  = False,
+    lr:         Optional[float] = None,
+    lr_step:    Optional[list]  = None,
+    use_cosine: bool  = False,
 ):
     """
     Load a full AMOT checkpoint (model weights + optional optimizer state).
 
     Shape mismatches are handled gracefully: mismatched tensors are replaced
     with the model's current random weights so training can continue.
+
+    When resume=True the optimizer state is restored.  LR is reset to `lr`
+    with step-decay applied — UNLESS use_cosine=True, in which case the LR
+    is left at `lr` without any step-decay so the cosine scheduler can
+    compute the correct value from its own last_epoch.
     """
-    checkpoint  = torch.load(path, map_location='cpu', weights_only=False)
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
     if 'epoch' in checkpoint:
         print(f'[load_model] {path}  (epoch {checkpoint["epoch"]})')
 
-    src         = checkpoint.get('state_dict', checkpoint)
-    state_dict  = {
+    src        = checkpoint.get('state_dict', checkpoint)
+    state_dict = {
         (k[7:] if k.startswith('module') and not k.startswith('module_list') else k): v
         for k, v in src.items()
     }
@@ -99,7 +105,6 @@ def load_model(
             print(f'  [skip] {k}: ckpt {v.shape} ≠ model {model_state[k].shape}')
             state_dict[k] = model_state[k]
 
-    # Fill any keys present in the model but absent from the checkpoint
     for k in model_state:
         if k not in state_dict:
             state_dict[k] = model_state[k]
@@ -108,17 +113,59 @@ def load_model(
 
     if optimizer is not None and resume:
         if 'optimizer' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            # Capture per-group LRs from the fresh optimizer BEFORE loading the
+            # checkpoint.  These reflect the intended backbone/heads ratio
+            # (e.g. backbone_lr_scale) set at optimizer creation time and are
+            # used below to restore the ratio after LR reset.
+            pre_lrs = [pg['lr'] for pg in optimizer.param_groups]
+            ref_lr  = pre_lrs[-1]          # last group = heads = opt.lr (unscaled)
+
+            ckpt_opt = checkpoint['optimizer']
+
+            # ── Param-group count mismatch ────────────────────────────────────
+            # The checkpoint was saved AFTER BaseTrainer.__init__ added the loss
+            # param group (e.g. ReID classifier), so it has n_cur+1 groups while
+            # the freshly created optimizer still has n_cur groups.  Truncate the
+            # checkpoint to match so load_state_dict does not raise ValueError.
+            n_cur  = len(optimizer.param_groups)
+            n_ckpt = len(ckpt_opt.get('param_groups', []))
+            if n_cur != n_ckpt:
+                print(f'  [warn] checkpoint has {n_ckpt} param groups, '
+                      f'current optimizer has {n_cur} — keeping first {n_cur}')
+                kept_groups    = ckpt_opt['param_groups'][:n_cur]
+                kept_param_ids = {pid for g in kept_groups for pid in g['params']}
+                ckpt_opt = {
+                    'state':        {k: v for k, v in ckpt_opt['state'].items()
+                                     if k in kept_param_ids},
+                    'param_groups': kept_groups,
+                }
+
+            optimizer.load_state_dict(ckpt_opt)
             start_epoch = checkpoint['epoch']
-            start_lr    = lr
-            for step in lr_step:
-                if start_epoch >= step:
-                    start_lr *= 0.1
-            for pg in optimizer.param_groups:
-                pg['lr'] = start_lr
-            print(f'  resumed optimizer  lr={start_lr}')
+
+            # ── Target LR for the reference (heads) group ─────────────────────
+            # Cosine: do NOT apply step-decay — the scheduler recomputes the
+            # correct value from last_epoch; applying decay here would
+            # double-decay and give a far-too-small LR.
+            if use_cosine:
+                target_ref_lr = lr
+            else:
+                target_ref_lr = lr
+                for step in lr_step or []:
+                    if start_epoch >= step:
+                        target_ref_lr *= 0.1
+
+            # ── Restore per-group LRs, preserving backbone/heads ratio ────────
+            # Example: backbone group gets target_ref_lr * backbone_lr_scale
+            #          instead of being reset to target_ref_lr like the heads.
+            for pg, pre_lr in zip(optimizer.param_groups, pre_lrs):
+                pg['lr'] = (target_ref_lr * pre_lr / ref_lr) if ref_lr > 0 else target_ref_lr
+
+            lrs_str = ', '.join(f'{pg["lr"]:.2e}' for pg in optimizer.param_groups)
+            print(f'  resumed optimizer  epoch={start_epoch}  lrs=[{lrs_str}]'
+                  f'  (cosine={use_cosine})')
         else:
-            print('  [warn] no optimizer state in checkpoint')
+            print('  [warn] no optimizer state in checkpoint — starting optimizer fresh')
 
     if optimizer is not None:
         return model, optimizer, checkpoint.get('epoch', 0)
@@ -126,12 +173,16 @@ def load_model(
 
 
 def save_model(path: str, epoch: int, model: nn.Module, optimizer=None) -> None:
-    """Save model (and optionally optimizer) state to disk."""
-    state_dict = (
-        model.module.state_dict()
-        if isinstance(model, nn.DataParallel)
-        else model.state_dict()
-    )
+    """Save model (and optionally optimizer) state to disk.
+
+    Unwraps DataParallel / DistributedDataParallel / custom _DataParallel so
+    the saved state_dict always has clean keys (no 'module.' prefix).
+    """
+    # Unwrap any parallel wrapper — check .module attribute generically so this
+    # works for nn.DataParallel, torch DDP, and our custom _DataParallel alike.
+    unwrapped = getattr(model, 'module', model)
+    state_dict = unwrapped.state_dict()
+
     data = {'epoch': epoch, 'state_dict': state_dict}
     if optimizer is not None:
         data['optimizer'] = optimizer.state_dict()

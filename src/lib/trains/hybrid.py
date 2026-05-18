@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from lib.models.losses.hybrid_loss import HybridLoss
 from lib.models.networks.hybrid.heads import CenterNetOutput, DETROutput
-from lib.utils.det_eval import DetectionEvaluator
+from lib.utils.det_eval import COCOEvaluator, VISDRONE_CLASSES
 from .base_trainer import BaseTrainer
 
 
@@ -103,7 +103,8 @@ class HybridTrainer(BaseTrainer):
         model = mwl.module.model if hasattr(mwl, 'module') else mwl.model
         model.eval()
 
-        ev = DetectionEvaluator(num_classes=opt.num_classes)
+        ev = COCOEvaluator(num_classes=opt.num_classes,
+                           class_names=VISDRONE_CLASSES[:opt.num_classes])
 
         with torch.no_grad():
             for batch in val_loader:
@@ -151,9 +152,8 @@ class HybridTrainer(BaseTrainer):
                               gt_boxes.astype(np.float32),  gt_labels)
 
         stats = ev.summarize()
-
-        parts = ' | '.join(f'{k} {v:.4f}' for k, v in stats.items())
-        print(f'[eval] epoch {epoch:03d} | {parts}')
+        print(f'\n[eval] epoch {epoch:03d}')
+        ev.print_summary(stats)
 
         if logger is not None:
             for k, v in stats.items():

@@ -229,10 +229,7 @@ def run(opt):
     else:
         optimizer = torch.optim.Adam(model.parameters(), opt.lr)
 
-    # Scale LR for multi-GPU before any checkpoint is loaded
-    scale_lr_for_multigpu(optimizer, opt)
-
-    # Load pretrained weights
+    # Load pretrained weights (before any LR scaling or checkpoint resume)
     if opt.backbone_weights:
         if 'hybrid' in opt.arch and hasattr(model, 'load_pretrained'):
             model.load_pretrained(opt.backbone_weights)
@@ -240,11 +237,17 @@ def run(opt):
             from lib.models.model import load_pretrained_backbone
             model = load_pretrained_backbone(model, opt.backbone_weights)
 
-    # Resume from checkpoint
+    # Resume from checkpoint — pass use_cosine so load_model doesn't double-decay
+    use_cosine  = getattr(opt, 'cosine_lr', False)
     start_epoch = 0
     if opt.load_model != '':
         model, optimizer, start_epoch = load_model(
-            model, opt.load_model, optimizer, opt.resume, opt.lr, opt.lr_step)
+            model, opt.load_model, optimizer, opt.resume, opt.lr, opt.lr_step,
+            use_cosine=use_cosine)
+
+    # Scale LR for multi-GPU AFTER checkpoint is loaded so scaling isn't
+    # overwritten by the optimizer state restore inside load_model.
+    scale_lr_for_multigpu(optimizer, opt)
 
     # ── Trainer ──────────────────────────────────────────────────────────────────
     Trainer = train_factory[opt.task]

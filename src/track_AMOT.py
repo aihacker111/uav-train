@@ -35,30 +35,44 @@ def _tlwh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
     return out
 
 
-def load_gt_detections(ann_file: str) -> dict:
+def load_gt_detections(ann_file: str) -> tuple:
     """
-    Read VisDrone/MOT ground-truth annotation file and return per-frame
-    detection boxes with class labels.
+    Read VisDrone annotation file.
 
-    Format: frame_id, target_id, x, y, w, h, score, object_category, ...
-    object_category is 1-indexed (VisDrone: 1=pedestrian … 10=motor).
-    Returns {frame_id: [(tlwh, cls_id_0indexed), ...]}
+    Format: frame_id, target_id, x, y, w, h, score, object_category, truncation, occlusion
+      score=1 → valid,  score=0 → ignored/don't-care
+      object_category: 1-indexed (1=pedestrian … 10=motor, 0=ignored-region, 11=others)
+
+    Returns:
+        frame_dets   : {frame_id: [(tlwh, cls_id_0idx), ...]}  — valid objects only
+        frame_ignores: {frame_id: [tlwh, ...]}                  — ignored regions
     """
-    frame_dets: dict = {}
+    frame_dets:    dict = {}
+    frame_ignores: dict = {}
     if not osp.isfile(ann_file):
-        return frame_dets
+        return frame_dets, frame_ignores
+
     with open(ann_file, 'r') as f:
         for line in f:
             parts = line.strip().split(',')
             if len(parts) < 8:
                 continue
-            fid = int(parts[0])
-            tlwh = tuple(float(x) for x in parts[2:6])
-            cls_id = int(float(parts[7])) - 1   # 1-indexed → 0-indexed
+            fid    = int(parts[0])
+            tlwh   = np.array([float(x) for x in parts[2:6]], dtype=np.float32)
+            score  = int(float(parts[6]))      # 1=valid, 0=ignored
+            cat    = int(float(parts[7]))      # 1-indexed category
+            cls_id = cat - 1                   # 0-indexed
+
+            # ignored region or invalid object → don't-care
+            if score == 0 or cat == 0 or cat == 11:
+                frame_ignores.setdefault(fid, []).append(tlwh)
+                continue
+
             if cls_id < 0:
                 continue
-            frame_dets.setdefault(fid, []).append((np.array(tlwh, dtype=np.float32), cls_id))
-    return frame_dets
+            frame_dets.setdefault(fid, []).append((tlwh, cls_id))
+
+    return frame_dets, frame_ignores
 
 
 # ── Core tracking / detection loop ────────────────────────────────────────────
@@ -193,7 +207,9 @@ def main(opt,
     n_frame = 0
     timer_avgs, timer_calls = [], []
 
-    det_ev = DetectionEvaluator(num_classes=opt.num_classes)  # accumulates across all seqs
+    from lib.utils.det_eval import COCOEvaluator, VISDRONE_CLASSES
+    det_ev = COCOEvaluator(num_classes=opt.num_classes,
+                           class_names=VISDRONE_CLASSES[:opt.num_classes])
 
     for seq in seqs:
         output_dir = os.path.join(
@@ -218,12 +234,13 @@ def main(opt,
         # ── Detection mAP: compare predictions vs GT per frame ───────────────
         ann_root = osp.join(osp.dirname(data_root), 'annotations')
         ann_file = osp.join(ann_root, f'{seq}.txt')
-        gt_frame_dets = load_gt_detections(ann_file)
+        gt_frame_dets, gt_frame_ignores = load_gt_detections(ann_file)
 
         all_frame_ids = set(frame_det_results.keys()) | set(gt_frame_dets.keys())
         for fid in sorted(all_frame_ids):
-            preds = frame_det_results.get(fid, [])
-            gts   = gt_frame_dets.get(fid, [])
+            preds   = frame_det_results.get(fid, [])
+            gts     = gt_frame_dets.get(fid, [])
+            ignores = gt_frame_ignores.get(fid, [])
 
             if preds:
                 pb, ps, pl = zip(*preds)
@@ -243,7 +260,12 @@ def main(opt,
                 gt_boxes  = np.zeros((0, 4), dtype=np.float32)
                 gt_labels = np.zeros((0,),   dtype=np.int64)
 
-            det_ev.update(pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels)
+            ignore_boxes = (
+                _tlwh_to_xyxy(np.stack(ignores)) if ignores else None
+            )
+
+            det_ev.update(pred_boxes, pred_scores, pred_labels,
+                          gt_boxes,  gt_labels, ignore_boxes)
 
         # ── MOT tracking metrics ─────────────────────────────────────────────
         logger.info('Evaluate seq: {}'.format(seq))
@@ -272,17 +294,10 @@ def main(opt,
     Evaluator.save_summary(summary, os.path.join(
         result_root, 'summary_{}.xlsx'.format(exp_name)))
 
-    # ── Detection metrics (mAP50, mAP50:95) ──────────────────────────────────
-    det_stats = det_ev.summarize()
+    # ── Detection metrics (COCO-style) ───────────────────────────────────────
     print('\n===== Detection Metrics =====')
-    print(f"{'Metric':<20} {'Value':>8}")
-    print('-' * 30)
-    for k in ('mAP50:95', 'mAP50'):
-        print(f"{k:<20} {det_stats.get(k, 0.0):>8.4f}")
-    print('-' * 30)
-    for k, v in sorted(det_stats.items()):
-        if k.startswith('AP50_cls'):
-            print(f"  {k:<18} {v:>8.4f}")
+    det_stats = det_ev.summarize()
+    det_ev.print_summary(det_stats)
 
 
 if __name__ == '__main__':

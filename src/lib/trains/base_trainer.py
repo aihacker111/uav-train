@@ -38,8 +38,21 @@ class BaseTrainer:
         # Register any learnable parameters inside the loss (e.g. ReID classifier).
         # Explicitly mirror the last param group's LR so these params receive the
         # same (already multi-GPU-scaled) learning rate as the model heads.
-        heads_lr = self.optimizer.param_groups[-1]['lr']
-        self.optimizer.add_param_group({'params': self.loss.parameters(), 'lr': heads_lr})
+        #
+        # When resuming, the checkpoint's optimizer.state_dict() already contains
+        # this extra param group (it was saved with it).  load_model restores all
+        # groups so we must NOT add it again — that would create a duplicate group
+        # and misalign the optimizer state.  We detect a resume by comparing the
+        # current number of param groups against what we expect before adding.
+        loss_params = list(self.loss.parameters())
+        if loss_params:
+            already_registered = any(
+                any(p is lp for p in pg['params'] for lp in loss_params)
+                for pg in self.optimizer.param_groups
+            )
+            if not already_registered:
+                heads_lr = self.optimizer.param_groups[-1]['lr']
+                self.optimizer.add_param_group({'params': loss_params, 'lr': heads_lr})
 
     def set_device(self, gpus, chunk_sizes, device) -> None:
         is_ddp = dist.is_available() and dist.is_initialized()
