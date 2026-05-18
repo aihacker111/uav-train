@@ -237,21 +237,26 @@ def run(opt):
             from lib.models.model import load_pretrained_backbone
             model = load_pretrained_backbone(model, opt.backbone_weights)
 
-    # Resume from checkpoint — pass use_cosine so load_model doesn't double-decay
+    # ── Trainer (created BEFORE load_model so loss params are in optimizer) ──────
+    # Creating the Trainer first ensures the loss param group (e.g. ReID classifier)
+    # is already registered in the optimizer before load_model restores state —
+    # this fixes the N vs N+1 param group mismatch on resume.
     use_cosine  = getattr(opt, 'cosine_lr', False)
+    Trainer     = train_factory[opt.task]
+    trainer     = Trainer(opt=opt, model=model, optimizer=optimizer)
+
+    # Resume from checkpoint — pass use_cosine so load_model doesn't double-decay,
+    # and pass trainer.loss so ReID classifier weights are also restored.
     start_epoch = 0
     if opt.load_model != '':
         model, optimizer, start_epoch = load_model(
             model, opt.load_model, optimizer, opt.resume, opt.lr, opt.lr_step,
-            use_cosine=use_cosine)
+            use_cosine=use_cosine, loss=trainer.loss)
 
     # Scale LR for multi-GPU AFTER checkpoint is loaded so scaling isn't
     # overwritten by the optimizer state restore inside load_model.
     scale_lr_for_multigpu(optimizer, opt)
 
-    # ── Trainer ──────────────────────────────────────────────────────────────────
-    Trainer = train_factory[opt.task]
-    trainer = Trainer(opt=opt, model=model, optimizer=optimizer)
     trainer.set_device(opt.gpus, opt.chunk_sizes, opt.device)
 
     # ── Cosine LR scheduler with linear warmup ───────────────────────────────────
@@ -339,9 +344,11 @@ def run(opt):
 
         # ── Checkpointing (rank 0 only) ──────────────────────────────────────────
         if rank == 0:
-            save_model(os.path.join(opt.save_dir, 'model_last.pth'), epoch, model, optimizer)
+            save_model(os.path.join(opt.save_dir, 'model_last.pth'),
+                       epoch, model, optimizer, loss=trainer.loss)
             if epoch in opt.lr_step or epoch % 5 == 0:
-                save_model(os.path.join(opt.save_dir, f'model_{epoch}.pth'), epoch, model, optimizer)
+                save_model(os.path.join(opt.save_dir, f'model_{epoch}.pth'),
+                           epoch, model, optimizer, loss=trainer.loss)
 
         # ── Step-decay (only when cosine scheduler is NOT used) ──────────────────
         if not use_cosine and epoch in opt.lr_step:

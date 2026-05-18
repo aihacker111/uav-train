@@ -77,6 +77,7 @@ def load_model(
     lr:         Optional[float] = None,
     lr_step:    Optional[list]  = None,
     use_cosine: bool  = False,
+    loss:       Optional[nn.Module] = None,
 ):
     """
     Load a full AMOT checkpoint (model weights + optional optimizer state).
@@ -167,23 +168,42 @@ def load_model(
         else:
             print('  [warn] no optimizer state in checkpoint — starting optimizer fresh')
 
+    # Restore learnable loss parameters (e.g. ReID classifier in HybridLoss).
+    # These are NOT part of model.state_dict() so they must be saved/loaded separately.
+    if loss is not None and 'loss_state' in checkpoint:
+        loss.load_state_dict(checkpoint['loss_state'])
+        print('  restored loss state (ReID classifier weights)')
+    elif loss is not None and resume:
+        print('  [warn] no loss_state in checkpoint — ReID classifier starts fresh')
+
     if optimizer is not None:
         return model, optimizer, checkpoint.get('epoch', 0)
     return model
 
 
-def save_model(path: str, epoch: int, model: nn.Module, optimizer=None) -> None:
-    """Save model (and optionally optimizer) state to disk.
+def save_model(
+    path:      str,
+    epoch:     int,
+    model:     nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    loss:      Optional[nn.Module]             = None,
+) -> None:
+    """Save model (and optionally optimizer + loss) state to disk.
 
     Unwraps DataParallel / DistributedDataParallel / custom _DataParallel so
     the saved state_dict always has clean keys (no 'module.' prefix).
-    """
-    # Unwrap any parallel wrapper — check .module attribute generically so this
-    # works for nn.DataParallel, torch DDP, and our custom _DataParallel alike.
-    unwrapped = getattr(model, 'module', model)
-    state_dict = unwrapped.state_dict()
 
-    data = {'epoch': epoch, 'state_dict': state_dict}
+    `loss` should be the trainer's loss module (e.g. HybridLoss) so that
+    learnable parameters inside it (e.g. ReID classifier) are persisted and
+    can be restored on resume — they are NOT part of model.state_dict().
+    """
+    unwrapped  = getattr(model, 'module', model)
+    data = {
+        'epoch':      epoch,
+        'state_dict': unwrapped.state_dict(),
+    }
     if optimizer is not None:
         data['optimizer'] = optimizer.state_dict()
+    if loss is not None and len(list(loss.parameters())) > 0:
+        data['loss_state'] = loss.state_dict()
     torch.save(data, path)
