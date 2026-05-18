@@ -48,6 +48,7 @@ from lib.datasets.transforms import (
     RandomOcclusionPatch,
     CopyPaste,
     Mosaic,
+    build_aerial_mot_transforms,
 )
 
 

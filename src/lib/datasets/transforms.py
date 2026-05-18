@@ -954,17 +954,16 @@ def build_aerial_mot_transforms(sample_fn=None):
     """
     PIL-based pre-letterbox augmentation for aerial MOT (VisDrone 1920x1080).
 
-    Pipeline order is deliberate:
-      1. Spatial (flip, crop) — before any pixel-level distortion so boxes stay valid.
-      2. Density augmentation (CopyPaste) — paste objects before appearance distortion.
-      3. Appearance (color jitter, grayscale) — global photometric variation.
-      4. UAV real-world degradations (fog, motion blur, JPEG, noise, glare) — applied
-         after appearance so they compound realistically.
-      5. Multi-scale resize — final spatial rescale before letterbox.
+    Pipeline order:
+      1. Mosaic (p=0.5)      — 4-image grid for aggressive density boost (requires sample_fn).
+      2. Spatial             — flip + zoom-in crop; keep before pixel ops so boxes stay valid.
+      3. CopyPaste (p=0.4)   — paste extra objects at original resolution (requires sample_fn).
+      4. Appearance          — color jitter, grayscale, night-mode.
+      5. UAV degradations    — fog, motion blur, JPEG, sensor noise, sun glare, occlusion patch.
+      6. Resize              — multi-scale letterbox prep.
 
-    Each UAV augmentation is independently gated by its own probability so the
-    combination is stochastic and the model sees clean images often enough to not
-    over-fit to degraded inputs.
+    When sample_fn is None (first dataset construction pass), Mosaic and CopyPaste are
+    omitted — they are inserted once sample_fn is wired up with the real dataset.
     """
     transforms = [
         # ── spatial ───────────────────────────────────────────────────────────
@@ -972,7 +971,7 @@ def build_aerial_mot_transforms(sample_fn=None):
         ScaleBiasedCrop(min_scale=0.35, max_scale=0.85, beta_alpha=2.0, beta_beta=5.0, p=0.4),
         # ── appearance ────────────────────────────────────────────────────────
         RandomColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15, p=0.8),
-        RandomGrayscale(p=0.25),           # p raised 0.15→0.25 for night KPI
+        RandomGrayscale(p=0.25),
         RandomNightMode(brightness_range=(0.05, 0.35), noise_std_range=(10.0, 30.0), p=0.25),
         # ── UAV real-world degradations ───────────────────────────────────────
         RandomFog(fog_coeff_range=(0.1, 0.45), p=0.3),
@@ -987,32 +986,10 @@ def build_aerial_mot_transforms(sample_fn=None):
     ]
 
     if sample_fn is not None:
-        # CopyPaste after the first crop but before appearance — objects are
-        # pasted while the image is still at original resolution and color.
-        transforms.insert(2, CopyPaste(sample_fn=sample_fn, max_objects=15, p=0.4))
+        # Mosaic first — combines 4 images before any other spatial op.
+        transforms.insert(0, Mosaic(sample_fn=sample_fn, p=0.5))
+        # CopyPaste after crop (index 3 with Mosaic prepended) — paste objects
+        # at original resolution before appearance distortion.
+        transforms.insert(3, CopyPaste(sample_fn=sample_fn, max_objects=15, p=0.4))
 
     return Compose(transforms)
-
-
-def build_mosaic_transforms(sample_fn):
-    """
-    Mosaic-first pipeline for aggressive small-object augmentation.
-
-    Use when training from scratch or when small-object recall is low.
-    Includes the same UAV degradation stack as build_aerial_mot_transforms.
-    """
-    return Compose([
-        Mosaic(sample_fn=sample_fn, p=0.5),
-        RandomHorizontalFlip(p=0.5),
-        RandomColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15, p=0.8),
-        RandomGrayscale(p=0.25),           # p raised 0.15→0.25 for night KPI
-        RandomNightMode(brightness_range=(0.05, 0.35), noise_std_range=(10.0, 30.0), p=0.25),
-        RandomFog(fog_coeff_range=(0.1, 0.45), p=0.3),
-        RandomMotionBlur(kernel_size_range=(5, 17), p=0.25),
-        RandomJPEGCompression(quality_range=(45, 85), p=0.3),
-        RandomSensorNoise(gaussian_std_range=(5.0, 20.0), poisson_scale=0.06, p=0.2),
-        RandomSunGlare(intensity_range=(0.3, 0.65), p=0.15),
-        RandomOcclusionPatch(patch_scale_range=(0.05, 0.20), num_patches=2, p=0.30),
-        RandomGaussianBlur(kernel_size=5, sigma=(0.1, 1.5), p=0.2),
-        RandomResize([576, 608, 640, 672, 704], max_size=1333),
-    ])
