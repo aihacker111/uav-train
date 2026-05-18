@@ -746,7 +746,8 @@ class JointDataset(LoadImagesAndLabels):  # for training
         draw_gaussian = draw_msra_gaussian if self.opt.mse_loss else draw_umich_gaussian
 
         # 遍历每一个ground truth检测目标
-        for k in range(num_objs):  # 图片中实际的目标个数
+        # Cap at max_objs: Mosaic/CopyPaste can push num_objs well above 200.
+        for k in range(min(num_objs, self.max_objs)):
             label = labels[k]
 
             # 计算bbox的经过网络的输出GT值
