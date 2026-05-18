@@ -353,6 +353,13 @@ def letterbox(img,
     img = cv2.resize(img, new_shape, interpolation=cv2.INTER_AREA)
     img = cv2.copyMakeBorder(img, top, bottom, left, right,
                              cv2.BORDER_CONSTANT, value=color)  # padded rectangular
+    # Safety: snap to multiples of 64 for ViT patch-embed divisibility
+    h_out, w_out = img.shape[:2]
+    h64 = ((h_out + 63) // 64) * 64
+    w64 = ((w_out + 63) // 64) * 64
+    if h64 != h_out or w64 != w_out:
+        img = cv2.copyMakeBorder(img, 0, h64 - h_out, 0, w64 - w_out,
+                                 cv2.BORDER_CONSTANT, value=color)
     return img, ratio, dw, dh
 
 

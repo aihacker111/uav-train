@@ -18,7 +18,7 @@ _MODEL_REGISTRY = {
 }
 
 
-def create_model(arch: str, heads: dict, head_conv: int, reid_dim: int = 256) -> nn.Module:
+def create_model(arch: str, heads: dict, head_conv: int, reid_dim: int = 256, num_classes: int = 7) -> nn.Module:
     """
     Instantiate a model by architecture string.
 
@@ -36,7 +36,9 @@ def create_model(arch: str, heads: dict, head_conv: int, reid_dim: int = 256) ->
         variant = suffix if suffix in ('tiny', 'small', 'base') else 'small'
         cfg = HybridModelConfig()
         cfg.vit.variant = variant
-        cfg.detr.reid_dim = reid_dim
+        cfg.detr.reid_dim    = reid_dim
+        cfg.centernet.num_classes = num_classes
+        cfg.detr.num_classes      = num_classes
         return build_hybrid_model(cfg)
 
     num_layers = _SIZE_MAP.get(suffix, 0)

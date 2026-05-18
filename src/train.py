@@ -213,7 +213,8 @@ def run(opt):
     if rank == 0:
         print('Creating model...')
     model = create_model(opt.arch, opt.heads, opt.head_conv,
-                         reid_dim=getattr(opt, 'reid_dim', 256))
+                         reid_dim=getattr(opt, 'reid_dim', 256),
+                         num_classes=opt.num_classes)
 
     # Split optimizer: backbone (small LR) + heads (full LR)
     _use_split_opt = ('lwdetr' in opt.arch or 'hybrid' in opt.arch) and hasattr(model, 'backbone')

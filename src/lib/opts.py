@@ -467,6 +467,11 @@ class opts(object):
         input_w = opt.input_res if opt.input_res > 0 else input_w
         opt.input_h = opt.input_h if opt.input_h > 0 else input_h
         opt.input_w = opt.input_w if opt.input_w > 0 else input_w
+        # ViT patch embed requires dims divisible by 64 — round up silently
+        opt.input_h = ((opt.input_h + 63) // 64) * 64
+        opt.input_w = ((opt.input_w + 63) // 64) * 64
+        if opt.input_h != (opt.input_h // 64 * 64) or opt.input_w != (opt.input_w // 64 * 64):
+            print(f'[warn] input size snapped to {opt.input_w}×{opt.input_h} (must be divisible by 64)')
         opt.output_h = opt.input_h // opt.down_ratio  # 输出特征图的宽高
         opt.output_w = opt.input_w // opt.down_ratio
         opt.input_res = max(opt.input_h, opt.input_w)
