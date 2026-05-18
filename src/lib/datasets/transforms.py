@@ -485,7 +485,13 @@ class CopyPaste:
 
         # Resize donor to destination size so boxes are in the same coord space
         if (src_w, src_h) != (dst_w, dst_h):
-            donor_img, donor_tgt = resize(donor_img, donor_tgt, (dst_h, dst_w))
+            donor_img = donor_img.resize((dst_w, dst_h), PIL.Image.BILINEAR)
+            if 'boxes' in donor_tgt and len(donor_tgt['boxes']) > 0:
+                donor_tgt = donor_tgt.copy()
+                boxes = donor_tgt['boxes'].clone().float()
+                boxes[:, [0, 2]] *= dst_w / src_w
+                boxes[:, [1, 3]] *= dst_h / src_h
+                donor_tgt['boxes'] = boxes
 
         donor_boxes  = donor_tgt['boxes']    # (N, 4) xyxy
         donor_labels = donor_tgt['labels']
@@ -781,7 +787,15 @@ class MixUp:
         img2, target2 = self.sample_fn()
         w, h = img.size
         if img2.size != (w, h):
-            img2, target2 = resize(img2, target2, (h, w))
+            # Use PIL resize directly to avoid the (H,W)/(W,H) reversal inside resize().
+            orig_w2, orig_h2 = img2.size
+            img2 = img2.resize((w, h), PIL.Image.BILINEAR)
+            if 'boxes' in target2 and len(target2.get('boxes', [])) > 0:
+                target2 = target2.copy()
+                boxes = target2['boxes'].clone().float()
+                boxes[:, [0, 2]] *= w / orig_w2
+                boxes[:, [1, 3]] *= h / orig_h2
+                target2['boxes'] = boxes
 
         r      = float(np.random.beta(self.alpha, self.alpha))
         mixed  = (r * np.array(img, np.float32) +
