@@ -264,19 +264,15 @@ class opts(object):
                                  default='/media/jianbo/ioe/UAVdata')
 
         # hybrid model loss weights
-        self.parser.add_argument('--bbox_weight', type=float, default=2.0,
-                                 help='DETR SmoothL1 box loss weight (hybrid task). '
-                                      'Reduced from 5.0 to balance Stage-1 vs Stage-2.')
-        self.parser.add_argument('--giou_weight', type=float, default=1.0,
-                                 help='DETR CIoU loss weight (hybrid task). '
-                                      'Reduced from 2.0 to balance Stage-1 vs Stage-2.')
-        self.parser.add_argument('--stage1_weight', type=float, default=2.0,
-                                 help='Weight for CenterNet stage-1 loss (hybrid task). '
-                                      'Boosted to 2.0 so heatmap gets adequate gradient '
-                                      'relative to the heavier Stage-2 terms.')
+        self.parser.add_argument('--bbox_weight', type=float, default=5.0,
+                                 help='DETR SmoothL1 box loss weight (hybrid task).')
+        self.parser.add_argument('--giou_weight', type=float, default=2.0,
+                                 help='DETR CIoU loss weight (hybrid task).')
+        self.parser.add_argument('--stage1_weight', type=float, default=1.0,
+                                 help='Weight for CenterNet stage-1 loss (hybrid task).')
         self.parser.add_argument('--stage2_weight', type=float, default=1.0,
                                  help='Weight for DETR stage-2 loss (hybrid task).')
-        self.parser.add_argument('--consist_weight', type=float, default=0.05,
+        self.parser.add_argument('--consist_weight', type=float, default=0.1,
                                  help='Stage-1/Stage-2 consistency loss weight. '
                                       'Ramped up over consist_warmup_epochs to avoid '
                                       'early-training noise from random Stage-2 matches.')

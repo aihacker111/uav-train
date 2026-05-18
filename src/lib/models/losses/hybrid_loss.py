@@ -189,13 +189,13 @@ class HybridLoss(nn.Module):
         num_classes:           int   = 7,
         lambda_wh:             float = 0.1,
         lambda_reg:            float = 1.0,
-        lambda_bbox:           float = 2.0,
-        lambda_ciou:           float = 1.0,
+        lambda_bbox:           float = 5.0,
+        lambda_ciou:           float = 2.0,
         lambda_reid:           float = 1.0,
         lambda_triplet:        float = 0.5,
-        lambda_consist:        float = 0.05,
+        lambda_consist:        float = 0.1,
         consist_warmup_epochs: int   = 10,
-        lambda_stage1:         float = 2.0,
+        lambda_stage1:         float = 1.0,
         lambda_stage2:         float = 1.0,
         aux_loss:              bool  = True,
         reid_classifier:       Optional[nn.Linear] = None,
@@ -218,7 +218,7 @@ class HybridLoss(nn.Module):
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
 
-        self.matcher = HungarianMatcher(cost_class=2.0, cost_bbox=2.0, cost_giou=1.0)
+        self.matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
 
     def set_epoch(self, epoch: int) -> None:
         """Call at the start of each epoch so consistency loss can ramp up gradually."""

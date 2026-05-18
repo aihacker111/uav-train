@@ -343,6 +343,23 @@ class RandomSelect:
         return self.transforms2(img, target)
 
 
+class RandomOneOf:
+    """Apply exactly one transform chosen uniformly at random, or skip entirely (prob 1-p).
+
+    Use this to create mutually exclusive augmentation slots so that competing
+    transforms (e.g. NightMode vs Fog vs SunGlare) never stack on the same image.
+    Set p=1.0 on each inner transform so the slot's outer `p` is the only gate.
+    """
+    def __init__(self, transforms: list, p: float = 1.0):
+        self.transforms = transforms
+        self.p          = p
+
+    def __call__(self, img, target):
+        if random.random() >= self.p:
+            return img, target
+        return random.choice(self.transforms)(img, target)
+
+
 class ToTensor:
     def __call__(self, img, target):
         return F.to_tensor(img), target
@@ -1127,49 +1144,71 @@ def build_aerial_mot_transforms(sample_fn=None):
     """
     PIL-based pre-letterbox augmentation for aerial MOT (VisDrone 1920x1080).
 
-    Pipeline order:
-      1. Mosaic (p=0.5)      — 4-image grid for aggressive density boost (requires sample_fn).
-      2. Spatial             — flip + zoom-in crop; keep before pixel ops so boxes stay valid.
-      3. CopyPaste (p=0.4)   — paste extra objects at original resolution (requires sample_fn).
-      4. Appearance          — color jitter, grayscale, night-mode.
-      5. UAV degradations    — fog, motion blur, JPEG, sensor noise, sun glare, occlusion patch.
-      6. Resize              — multi-scale letterbox prep.
+    Design goals:
+      - Mutually exclusive "slots" for atmosphere and blur: no two heavy degradations stack.
+      - Conservative geometric scale so small objects (5-15 px) survive after Mosaic.
+      - Expected ~3 active augmentations without Mosaic, ~4-5 with Mosaic — down from ~6.
 
-    When sample_fn is None (first dataset construction pass), Mosaic and CopyPaste are
-    omitted — they are inserted once sample_fn is wired up with the real dataset.
+    Pipeline order (with sample_fn):
+      0. Mosaic (p=0.5)          — 4-image grid; each sub-image at W/2 × H/2.
+      1. RandomPerspective       — scale=(0.8,1.2) keeps small objects above noise floor.
+      2. MixUp (p=0.15)          — ghost-blend for regularisation.
+      3. Flip                    — free spatial symmetry.
+      4. ScaleBiasedCrop         — zoom-in so post-letterbox objects are larger.
+      5. CopyPaste (p=0.35)      — extra objects before appearance distortion.
+      6. ColorJitter             — mild, moderate probability.
+      7. Grayscale               — rare IR/night simulation.
+      8. RandomOneOf atmosphere  — NightMode | Fog | SunGlare (never combined).
+      9. RandomOneOf blur        — MotionBlur | GaussianBlur (never combined).
+     10. JPEG + SensorNoise      — lightweight, independent.
+     11. OcclusionPatch          — re-id difficulty.
+     12. RandomResize            — multi-scale letterbox prep.
+
+    When sample_fn is None, steps 0-2 and CopyPaste are omitted.
     """
     transforms = [
-        # ── spatial ───────────────────────────────────────────────────────────
+        # ── geometric ─────────────────────────────────────────────────────────
         RandomHorizontalFlip(p=0.5),
-        ScaleBiasedCrop(min_scale=0.35, max_scale=0.85, beta_alpha=2.0, beta_beta=5.0, p=0.4),
-        # ── appearance ────────────────────────────────────────────────────────
-        RandomColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15, p=0.8),
-        RandomGrayscale(p=0.25),
-        RandomNightMode(brightness_range=(0.05, 0.35), noise_std_range=(10.0, 30.0), p=0.25),
-        # ── UAV real-world degradations ───────────────────────────────────────
-        RandomFog(fog_coeff_range=(0.1, 0.45), p=0.3),
-        RandomMotionBlur(kernel_size_range=(5, 17), p=0.25),
-        RandomJPEGCompression(quality_range=(45, 85), p=0.3),
-        RandomSensorNoise(gaussian_std_range=(5.0, 20.0), poisson_scale=0.06, p=0.2),
-        RandomSunGlare(intensity_range=(0.3, 0.65), p=0.15),
-        RandomOcclusionPatch(patch_scale_range=(0.05, 0.20), num_patches=2, p=0.30),
-        # ── kept last: isotropic blur + multi-scale resize ────────────────────
-        RandomGaussianBlur(kernel_size=5, sigma=(0.1, 1.5), p=0.2),
+        # min_scale raised to 0.5: avoids cropping so tight that sub-Mosaic objects disappear.
+        ScaleBiasedCrop(min_scale=0.5, max_scale=0.9, beta_alpha=2.0, beta_beta=4.0, p=0.5),
+        # ── appearance: mild, always-on colour variation ───────────────────────
+        RandomColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.6),
+        RandomGrayscale(p=0.1),
+        # ── atmosphere slot: pick AT MOST ONE of NightMode / Fog / SunGlare ───
+        # p=1.0 on each inner transform — the outer p=0.45 is the only gate.
+        # This prevents the ~7% chance of NightMode+Fog stacking that caused
+        # completely undetectable images in the old pipeline.
+        RandomOneOf([
+            RandomNightMode(brightness_range=(0.1, 0.4), noise_std_range=(8.0, 20.0),
+                            desaturate_p=0.5, p=1.0),
+            RandomFog(fog_coeff_range=(0.1, 0.4), p=1.0),
+            RandomSunGlare(intensity_range=(0.3, 0.6), p=1.0),
+        ], p=0.45),
+        # ── blur slot: pick AT MOST ONE of MotionBlur / GaussianBlur ──────────
+        RandomOneOf([
+            RandomMotionBlur(kernel_size_range=(5, 13), p=1.0),
+            RandomGaussianBlur(kernel_size=5, sigma=(0.1, 1.5), p=1.0),
+        ], p=0.3),
+        # ── lightweight independent degradations ──────────────────────────────
+        RandomJPEGCompression(quality_range=(50, 90), p=0.2),
+        RandomSensorNoise(gaussian_std_range=(3.0, 15.0), poisson_scale=0.05, p=0.15),
+        # ── re-id occlusion difficulty ────────────────────────────────────────
+        RandomOcclusionPatch(patch_scale_range=(0.04, 0.15), num_patches=2, p=0.2),
+        # ── multi-scale resize (must be last) ─────────────────────────────────
         RandomResize([576, 608, 640, 672, 704], max_size=1333),
     ]
 
     if sample_fn is not None:
-        # ── Mosaic stack (YOLOv5/v8 style) ───────────────────────────────────
-        # 1. Mosaic     — combine 4 images into a 2×2 grid
-        # 2. RandomPerspective — geometric warp on the stitched mosaic
-        # 3. MixUp      — ghost-blend with a second image (p=0.15)
-        # 4. CopyPaste  — paste extra objects before appearance distortion
         transforms.insert(0, Mosaic(sample_fn=sample_fn, p=0.5))
+        # scale=(0.8, 1.2): was (0.5, 1.5) — the old range zoomed sub-Mosaic objects
+        # down to 1/8 of original resolution, pushing 10-px objects below 2 px.
         transforms.insert(1, RandomPerspective(
-            degrees=5.0, translate=0.1, scale=(0.5, 1.5), shear=2.0, p=0.5))
+            degrees=3.0, translate=0.1, scale=(0.8, 1.2), shear=1.5,
+            perspective=0.0, min_area=4.0, p=0.5))
         transforms.insert(2, MixUp(sample_fn=sample_fn, alpha=8.0, p=0.15))
-        # CopyPaste goes after ScaleBiasedCrop (now at index 5 with the 3 inserts)
-        transforms.insert(5, CopyPaste(sample_fn=sample_fn, max_objects=15, p=0.4))
+        # CopyPaste after ScaleBiasedCrop (index 5 with the 3 inserts above).
+        transforms.insert(5, CopyPaste(sample_fn=sample_fn, max_objects=15,
+                                        paste_prob=0.5, p=0.35))
 
     return Compose(transforms)
 
