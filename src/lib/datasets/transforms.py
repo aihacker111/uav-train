@@ -642,6 +642,165 @@ class Mosaic:
         return canvas, new_target
 
 
+class RandomPerspective:
+    """
+    Random affine / perspective transform — the standard geometric companion to Mosaic.
+
+    Applied right after Mosaic so the stitched grid gets additional geometric variety
+    (scale jitter, rotation, translation, shear, optional perspective warp).
+
+    Box corners are transformed through the full matrix and re-fitted as axis-aligned
+    bounding boxes.  Boxes that become too small after clipping are discarded.
+
+    degrees   : ±rotation range (°)
+    translate : ±translation as fraction of image size
+    scale     : (min, max) scale multiplier
+    shear     : ±shear range (°)
+    perspective: perspective distortion magnitude (0 = pure affine)
+    min_area  : discard transformed boxes smaller than this (px²)
+    """
+    def __init__(
+        self,
+        degrees:     float = 5.0,
+        translate:   float = 0.1,
+        scale:       Tuple[float, float] = (0.5, 1.5),
+        shear:       float = 2.0,
+        perspective: float = 0.0,
+        min_area:    float = 4.0,
+        p:           float = 0.5,
+    ) -> None:
+        self.degrees     = degrees
+        self.translate   = translate
+        self.scale       = scale
+        self.shear       = shear
+        self.perspective = perspective
+        self.min_area    = min_area
+        self.p           = p
+
+    def _build_matrix(self, w: int, h: int) -> np.ndarray:
+        # Centre → transform → un-centre
+        C       = np.eye(3, dtype=np.float64)
+        C[0, 2] = -w / 2
+        C[1, 2] = -h / 2
+
+        P       = np.eye(3, dtype=np.float64)
+        P[2, 0] = random.uniform(-self.perspective, self.perspective)
+        P[2, 1] = random.uniform(-self.perspective, self.perspective)
+
+        angle   = random.uniform(-self.degrees, self.degrees)
+        scale   = random.uniform(self.scale[0], self.scale[1])
+        R       = np.eye(3, dtype=np.float64)
+        R[:2]   = cv2.getRotationMatrix2D((0, 0), angle, scale)
+
+        S       = np.eye(3, dtype=np.float64)
+        S[0, 1] = np.tan(random.uniform(-self.shear, self.shear) * np.pi / 180)
+        S[1, 0] = np.tan(random.uniform(-self.shear, self.shear) * np.pi / 180)
+
+        T       = np.eye(3, dtype=np.float64)
+        T[0, 2] = random.uniform(0.5 - self.translate, 0.5 + self.translate) * w
+        T[1, 2] = random.uniform(0.5 - self.translate, 0.5 + self.translate) * h
+
+        return T @ S @ R @ P @ C
+
+    def __call__(self, img: PIL.Image.Image, target: Dict) -> Tuple:
+        if random.random() >= self.p:
+            return img, target
+
+        w, h   = img.size
+        M      = self._build_matrix(w, h)
+        img_np = np.array(img)
+
+        if self.perspective > 0:
+            img_np = cv2.warpPerspective(img_np, M, (w, h), borderValue=(114, 114, 114))
+        else:
+            img_np = cv2.warpAffine(img_np, M[:2], (w, h), borderValue=(114, 114, 114))
+
+        target = target.copy()
+        if 'boxes' in target and len(target['boxes']) > 0:
+            boxes = target['boxes'].numpy()          # (N, 4) xyxy
+            n     = len(boxes)
+
+            # 4 corners per box → (N*4, 2)
+            corners = np.stack([
+                boxes[:, [0, 1]], boxes[:, [2, 1]],
+                boxes[:, [2, 3]], boxes[:, [0, 3]],
+            ], axis=1).reshape(-1, 2)
+
+            # Homogeneous transform
+            ones      = np.ones((len(corners), 1))
+            corners_h = np.concatenate([corners, ones], axis=1)   # (N*4, 3)
+            corners_t = (M @ corners_h.T).T                        # (N*4, 3)
+            if self.perspective > 0:
+                corners_t = corners_t[:, :2] / corners_t[:, 2:3]
+            else:
+                corners_t = corners_t[:, :2]
+            corners_t = corners_t.reshape(n, 4, 2)
+
+            x1 = corners_t[:, :, 0].min(1).clip(0, w)
+            y1 = corners_t[:, :, 1].min(1).clip(0, h)
+            x2 = corners_t[:, :, 0].max(1).clip(0, w)
+            y2 = corners_t[:, :, 1].max(1).clip(0, h)
+
+            new_boxes = np.stack([x1, y1, x2, y2], axis=1)
+            areas     = (new_boxes[:, 2] - new_boxes[:, 0]) * (new_boxes[:, 3] - new_boxes[:, 1])
+            keep      = areas > self.min_area
+
+            target['boxes']  = torch.from_numpy(new_boxes[keep]).float()
+            target['labels'] = target['labels'][keep]
+            if 'ids' in target:
+                target['ids'] = target['ids'][keep]
+
+        return PIL.Image.fromarray(img_np), target
+
+
+class MixUp:
+    """
+    MixUp augmentation (Zhang et al. 2018) — blends two images pixel-wise and merges labels.
+
+    In YOLOv5/v8 this is applied after Mosaic+Perspective with p=0.15.
+    The blend ratio r ~ Beta(alpha, alpha): high alpha → ratio near 0.5,
+    low alpha → more extreme blends.
+
+    Labels from both images are concatenated (not blended) — the model
+    learns to detect objects from both the dominant and ghost image.
+    """
+    def __init__(
+        self,
+        sample_fn: Callable,
+        alpha:     float = 8.0,
+        p:         float = 0.15,
+    ) -> None:
+        self.sample_fn = sample_fn
+        self.alpha     = alpha
+        self.p         = p
+
+    def __call__(self, img: PIL.Image.Image, target: Dict) -> Tuple:
+        if random.random() >= self.p:
+            return img, target
+
+        img2, target2 = self.sample_fn()
+        w, h = img.size
+        if img2.size != (w, h):
+            img2, target2 = resize(img2, target2, (h, w))
+
+        r      = float(np.random.beta(self.alpha, self.alpha))
+        mixed  = (r * np.array(img, np.float32) +
+                  (1 - r) * np.array(img2, np.float32)).clip(0, 255).astype(np.uint8)
+
+        target = target.copy()
+        if 'boxes' in target2 and len(target2['boxes']) > 0:
+            if 'boxes' in target and len(target['boxes']) > 0:
+                target['boxes']  = torch.cat([target['boxes'],  target2['boxes']],  dim=0)
+                target['labels'] = torch.cat([target['labels'], target2['labels']], dim=0)
+                if 'ids' in target and 'ids' in target2:
+                    target['ids'] = torch.cat([target['ids'], target2['ids']], dim=0)
+            else:
+                target['boxes']  = target2['boxes']
+                target['labels'] = target2['labels']
+
+        return PIL.Image.fromarray(mixed), target
+
+
 class Normalize:
     def __init__(self, mean, std):
         self.mean = mean
@@ -986,10 +1145,32 @@ def build_aerial_mot_transforms(sample_fn=None):
     ]
 
     if sample_fn is not None:
-        # Mosaic first — combines 4 images before any other spatial op.
+        # ── Mosaic stack (YOLOv5/v8 style) ───────────────────────────────────
+        # 1. Mosaic     — combine 4 images into a 2×2 grid
+        # 2. RandomPerspective — geometric warp on the stitched mosaic
+        # 3. MixUp      — ghost-blend with a second image (p=0.15)
+        # 4. CopyPaste  — paste extra objects before appearance distortion
         transforms.insert(0, Mosaic(sample_fn=sample_fn, p=0.5))
-        # CopyPaste after crop (index 3 with Mosaic prepended) — paste objects
-        # at original resolution before appearance distortion.
-        transforms.insert(3, CopyPaste(sample_fn=sample_fn, max_objects=15, p=0.4))
+        transforms.insert(1, RandomPerspective(
+            degrees=5.0, translate=0.1, scale=(0.5, 1.5), shear=2.0, p=0.5))
+        transforms.insert(2, MixUp(sample_fn=sample_fn, alpha=8.0, p=0.15))
+        # CopyPaste goes after ScaleBiasedCrop (now at index 5 with the 3 inserts)
+        transforms.insert(5, CopyPaste(sample_fn=sample_fn, max_objects=15, p=0.4))
 
     return Compose(transforms)
+
+
+def disable_mosaic(pipeline: Compose) -> Compose:
+    """
+    Return a new Compose with Mosaic, RandomPerspective, and MixUp removed.
+
+    Call this in the last `close_mosaic_epochs` epochs so the model sees
+    full-resolution images before the end of training — the standard
+    YOLOv5/v8 close-mosaic trick for convergence.
+
+    Usage in train.py::
+        if epoch == opt.num_epochs - opt.close_mosaic_epochs + 1:
+            train_dataset.pil_transform = disable_mosaic(train_dataset.pil_transform)
+    """
+    _remove = (Mosaic, RandomPerspective, MixUp)
+    return Compose([t for t in pipeline.transforms if not isinstance(t, _remove)])

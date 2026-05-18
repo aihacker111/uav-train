@@ -186,36 +186,43 @@ class HybridLoss(nn.Module):
 
     def __init__(
         self,
-        num_classes:      int   = 7,
-        lambda_wh:        float = 0.1,
-        lambda_reg:       float = 1.0,
-        lambda_bbox:      float = 5.0,
-        lambda_ciou:      float = 2.0,
-        lambda_reid:      float = 1.0,
-        lambda_triplet:   float = 0.5,
-        lambda_consist:   float = 0.1,
-        lambda_stage1:    float = 1.0,
-        lambda_stage2:    float = 1.0,
-        aux_loss:         bool  = True,
-        reid_classifier:  Optional[nn.Linear] = None,
+        num_classes:           int   = 7,
+        lambda_wh:             float = 0.1,
+        lambda_reg:            float = 1.0,
+        lambda_bbox:           float = 2.0,
+        lambda_ciou:           float = 1.0,
+        lambda_reid:           float = 1.0,
+        lambda_triplet:        float = 0.5,
+        lambda_consist:        float = 0.05,
+        consist_warmup_epochs: int   = 10,
+        lambda_stage1:         float = 2.0,
+        lambda_stage2:         float = 1.0,
+        aux_loss:              bool  = True,
+        reid_classifier:       Optional[nn.Linear] = None,
     ) -> None:
         super().__init__()
-        self.num_classes    = num_classes
-        self.lambda_wh      = lambda_wh
-        self.lambda_reg     = lambda_reg
-        self.lambda_bbox    = lambda_bbox
-        self.lambda_ciou    = lambda_ciou
-        self.lambda_reid    = lambda_reid
-        self.lambda_triplet = lambda_triplet
-        self.lambda_consist = lambda_consist
-        self.lambda_stage1  = lambda_stage1
-        self.lambda_stage2  = lambda_stage2
-        self.aux_loss       = aux_loss
+        self.num_classes           = num_classes
+        self.lambda_wh             = lambda_wh
+        self.lambda_reg            = lambda_reg
+        self.lambda_bbox           = lambda_bbox
+        self.lambda_ciou           = lambda_ciou
+        self.lambda_reid           = lambda_reid
+        self.lambda_triplet        = lambda_triplet
+        self.lambda_consist        = lambda_consist
+        self.consist_warmup_epochs = consist_warmup_epochs
+        self.lambda_stage1         = lambda_stage1
+        self.lambda_stage2         = lambda_stage2
+        self.aux_loss              = aux_loss
+        self._epoch                = 0      # updated each epoch via set_epoch()
 
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
 
-        self.matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
+        self.matcher = HungarianMatcher(cost_class=2.0, cost_bbox=2.0, cost_giou=1.0)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Call at the start of each epoch so consistency loss can ramp up gradually."""
+        self._epoch = epoch
 
     # ── Stage-1 ────────────────────────────────────────────────────────────────
 
@@ -237,8 +244,9 @@ class HybridLoss(nn.Module):
         pred_reg = _gather_at_ind(cn_out.reg, ind)
 
         mask     = reg_mask.unsqueeze(-1).float()
-        loss_wh  = (F.l1_loss(pred_wh,  gt_wh,  reduction='none') * mask).sum() / n
-        loss_reg = (F.l1_loss(pred_reg, gt_reg, reduction='none') * mask).sum() / n
+        # SmoothL1: quadratic for |err|<beta (stable for small offsets), L1 beyond
+        loss_wh  = (F.smooth_l1_loss(pred_wh,  gt_wh,  beta=1.0, reduction='none') * mask).sum() / n
+        loss_reg = (F.smooth_l1_loss(pred_reg, gt_reg, beta=0.5, reduction='none') * mask).sum() / n
 
         total = loss_hm + self.lambda_wh * loss_wh + self.lambda_reg * loss_reg
         return {'total': total, 'hm': loss_hm, 'wh': loss_wh, 'reg': loss_reg}
@@ -283,7 +291,9 @@ class HybridLoss(nn.Module):
             src_b    = torch.cat(src_b_list)
             tgt_b    = torch.cat(tgt_b_list)
             n_m      = src_b.shape[0]
-            loss_bbox = F.l1_loss(src_b, tgt_b, reduction='sum') / n_m
+            # SmoothL1 with beta=0.05: normalized box coords are in [0,1],
+            # threshold at 0.05 ≈ 64px error at 1280px width
+            loss_bbox = F.smooth_l1_loss(src_b, tgt_b, beta=0.05, reduction='sum') / n_m
             loss_ciou = ciou_loss(
                 box_cxcywh_to_xyxy(src_b),
                 box_cxcywh_to_xyxy(tgt_b),
@@ -461,11 +471,13 @@ class HybridLoss(nn.Module):
             total  = total + self.lambda_reid * l_reid
             loss_stats['loss_reid'] = l_reid
 
-        # Consistency loss: Stage-1 hm peaks at Stage-2 matched centres
+        # Consistency loss: ramped from 0 → lambda_consist over consist_warmup_epochs
+        # so random Stage-2 matches early in training don't corrupt Stage-1 heatmaps.
+        consist_scale = min(1.0, self._epoch / max(1, self.consist_warmup_epochs))
         l_consist = self._consistency_loss(
             outputs['stage1'], outputs['stage2'], targets, s2['indices'],
         )
-        total = total + self.lambda_consist * l_consist
+        total = total + self.lambda_consist * consist_scale * l_consist
         loss_stats['loss_consist'] = l_consist
         loss_stats['loss'] = total
 

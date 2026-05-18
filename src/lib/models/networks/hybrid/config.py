@@ -90,9 +90,9 @@ class DETRHeadConfig:
 
 @dataclass
 class QueryGenConfig:
-    top_k: int             = 300    # candidates extracted from heatmap (500 is overkill for VisDrone)
-    nms_kernel: int        = 21     # local-max NMS window (21×21 = 84px at stride4, covers large objects)
-    score_threshold: float = 0.01  # discard near-zero peaks
+    top_k: int             = 150    # reduced from 300: VisDrone frames rarely have >100 objects
+    nms_kernel: int        = 13     # reduced from 21: 13×13 = 52px at stride4, fits clustered pedestrians
+    score_threshold: float = 0.05  # raised from 0.01: filters noise queries early in training
 
 
 @dataclass

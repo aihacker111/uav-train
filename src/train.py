@@ -20,7 +20,7 @@ from lib.models.data_parallel import DataParallel
 from lib.logger import Logger
 from lib.datasets.dataset_factory import get_dataset
 from lib.trains.train_factory import train_factory
-from lib.datasets.transforms import build_aerial_mot_transforms
+from lib.datasets.transforms import build_aerial_mot_transforms, disable_mosaic
 
 
 def build_transforms(use_imagenet_norm, augment):
@@ -316,6 +316,17 @@ def run(opt):
                     p.requires_grad_(True)
                 _backbone_frozen = False
                 print(f'Epoch {epoch}: backbone unfrozen')
+
+        # ── Notify loss of current epoch (consistency loss warmup ramp) ──────────
+        if hasattr(trainer.loss, 'set_epoch'):
+            trainer.loss.set_epoch(epoch)
+
+        # ── Close-mosaic: disable Mosaic/Perspective/MixUp in last N epochs ─────
+        _close_mosaic = getattr(opt, 'close_mosaic_epochs', 10)
+        if _close_mosaic > 0 and epoch == opt.num_epochs - _close_mosaic + 1:
+            train_dataset.pil_transform = disable_mosaic(train_dataset.pil_transform)
+            remaining = [type(t).__name__ for t in train_dataset.pil_transform.transforms]
+            print(f'Epoch {epoch}: close-mosaic — pipeline now: {remaining}')
 
         # ── Train ────────────────────────────────────────────────────────────────
         # Inject scheduler so base_trainer can call .step() after each batch

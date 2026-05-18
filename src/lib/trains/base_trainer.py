@@ -92,12 +92,16 @@ class BaseTrainer:
             torch.cuda.empty_cache()
 
         opt             = self.opt
+        grad_accum      = getattr(opt, 'grad_accum', 1)
         results         = {}
         data_time       = AverageMeter()
         batch_time      = AverageMeter()
         avg_loss_stats  = {l: AverageMeter() for l in self.loss_stats}
         num_iters       = len(data_loader) if opt.num_iters < 0 else opt.num_iters
         bar             = Bar('{}/{}'.format(opt.task, opt.exp_id), max=num_iters)
+        if phase == 'train':
+            self.optimizer.zero_grad()  # clear any stale grads before epoch starts
+
         # Smoothed batch time for stable ETA (exponential moving average, α=0.05)
         _ema_batch_s    = None
         _EMA_ALPHA      = 0.05
@@ -124,15 +128,13 @@ class BaseTrainer:
 
             loss = loss.mean()
             if phase == 'train':
-                self.optimizer.zero_grad()
-                loss.backward()
-                clip_norm = getattr(opt, 'clip_grad_norm', 0.0)
-                if clip_norm > 0.0:
-                    all_params = [p for pg in self.optimizer.param_groups for p in pg['params']]
-                    nn.utils.clip_grad_norm_(all_params, clip_norm)
-                self.optimizer.step()
-                if self.scheduler is not None:
-                    self.scheduler.step()
+                # Gradient accumulation: divide loss to keep gradient scale consistent
+                (loss / grad_accum).backward()
+                if (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) >= num_iters:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    if self.scheduler is not None:
+                        self.scheduler.step()
 
             elapsed = time.time() - end
             batch_time.update(elapsed)

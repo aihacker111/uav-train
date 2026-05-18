@@ -75,8 +75,10 @@ class opts(object):
                                       '-1 for default setting: 256.')
         self.parser.add_argument('--backbone_lr_scale',
                                  type=float,
-                                 default=0.1,
-                                 help='LR multiplier for ViT backbone (relative to head LR).')
+                                 default=0.2,
+                                 help='LR multiplier for ViT backbone (relative to head LR). '
+                                      '0.2 allows faster UAV-domain adaptation than 0.1 '
+                                      'while still protecting pretrained features.')
         self.parser.add_argument('--freeze_backbone_epochs',
                                  type=int,
                                  default=0,
@@ -112,8 +114,9 @@ class opts(object):
         # train
         self.parser.add_argument('--lr',
                                  type=float,
-                                 default=7e-4,  # 1e-4, 7e-5, 5e-5, 3e-5
-                                 help='learning rate for batch size 32.')
+                                 default=4e-4,
+                                 help='learning rate for batch size 16 (single GPU). '
+                                      'Linear-scale with batch: 8e-4 for bs=32, 2e-4 for bs=8.')
         self.parser.add_argument('--lr_scale',
                                  type=str,
                                  default='linear',
@@ -124,7 +127,7 @@ class opts(object):
                                       'none:   no scaling (manual tuning).')
         self.parser.add_argument('--base_batch_size',
                                  type=int,
-                                 default=4,
+                                 default=16,
                                  help='Reference batch size the base --lr was tuned for '
                                       '(single GPU). Match this to your single-GPU --batch_size. '
                                       'Used by --lr_scale for multi-GPU LR adjustment.')
@@ -132,21 +135,17 @@ class opts(object):
                                  type=str,
                                  default='10, 20',
                                  help='drop learning rate by 10.')
-        self.parser.add_argument('--clip_grad_norm',
-                                 type=float,
-                                 default=1.0,
-                                 help='Max gradient norm for clipping. '
-                                      '0 disables clipping. '
-                                      'Recommended: 1.0 for ViT/transformer backbones, '
-                                      'especially when LR is scaled up for multi-GPU.')
+
         self.parser.add_argument('--cosine_lr',
-                                 action='store_true',
+                                 default=True,
+                                 action=argparse.BooleanOptionalAction,
                                  help='Use cosine LR schedule with linear warmup instead of step decay. '
-                                      'Recommended for ViT backbones.')
+                                      'Enabled by default (best practice for ViT). Use --no-cosine-lr to disable.')
         self.parser.add_argument('--warmup_iters',
                                  type=int,
-                                 default=1000,
-                                 help='Number of iterations for linear LR warmup (cosine_lr only).')
+                                 default=500,
+                                 help='Linear LR warmup iterations (cosine_lr only). '
+                                      '500 ≈ 0.8 epoch at batch=16, ~10k samples.')
         self.parser.add_argument('--min_lr_ratio',
                                  type=float,
                                  default=0.01,
@@ -155,6 +154,11 @@ class opts(object):
                                  type=int,
                                  default=30,  # 30, 10, 3, 1
                                  help='total training epochs.')
+        self.parser.add_argument('--close_mosaic_epochs',
+                                 type=int,
+                                 default=10,
+                                 help='Disable Mosaic/MixUp/Perspective in the last N epochs '
+                                      '(YOLOv5/v8 close-mosaic trick). 0 = never disable.')
         self.parser.add_argument('--batch_size',
                                  type=int,
                                  default=4,  # 1920×1088: 4 per GPU (24GB); 1088×640: 8-12 per GPU
@@ -260,14 +264,29 @@ class opts(object):
                                  default='/media/jianbo/ioe/UAVdata')
 
         # hybrid model loss weights
-        self.parser.add_argument('--bbox_weight', type=float, default=5.0,
-                                 help='DETR L1 box loss weight (hybrid task).')
-        self.parser.add_argument('--giou_weight', type=float, default=2.0,
-                                 help='DETR GIoU loss weight (hybrid task).')
-        self.parser.add_argument('--stage1_weight', type=float, default=1.0,
-                                 help='Weight for CenterNet stage-1 loss (hybrid task).')
+        self.parser.add_argument('--bbox_weight', type=float, default=2.0,
+                                 help='DETR SmoothL1 box loss weight (hybrid task). '
+                                      'Reduced from 5.0 to balance Stage-1 vs Stage-2.')
+        self.parser.add_argument('--giou_weight', type=float, default=1.0,
+                                 help='DETR CIoU loss weight (hybrid task). '
+                                      'Reduced from 2.0 to balance Stage-1 vs Stage-2.')
+        self.parser.add_argument('--stage1_weight', type=float, default=2.0,
+                                 help='Weight for CenterNet stage-1 loss (hybrid task). '
+                                      'Boosted to 2.0 so heatmap gets adequate gradient '
+                                      'relative to the heavier Stage-2 terms.')
         self.parser.add_argument('--stage2_weight', type=float, default=1.0,
                                  help='Weight for DETR stage-2 loss (hybrid task).')
+        self.parser.add_argument('--consist_weight', type=float, default=0.05,
+                                 help='Stage-1/Stage-2 consistency loss weight. '
+                                      'Ramped up over consist_warmup_epochs to avoid '
+                                      'early-training noise from random Stage-2 matches.')
+        self.parser.add_argument('--consist_warmup_epochs', type=int, default=10,
+                                 help='Epochs over which consistency loss weight ramps '
+                                      'from 0 to consist_weight.')
+        self.parser.add_argument('--grad_accum', type=int, default=1,
+                                 help='Gradient accumulation steps. Effective batch = '
+                                      'batch_size * grad_accum. Use to simulate larger '
+                                      'batches on memory-constrained hardware.')
 
         # loss
         self.parser.add_argument('--mse_loss',  # default: false

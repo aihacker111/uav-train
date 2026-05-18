@@ -44,16 +44,18 @@ class HybridTrainer(BaseTrainer):
             loss_stats.append('loss_reid')
 
         loss = HybridLoss(
-            num_classes    = opt.num_classes,
-            lambda_wh      = getattr(opt, 'wh_weight',     0.1),
-            lambda_reg     = getattr(opt, 'off_weight',     1.0),
-            lambda_bbox    = getattr(opt, 'bbox_weight',    5.0),
-            lambda_ciou    = getattr(opt, 'giou_weight',    2.0),
-            lambda_reid    = getattr(opt, 'id_weight',      1.0),
-            lambda_stage1  = getattr(opt, 'stage1_weight',  1.0),
-            lambda_stage2  = getattr(opt, 'stage2_weight',  1.0),
-            aux_loss       = True,
-            reid_classifier= reid_classifier,
+            num_classes           = opt.num_classes,
+            lambda_wh             = getattr(opt, 'wh_weight',            0.1),
+            lambda_reg            = getattr(opt, 'off_weight',            1.0),
+            lambda_bbox           = getattr(opt, 'bbox_weight',           2.0),
+            lambda_ciou           = getattr(opt, 'giou_weight',           1.0),
+            lambda_reid           = getattr(opt, 'id_weight',             1.0),
+            lambda_stage1         = getattr(opt, 'stage1_weight',         2.0),
+            lambda_stage2         = getattr(opt, 'stage2_weight',         1.0),
+            lambda_consist        = getattr(opt, 'consist_weight',        0.05),
+            consist_warmup_epochs = getattr(opt, 'consist_warmup_epochs', 10),
+            aux_loss              = True,
+            reid_classifier       = reid_classifier,
         )
         return loss_stats, loss
 
