@@ -262,9 +262,15 @@ def run(opt):
         total_iters     = iters_per_epoch * opt.num_epochs
         warmup_iters    = getattr(opt, 'warmup_iters', min(1000, iters_per_epoch))
         min_lr_ratio    = getattr(opt, 'min_lr_ratio', 0.01)
-        # Pass last_epoch so the scheduler resumes at the correct position
-        # without having to replay thousands of .step() calls (O(1) vs O(n)).
-        resumed_step = start_epoch * iters_per_epoch
+        resumed_step    = start_epoch * iters_per_epoch
+
+        # LambdaLR requires 'initial_lr' in every param group when last_epoch > -1.
+        # Param groups added after the scheduler was last saved (e.g. the loss/ReID
+        # group added by BaseTrainer.__init__) won't have this key — set it now.
+        for pg in optimizer.param_groups:
+            if 'initial_lr' not in pg:
+                pg['initial_lr'] = pg['lr']
+
         scheduler = build_cosine_scheduler(
             optimizer, warmup_iters, total_iters, min_lr_ratio,
             last_epoch=resumed_step - 1 if resumed_step > 0 else -1,
