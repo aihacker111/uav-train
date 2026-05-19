@@ -176,9 +176,13 @@ class QueryGenerator(nn.Module):
         cx_cy = W @ pos.expand(B, -1, -1)                     # (B, K, 2)
         cx, cy = cx_cy[..., 0], cx_cy[..., 1]
 
-        # ── Weighted wh (gradient flows to Stage-1 wh head) ──────────────────
+        # ── Weighted wh ───────────────────────────────────────────────────────
+        # wh_map detached: Stage-2 CIoU gradient would otherwise diffuse across
+        # all N spatial locations via W, conflicting with Stage-1 SmoothL1
+        # supervision which only targets GT peak positions.
+        # Stage-2 → Stage-1 feedback is preserved through hm (W @ hm_spatial).
         if wh_map is not None:
-            wh_spatial = wh_map.reshape(B, 2, N).permute(0, 2, 1)  # (B, N, 2)
+            wh_spatial = wh_map.detach().reshape(B, 2, N).permute(0, 2, 1)  # (B, N, 2)
             peak_wh    = W @ wh_spatial                              # (B, K, 2)
             ref_w = (peak_wh[..., 0] / Ws).clamp(_EPS, 1.0 - _EPS)
             ref_h = (peak_wh[..., 1] / Hs).clamp(_EPS, 1.0 - _EPS)
