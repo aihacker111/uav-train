@@ -212,7 +212,10 @@ def run(opt):
 
     if rank == 0:
         print('Creating model...')
-    model = create_model(opt.arch, opt.heads, opt.head_conv,
+    # Pass opt via sentinel key so hybrid create_model can wire grad_checkpoint
+    # and top_down_fusion without changing the public create_model signature.
+    _heads = dict(opt.heads, **{'__opt__': opt}) if opt.task == 'hybrid' else opt.heads
+    model = create_model(opt.arch, _heads, opt.head_conv,
                          reid_dim=getattr(opt, 'reid_dim', 256),
                          num_classes=opt.num_classes)
 

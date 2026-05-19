@@ -6,10 +6,18 @@ Changes vs. original:
   - Takes ALL vit_features (concatenated) instead of only the last one
   - forward() returns (MultiScaleNeckOutput, finest_feat) in one pass (no double projection)
   - CenterNetUpsampleNeck upsamples finest stride-16 → stride-4 for small-object detection
+  - Optional FPN top-down pathway (top_down_fusion=True) when num_output_levels > 1:
+      coarser levels are fused with upsampled context from one level coarser,
+      propagating global semantics back toward the fine-grained level.
 
-Level layout for DETR memory:
-  Level 0 (finest): projector(concat vit_features)  → H/16 × W/16
-  Level k (extra) : stride-2 conv(level k-1)         → H/(16·2^k)
+Level layout for DETR memory (num_output_levels=3, top_down_fusion=True):
+  Bottom-up:
+    Level 0 (finest): projector(concat vit_features)  → H/16 × W/16
+    Level 1 (extra1): stride-2 conv(level 0)           → H/32 × W/32
+    Level 2 (extra2): stride-2 conv(level 1)           → H/64 × W/64
+  Top-down fusion:
+    Level 1 += upsample(Level 2) via td_projs[0]
+    Level 0 += upsample(Level 1) via td_projs[1]   ← finest gets global context
 """
 from __future__ import annotations
 
@@ -18,6 +26,7 @@ from typing import List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from .config import NeckConfig
@@ -175,9 +184,11 @@ class MultiScaleNeck(nn.Module):
         D = cfg.hidden_dim
         self.hidden_dim        = D
         self.num_output_levels = cfg.num_output_levels
+        self.top_down_fusion   = cfg.top_down_fusion and cfg.num_output_levels > 1
 
         self.proj0 = LWDetrProjector(in_ch, D)
 
+        # Bottom-up: each extra level = stride-2 conv of the level above it
         self.extra_projs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(D, D, kernel_size=3, stride=2, padding=1, bias=False),
@@ -185,6 +196,22 @@ class MultiScaleNeck(nn.Module):
             )
             for _ in range(cfg.num_output_levels - 1)
         ])
+
+        # Top-down FPN: one 1×1 lateral conv per transition (coarse → fine).
+        # td_projs[i] adapts the (i+1)-th level before adding to the i-th level.
+        # Indexed from coarsest-to-finest direction:
+        #   td_projs[0]: level[-1] → level[-2]  (coarsest pair)
+        #   td_projs[-1]: level[1]  → level[0]   (finest pair)
+        # Only instantiated when top_down_fusion=True and num_output_levels > 1.
+        n_td = cfg.num_output_levels - 1
+        self.td_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(D, D, kernel_size=1, bias=False),
+                nn.GroupNorm(32, D),
+                nn.ReLU(inplace=True),
+            )
+            for _ in range(n_td)
+        ]) if self.top_down_fusion else nn.ModuleList()
 
     def _flatten_and_embed(
         self, feats: List[Tensor]
@@ -223,9 +250,20 @@ class MultiScaleNeck(nn.Module):
         cat_feat = torch.cat(vit_features, dim=1)   # (B, n×embed_dim, H/16, W/16)
         finest   = self.proj0(cat_feat)             # (B, D, H/16, W/16)
 
+        # Bottom-up: build coarser levels via stride-2 conv
         levels = [finest]
         for extra in self.extra_projs:
             levels.append(extra(levels[-1]))
+
+        # Top-down FPN fusion: propagate global context from coarse → fine.
+        # td_projs are ordered coarsest-pair first, so we walk from the end.
+        if self.top_down_fusion:
+            for i in range(len(levels) - 2, -1, -1):
+                td_idx  = len(levels) - 2 - i          # td_projs index
+                up      = F.interpolate(
+                    levels[i + 1], size=levels[i].shape[-2:], mode='nearest',
+                )
+                levels[i] = levels[i] + self.td_projs[td_idx](up)
 
         memory, spatial_shapes, level_start_idx, pos_embed = self._flatten_and_embed(levels)
         valid_ratios = self._valid_ratios(finest.shape[0], len(levels), finest.device)

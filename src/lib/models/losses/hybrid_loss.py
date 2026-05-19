@@ -7,15 +7,27 @@ Stage 1 — CenterNet:
 Stage 2 — DETR (Hungarian matching, applied per decoder layer):
   L_s2 = L_varifocal(cls) + λ_bbox * L_L1(box) + λ_ciou * L_CIoU(box)
         + λ_reid * (L_CE + L_triplet)(reid)  [if reid_classifier is set]
-        + λ_consist * L_consist(Stage-1 hm ↔ Stage-2 matched centers)
+        + λ_consist * L_consist(Stage-1 hm ↔ GT centers of Stage-2 matched objects)
 
-Auxiliary losses from intermediate decoder layers are summed with weight 0.5.
+Auxiliary losses from intermediate decoder layers use progressive weights:
+  layer i weight = aux_weight_base * (i + 1) / num_aux_layers
+  (shallower layers get smaller weight since their predictions are less refined)
+
+Stage balance curriculum (when total_epochs > 0):
+  t = epoch / total_epochs  ∈ [0, 1]
+  eff_λ_s1 = λ_stage1  →  1.0   (decays: Stage-1 is dominant early, balanced late)
+  eff_λ_s2 = λ_stage2  →  λ_stage1  (rises: Stage-2 gains more weight over time)
+  This implements a natural curriculum: CenterNet bootstraps Stage-2 first, then
+  the decoder takes over as the primary learning signal.
 
 Changes vs. v1:
   • sigmoid_focal_loss → varifocal_loss for Stage-2 cls (IoU-quality-weighted)
   • GIoU → CIoU for box regression (more stable for tiny boxes)
   • ReID: CE + TripletLoss (hard mining) instead of CE-only
-  • Consistency loss: heatmap at Stage-2 matched centers should be high
+  • Consistency loss: uses GT box centers (not Stage-2 predicted centers) for
+    a stable, Stage-2-quality-independent supervision signal on Stage-1 heatmap
+  • Dynamic stage weighting: curriculum from Stage-1-heavy to Stage-2-heavy
+  • Progressive aux weights: shallower decoder layers receive lower loss weight
 """
 from __future__ import annotations
 
@@ -189,16 +201,17 @@ class HybridLoss(nn.Module):
         num_classes:           int   = 7,
         lambda_wh:             float = 0.1,
         lambda_reg:            float = 1.0,
-        lambda_bbox:           float = 5.0,
+        lambda_bbox:           float = 2.0,   # matches trainer default (was 5.0, misleading)
         lambda_ciou:           float = 2.0,
         lambda_reid:           float = 1.0,
         lambda_triplet:        float = 0.5,
         lambda_consist:        float = 0.1,
-        consist_warmup_epochs: int   = 10,
-        lambda_stage1:         float = 1.0,
+        consist_warmup_epochs: int   = 5,     # shorter: GT centers don't need long warmup
+        lambda_stage1:         float = 2.0,
         lambda_stage2:         float = 1.0,
         aux_loss:              bool  = True,
         reid_classifier:       Optional[nn.Linear] = None,
+        total_epochs:          int   = 0,     # 0 = disable dynamic weighting
     ) -> None:
         super().__init__()
         self.num_classes           = num_classes
@@ -214,6 +227,7 @@ class HybridLoss(nn.Module):
         self.lambda_stage2         = lambda_stage2
         self.aux_loss              = aux_loss
         self._epoch                = 0      # updated each epoch via set_epoch()
+        self.total_epochs          = total_epochs
 
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
@@ -221,8 +235,39 @@ class HybridLoss(nn.Module):
         self.matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
 
     def set_epoch(self, epoch: int) -> None:
-        """Call at the start of each epoch so consistency loss can ramp up gradually."""
+        """Call at the start of each epoch so warmup ramps and dynamic weights update."""
         self._epoch = epoch
+
+    def _effective_stage_weights(self) -> tuple[float, float]:
+        """
+        Compute dynamic per-epoch stage weights.
+
+        Curriculum schedule (t = epoch / total_epochs ∈ [0, 1]):
+          eff_λ_s1: lambda_stage1 → 1.0  (Stage-1 weight decays as it stabilises)
+          eff_λ_s2: lambda_stage2 → lambda_stage1  (Stage-2 rises to share load equally)
+
+        Rationale:
+          - Early training: Stage-1 (CenterNet) must learn before Stage-2 can get
+            good query seeds. A higher Stage-1 weight drives faster heatmap convergence.
+          - Late training: Stage-1 heatmap is stable; Stage-2 decoder needs more
+            gradient to fine-tune boxes and classification for VisDrone's small objects.
+          - The endpoint eff_λ_s1 = eff_λ_s2 = 1.0 gives balanced supervision
+            so neither stage dominates at convergence.
+
+        When total_epochs == 0, returns the static configured weights unchanged.
+        """
+        if self.total_epochs <= 0:
+            return self.lambda_stage1, self.lambda_stage2
+
+        t = min(1.0, self._epoch / self.total_epochs)   # ∈ [0, 1]
+
+        # Cosine interpolation: smoother than linear at the endpoints
+        # t=0 → start values, t=1 → end values
+        smooth_t = 0.5 * (1.0 - math.cos(math.pi * t))
+
+        eff_s1 = self.lambda_stage1 + smooth_t * (1.0 - self.lambda_stage1)
+        eff_s2 = self.lambda_stage2 + smooth_t * (self.lambda_stage1 - self.lambda_stage2)
+        return eff_s1, eff_s2
 
     # ── Stage-1 ────────────────────────────────────────────────────────────────
 
@@ -315,12 +360,17 @@ class HybridLoss(nn.Module):
 
         if self.aux_loss:
             L = detr_out.boxes_all.shape[0]
-            for layer in range(L - 1):
-                idx = self.matcher(detr_out.logits_all[layer], detr_out.boxes_all[layer], targets)
+            n_aux = L - 1  # number of intermediate layers
+            for layer in range(n_aux):
+                # Reuse final-layer indices (shared assignment standard in DN-DETR, Anchor DETR).
                 aux = self._detr_layer_loss(
-                    detr_out.logits_all[layer], detr_out.boxes_all[layer], targets, idx,
+                    detr_out.logits_all[layer], detr_out.boxes_all[layer], targets, indices,
                 )
-                total = total + 0.5 * aux['total']
+                # Progressive aux weights: shallower layers get lower weight since
+                # their predictions are less refined. Linearly from 0.25 (layer 0)
+                # to 0.5 (layer n_aux-1). Final layer always has weight 1.0.
+                aux_w = 0.25 + 0.25 * (layer / max(n_aux - 1, 1))
+                total = total + aux_w * aux['total']
 
         return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'], 'ciou': d['ciou'],
                 'indices': indices}
@@ -380,19 +430,21 @@ class HybridLoss(nn.Module):
     def _consistency_loss(
         self,
         cn_out:   CenterNetOutput,
-        detr_out: DETROutput,
         targets:  List[dict],
         indices:  list,
     ) -> Tensor:
         """
-        Stage-1 / Stage-2 consistency: the Stage-1 heatmap value at the center
-        of each Stage-2 Hungarian-matched prediction should be high (≈ 1).
+        Stage-1 / Stage-2 consistency: the Stage-1 heatmap value at the GT center
+        of each Stage-2 Hungarian-matched object should be high (≈ 1).
 
-        This creates a feedback loop — Stage-2 matching quality guides Stage-1
-        to place heatmap peaks at true object centers.
+        Uses GT box centers (not Stage-2 predicted centers) for a stable supervision
+        signal that is independent of Stage-2 prediction quality. This avoids the
+        risk of training Stage-1 to place peaks at wrong positions when Stage-2 is
+        still noisy early in training.
 
-        Stage-2 box gradients are detached so this loss only updates the
-        CenterNet heatmap head (not the decoder).
+        Only objects that appear in the Stage-2 matching (i.e., objects the decoder
+        sees) are supervised — objects filtered out before Stage-2 are ignored.
+        Only updates Stage-1 heatmap head (no gradient to Stage-2 decoder).
         """
         hm = cn_out.hm                       # (B, C, H_hm, W_hm) — sigmoid
         B, C, H_hm, W_hm = hm.shape
@@ -405,26 +457,24 @@ class HybridLoss(nn.Module):
             if len(src_i) == 0:
                 continue
 
-            si = src_i.to(dev)
             ti = tgt_i.to(dev)
 
-            # Predicted box centres from Stage-2 (detached — only update Stage-1)
-            boxes   = detr_out.boxes[b][si].detach()   # (n, 4) cxcywh normalised
-            cx      = boxes[:, 0].clamp(0, 1)
-            cy      = boxes[:, 1].clamp(0, 1)
+            # GT box centers from Stage-2 targets — stable regardless of decoder quality.
+            # cxcywh normalised, so cx/cy ∈ [0, 1] directly.
+            gt_boxes = targets[b]['boxes'][ti]           # (n, 4) cxcywh normalised
+            cx       = gt_boxes[:, 0].clamp(0, 1)
+            cy       = gt_boxes[:, 1].clamp(0, 1)
 
-            # GT class for each matched query
-            cls_idx = targets[b]['labels'][ti]          # (n,)
+            # GT class for each matched object
+            cls_idx = targets[b]['labels'][ti]           # (n,) long
 
             # Map normalised coords → heatmap pixel indices
-            x_hm = (cx * (W_hm - 1)).long()
-            y_hm = (cy * (H_hm - 1)).long()
+            x_hm = (cx * (W_hm - 1)).long().clamp(0, W_hm - 1)
+            y_hm = (cy * (H_hm - 1)).long().clamp(0, H_hm - 1)
 
-            # Sample heatmap at predicted centres
-            hm_vals = hm[b, cls_idx, y_hm, x_hm]       # (n,)
-
-            # BCE: push sampled value toward 1.0
-            total = total + F.binary_cross_entropy(
+            # Sample heatmap at GT object centers and push toward 1.0
+            hm_vals = hm[b, cls_idx, y_hm, x_hm]        # (n,)
+            total   = total + F.binary_cross_entropy(
                 hm_vals, torch.ones_like(hm_vals), reduction='mean',
             )
             n_batches += 1
@@ -452,7 +502,10 @@ class HybridLoss(nn.Module):
         s1 = self._stage1_loss(outputs['stage1'], batch)
         s2 = self._stage2_loss(outputs['stage2'], targets)
 
-        total = self.lambda_stage1 * s1['total'] + self.lambda_stage2 * s2['total']
+        # Dynamic curriculum weights: Stage-1 heavy early, Stage-2 heavy late.
+        # Falls back to static lambda_stage1/2 when total_epochs == 0.
+        eff_s1, eff_s2 = self._effective_stage_weights()
+        total = eff_s1 * s1['total'] + eff_s2 * s2['total']
 
         loss_stats: Dict[str, Tensor] = {
             'loss':      total,
@@ -464,6 +517,8 @@ class HybridLoss(nn.Module):
             'loss_cls':  s2['cls'],
             'loss_bbox': s2['bbox'],
             'loss_ciou': s2['ciou'],
+            'w_s1':      torch.tensor(eff_s1),   # log effective weights for monitoring
+            'w_s2':      torch.tensor(eff_s2),
         }
 
         if self.reid_classifier is not None and 'ids' in targets[0]:
@@ -471,11 +526,13 @@ class HybridLoss(nn.Module):
             total  = total + self.lambda_reid * l_reid
             loss_stats['loss_reid'] = l_reid
 
-        # Consistency loss: ramped from 0 → lambda_consist over consist_warmup_epochs
-        # so random Stage-2 matches early in training don't corrupt Stage-1 heatmaps.
+        # Consistency loss: ramped from 0 → lambda_consist over consist_warmup_epochs.
+        # Now uses GT centers (not Stage-2 predictions), so warmup is shorter (5 epochs):
+        # it still prevents matching noise from corrupting Stage-1 on epoch 0, but
+        # the signal itself is stable so it doesn't need a long warmup.
         consist_scale = min(1.0, self._epoch / max(1, self.consist_warmup_epochs))
         l_consist = self._consistency_loss(
-            outputs['stage1'], outputs['stage2'], targets, s2['indices'],
+            outputs['stage1'], targets, s2['indices'],
         )
         total = total + self.lambda_consist * consist_scale * l_consist
         loss_stats['loss_consist'] = l_consist

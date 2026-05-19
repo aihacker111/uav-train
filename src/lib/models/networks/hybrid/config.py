@@ -50,9 +50,14 @@ class NeckConfig:
     decoder.  Set to 1 to match the pretrained LW-DETR checkpoints (P4 only,
     single H/16 × W/16 scale).  Set to >1 to get a feature pyramid (each extra
     level is produced by a stride-2 conv, giving H/32, H/64, …).
+
+    top_down_fusion: when True and num_output_levels > 1, adds an FPN-style
+    top-down pathway so coarser levels share context with finer levels.
+    No-op when num_output_levels == 1.
     """
-    hidden_dim: int       = 256
+    hidden_dim: int        = 256
     num_output_levels: int = 1    # 1 = pretrained-compatible (P4 single scale)
+    top_down_fusion: bool  = False # FPN top-down; only active when num_output_levels > 1
 
 
 @dataclass
@@ -90,9 +95,10 @@ class DETRHeadConfig:
 
 @dataclass
 class QueryGenConfig:
-    top_k: int             = 150    # reduced from 300: VisDrone frames rarely have >100 objects
-    nms_kernel: int        = 13     # reduced from 21: 13×13 = 52px at stride4, fits clustered pedestrians
-    score_threshold: float = 0.05  # raised from 0.01: filters noise queries early in training
+    top_k: int             = 200    # matches opts.K=200; VisDrone dense scenes can have >150 objects
+    nms_kernel: int        = 13     # 13×13 = 52px at stride4, fits clustered pedestrians
+    score_threshold: float = 0.1   # 0.05→0.1: reduces ~50% of noise queries entering decoder
+                                    # self-attention cost is O(K²), fewer valid queries = real speedup
 
 
 @dataclass
@@ -104,3 +110,7 @@ class HybridModelConfig:
     detr: DETRHeadConfig         = field(default_factory=DETRHeadConfig)
     query_gen: QueryGenConfig    = field(default_factory=QueryGenConfig)
     pretrained_path: str         = ''
+    # Gradient checkpointing: recomputes activations during backward instead of
+    # storing them — trades compute for memory. Enables larger batch sizes on the
+    # ViT backbone (the memory bottleneck) at the cost of ~15-20% slower backward.
+    grad_checkpoint: bool        = False

@@ -222,8 +222,10 @@ class LoadImagesAndLabels:  # for training
         else:
             labels_0 = np.zeros((0, 6), dtype=np.float32)
 
-        # HSV saturation/value jitter
-        if self.augment:
+        # HSV saturation/value jitter — skipped when pil_transform is set because
+        # ColorJitter in the PIL pipeline already handles colour variation; stacking
+        # both causes over-augmentation (extreme saturation / washed-out images).
+        if self.augment and self.pil_transform is None:
             fraction = 0.50
             img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
             S = img_hsv[:, :, 1].astype(np.float32)
@@ -294,12 +296,16 @@ class LoadImagesAndLabels:  # for training
         else:
             labels = np.array([])
 
-        # Random affine (rotation, scale, translate) on fixed-size image
+        # Random affine (rotation, scale, translate) on fixed-size image.
+        # scale=(0.80, 1.05): the old (0.50, 1.20) range could shrink already-tiny
+        # UAV objects (~10px) to <5px, pushing them below the Gaussian supervision
+        # threshold at stride-4.  Mosaic + ScaleBiasedCrop already cover scale
+        # diversity, so this step only needs a mild jitter.
         if self.augment:
             img, labels, M = random_affine(img, labels,
                                            degrees=(-5, 5),
                                            translate=(0.10, 0.10),
-                                           scale=(0.50, 1.20))
+                                           scale=(0.80, 1.05))
 
         num_labels = len(labels)
         if num_labels > 0:
@@ -384,12 +390,13 @@ def random_affine(img, targets=None,
     R[:2] = cv2.getRotationMatrix2D(angle=a, center=(
         img.shape[1] / 2, img.shape[0] / 2), scale=s)
 
-    # Translation
+    # Translation — T[0,2] is X (columns → width), T[1,2] is Y (rows → height).
+    # Original code had shape[0]/shape[1] (height/width) swapped for non-square images.
     T = np.eye(3)
     T[0, 2] = (random.random() * 2 - 1) * translate[0] * \
-              img.shape[0] + border  # x translation (pixels)
+              img.shape[1] + border  # x translation (pixels, shape[1]=width)
     T[1, 2] = (random.random() * 2 - 1) * translate[1] * \
-              img.shape[1] + border  # y translation (pixels)
+              img.shape[0] + border  # y translation (pixels, shape[0]=height)
 
     # Shear
     S = np.eye(3)

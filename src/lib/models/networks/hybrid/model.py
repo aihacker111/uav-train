@@ -31,6 +31,7 @@ from typing import Dict, Any, List
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as grad_ckpt
 from torch import Tensor
 
 from .config import HybridModelConfig, ViTConfig
@@ -99,9 +100,20 @@ class HybridCenterNetDETR(nn.Module):
         self.decoder        = HybridDecoder(dec_cfg)
         self.detr_head      = DETRHead(cfg.detr, bbox_reparam=dec_cfg.bbox_reparam)
 
+        # Gradient checkpointing: recompute backbone activations during backward
+        # instead of retaining them. Reduces ViT memory by ~50% at cost of ~20%
+        # slower backward. Enables larger batch sizes on memory-constrained GPUs.
+        self.grad_checkpoint = cfg.grad_checkpoint
+
     def forward(self, x: Tensor) -> Dict[str, Any]:
         # ── ViT backbone ──────────────────────────────────────────────────────
-        vit_features: List[Tensor] = self.backbone(x)
+        if self.grad_checkpoint and self.training:
+            # use_reentrant=False: safer with autocast/AMP and avoids double-backward issues
+            vit_features: List[Tensor] = grad_ckpt.checkpoint(
+                self.backbone, x, use_reentrant=False,
+            )
+        else:
+            vit_features: List[Tensor] = self.backbone(x)
 
         # ── Multi-scale neck ──────────────────────────────────────────────────
         neck_out, finest_s16 = self.neck(vit_features)   # (NeckOut, B×D×H/16×W/16)

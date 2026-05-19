@@ -88,6 +88,26 @@ class opts(object):
                                  default='',
                                  help='Path to LW-DETR COCO pretrained checkpoint (.pth). '
                                       'Empty string = train from scratch.')
+        self.parser.add_argument('--grad_checkpoint',
+                                 action='store_true',
+                                 default=False,
+                                 help='Enable gradient checkpointing on the ViT backbone. '
+                                      'Reduces backbone VRAM by ~50%% to allow larger batch '
+                                      'sizes on memory-constrained GPUs. Cost: ~20%% slower backward.')
+        self.parser.add_argument('--num_output_levels',
+                                 type=int,
+                                 default=1,
+                                 help='Number of feature pyramid levels emitted by MultiScaleNeck '
+                                      'to the DETR decoder (1=single-scale P4, 2=P4+P5, 3=P4+P5+P6). '
+                                      'Level 1 is pretrained-compatible. Level >1 changes decoder '
+                                      'attention shape so cross-attention restarts from scratch.')
+        self.parser.add_argument('--top_down_fusion',
+                                 action='store_true',
+                                 default=False,
+                                 help='Enable FPN top-down fusion in MultiScaleNeck. '
+                                      'REQUIRES --num_output_levels > 1 to have any effect. '
+                                      'Adds a lateral 1x1 conv from each coarser level back to '
+                                      'the finer level, giving finer features global context.')
         self.parser.add_argument('--down_ratio',
                                  type=int,
                                  default=4,  # 输出特征图的下采样率 H=H_image/4 and W=W_image/4
@@ -170,6 +190,18 @@ class opts(object):
                                  help='batch size on the master gpu.')
         self.parser.add_argument('--num_iters', type=int, default=-1,
                                  help='default: #samples / batch_size.')
+        self.parser.add_argument('--use_amp',
+                                 action='store_true',
+                                 default=False,
+                                 help='Enable Automatic Mixed Precision (fp16 forward + fp32 '
+                                      'weights). Gives ~1.5-2x training speedup and ~50%% VRAM '
+                                      'reduction with negligible accuracy loss. Requires CUDA.')
+        self.parser.add_argument('--grad_clip',
+                                 type=float,
+                                 default=0.1,
+                                 help='Max gradient norm for gradient clipping. '
+                                      '0.1 protects ViT backbone from gradient explosion. '
+                                      'Set to 0.0 to disable.')
         self.parser.add_argument('--val_intervals', type=int, default=5,
                                  help='number of epochs to run validation.')
         self.parser.add_argument('--trainval',

@@ -1006,8 +1006,10 @@ class RandomSensorNoise:
         # Poisson shot noise (only sometimes, simulating very low light)
         if self.poisson_scale > 0 and random.random() < 0.5:
             img_scaled = np.clip(img_np, 0, 255) / 255.0
-            img_np = img_np + np.random.poisson(img_scaled * self.poisson_scale / self.poisson_scale) \
-                             * self.poisson_scale * 255.0
+            # lambda = img_scaled / poisson_scale so samples scale with scene brightness;
+            # multiply back by poisson_scale * 255 to return to pixel units.
+            lam = np.maximum(img_scaled / self.poisson_scale, 1e-6)
+            img_np = img_np + np.random.poisson(lam).astype(np.float32) * self.poisson_scale * 255.0
         img_np = np.clip(img_np, 0, 255).astype(np.uint8)
         return PIL.Image.fromarray(img_np), target
 

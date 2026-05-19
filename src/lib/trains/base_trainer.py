@@ -7,6 +7,7 @@ from typing import Dict, Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from progress.bar import Bar
 
 from lib.utils.utils import AverageMeter
@@ -34,6 +35,14 @@ class BaseTrainer:
         self.loss_stats, self.loss = self._get_losses(opt)
         self.model_with_loss       = ModelWithLoss(model, self.loss)
         self.scheduler  = None   # set externally by train.py when cosine LR is used
+
+        # AMP scaler — only active when --use_amp is set and CUDA is available.
+        # GradScaler tracks the loss scale and skips optimizer steps when inf/nan
+        # gradients appear (e.g. from fp16 overflow), then recovers automatically.
+        use_amp = getattr(opt, 'use_amp', False) and torch.cuda.is_available()
+        self.scaler = GradScaler() if use_amp else None
+        if use_amp:
+            print('[AMP] Mixed-precision training enabled (fp16 forward + fp32 weights)')
 
         # Register any learnable parameters inside the loss (e.g. ReID classifier).
         # Explicitly mirror the last param group's LR so these params receive the
@@ -124,14 +133,38 @@ class BaseTrainer:
                 else:
                     batch[k] = batch[k].to(device=opt.device, non_blocking=True)
 
-            outputs, loss, loss_stats = model_with_loss(batch)
+            amp_enabled = self.scaler is not None
+            with autocast(enabled=amp_enabled):
+                outputs, loss, loss_stats = model_with_loss(batch)
 
             loss = loss.mean()
             if phase == 'train':
-                # Gradient accumulation: divide loss to keep gradient scale consistent
-                (loss / grad_accum).backward()
+                # Gradient accumulation with AMP support.
+                # scaler.scale() multiplies the loss by the current loss-scale factor
+                # so gradients stay in fp32 representable range even in fp16 forward.
+                scaled_loss = self.scaler.scale(loss / grad_accum) if amp_enabled \
+                              else (loss / grad_accum)
+                scaled_loss.backward()
+
                 if (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) >= num_iters:
-                    self.optimizer.step()
+                    grad_clip = getattr(opt, 'grad_clip', 0.0)
+                    if amp_enabled:
+                        # unscale_ restores true gradients before clipping/stepping
+                        self.scaler.unscale_(self.optimizer)
+                        if grad_clip > 0:
+                            nn.utils.clip_grad_norm_(
+                                (p for pg in self.optimizer.param_groups for p in pg['params']),
+                                grad_clip,
+                            )
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        if grad_clip > 0:
+                            nn.utils.clip_grad_norm_(
+                                (p for pg in self.optimizer.param_groups for p in pg['params']),
+                                grad_clip,
+                            )
+                        self.optimizer.step()
                     self.optimizer.zero_grad()
                     if self.scheduler is not None:
                         self.scheduler.step()

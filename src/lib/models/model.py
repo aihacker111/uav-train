@@ -36,9 +36,17 @@ def create_model(arch: str, heads: dict, head_conv: int, reid_dim: int = 256, nu
         variant = suffix if suffix in ('tiny', 'small', 'base') else 'small'
         cfg = HybridModelConfig()
         cfg.vit.variant = variant
-        cfg.detr.reid_dim    = reid_dim
+        cfg.detr.reid_dim         = reid_dim
         cfg.centernet.num_classes = num_classes
         cfg.detr.num_classes      = num_classes
+        # Wire opt flags into model config when called from train.py
+        if isinstance(heads, dict) and '__opt__' in heads:
+            opt = heads['__opt__']
+            cfg.grad_checkpoint          = getattr(opt, 'grad_checkpoint',    False)
+            cfg.neck.num_output_levels   = getattr(opt, 'num_output_levels',  1)
+            cfg.neck.top_down_fusion     = getattr(opt, 'top_down_fusion',    False)
+            if cfg.neck.top_down_fusion and cfg.neck.num_output_levels == 1:
+                print('[warn] --top_down_fusion has no effect when --num_output_levels=1')
         return build_hybrid_model(cfg)
 
     num_layers = _SIZE_MAP.get(suffix, 0)
