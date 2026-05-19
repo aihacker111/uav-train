@@ -96,9 +96,12 @@ class DETRHeadConfig:
 @dataclass
 class QueryGenConfig:
     top_k: int             = 200    # matches opts.K=200; VisDrone dense scenes can have >150 objects
-    nms_kernel: int        = 13     # 13×13 = 52px at stride4, fits clustered pedestrians
     score_threshold: float = 0.01  # Must be < CenterNet bias init sigmoid(-4.595)≈0.01 so content
                                     # queries are NOT zeroed out at init. 0.1 kills all content early.
+    # Gumbel-Top-K differentiable selection (replaces local-max NMS)
+    use_gumbel: bool       = True   # True: Gumbel-Top-K+STE during training, hard TopK at inference
+    tau_start: float       = 1.0   # initial temperature (soft, stable gradients, high diversity)
+    tau_end: float         = 0.1   # final temperature (sharp, near-hard selection, precise seeds)
 
 
 @dataclass

@@ -1,25 +1,34 @@
 """
 QueryGenerator: converts a CenterNet heatmap into dynamic DETR queries.
 
-Pipeline:
-  hm (B,C,H,W)  →  local-max NMS  →  score-threshold filter  →  top-K peaks
-  wh (B,2,H,W)  →  gather at peaks  →  normalised ref box size   ─┐
-                                                                    ├→ QueryBundle
-  feat (B,D,H,W) → gather + project                               ─┘
+Two selection modes controlled by QueryGenConfig.use_gumbel:
 
-Changes vs. v1:
-  • Reference box size now comes from Stage-1 wh prediction instead of a
-    fixed 0.05 default — gives the decoder a much better starting point,
-    especially for the wide size range of VisDrone objects.
-  • Soft score masking: content of below-threshold queries is zeroed out
-    before entering the decoder.  K stays fixed for batching / ONNX, but
-    the decoder only receives signal from confident peaks.
+  Gumbel-Top-K (training, use_gumbel=True):
+    K independent Gumbel perturbations are added to the max-class heatmap
+    scores; each query selects a distinct spatial location via argmax.
+    A Straight-Through Estimator (STE) makes the whole pipeline differentiable:
+      Forward : hard one-hot selection per query (fast, deterministic).
+      Backward: gradient flows through soft Gumbel-Softmax weights → heatmap
+                scores and Stage-1 wh head (partial detach — backbone feat is
+                still detached to protect representation learning).
+    Memory note: the (B, K, N) weight tensor uses ~180 MB at B=4, K=200,
+    N=56 320 (fp32). With AMP this halves; reduce K if memory is tight.
+
+  Hard TopK (inference or use_gumbel=False):
+    TopK over the max-class heatmap. No NMS — decoder self-attention handles
+    any spatial duplicates naturally, and is faster than max-pool NMS.
+
+Temperature τ is cosine-annealed epoch-by-epoch via set_tau():
+  τ large (early): soft distribution → stable gradients, high query diversity.
+  τ small (late) : sharp distribution → near-hard selection, precise seeds.
+  Coordinated with the Stage-1/2 curriculum in HybridLoss for consistent pacing.
 
 Reference points are in logit (unsigmoid) space.  The decoder (bbox_reparam=False)
 applies sigmoid internally before feeding MSDeformAttn, keeping coordinates in [0,1].
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -48,110 +57,207 @@ class QueryGenerator(nn.Module):
     """
     Converts a multi-class heatmap + feature map into decoder queries.
 
-    Steps:
-      1. Local-max NMS on the heatmap to suppress non-peak responses.
-      2. Zero out sub-threshold peaks (score_threshold filter).
-      3. Top-K selection across all classes and spatial locations.
-      4. Gather Stage-1 wh predictions at peak locations for reference size.
-      5. Project feature at peak positions to initialise content queries.
-      6. Soft-mask content of below-threshold queries (zeros → decoder ignores).
+    Gumbel path (training):
+      1. Build score distribution over spatial locations (max over classes).
+      2. Sample K independent Gumbel perturbations → K diverse soft selections.
+      3. STE: hard argmax in forward, soft Gumbel-Softmax gradient in backward.
+      4. Aggregate content / position / wh via weighted sum from soft weights.
+      5. Soft-mask below-threshold query content.
+
+    Hard path (inference):
+      1. Max over classes → TopK over spatial.
+      2. Gather content / position / wh at selected locations.
+      3. Soft-mask below-threshold query content.
     """
 
     def __init__(self, hidden_dim: int, cfg: QueryGenConfig) -> None:
         super().__init__()
         self.top_k      = cfg.top_k
-        self.nms_kernel = cfg.nms_kernel
         self.score_thr  = cfg.score_threshold
+        self.use_gumbel = cfg.use_gumbel
+        self.tau_start  = cfg.tau_start
+        self.tau_end    = cfg.tau_end
+        self._tau       = cfg.tau_start   # updated each epoch by set_tau()
 
         self.content_proj = nn.Linear(hidden_dim, hidden_dim)
         nn.init.xavier_uniform_(self.content_proj.weight)
         nn.init.zeros_(self.content_proj.bias)
 
-    # ── private helpers ───────────────────────────────────────────────────────
+    # ── Tau annealing ─────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _local_max_nms(hm: Tensor, kernel: int) -> Tensor:
-        pad    = kernel // 2
-        hm_max = F.max_pool2d(hm, kernel_size=kernel, stride=1, padding=pad)
-        return hm * (hm == hm_max).float()
+    def set_tau(self, epoch: int, total_epochs: int) -> None:
+        """
+        Cosine-anneal temperature τ from tau_start → tau_end over training.
+        Uses the same cosine schedule as the Stage-1/2 curriculum weight so
+        both ramps are perfectly in sync: as Stage-2 weight rises, τ falls and
+        query selection sharpens — Stage-2 gradient becomes increasingly focused.
+        No-op when use_gumbel is False or total_epochs ≤ 0.
+        """
+        if not self.use_gumbel or total_epochs <= 0:
+            self._tau = self.tau_start
+            return
+        t        = min(1.0, epoch / total_epochs)
+        smooth_t = 0.5 * (1.0 - math.cos(math.pi * t))
+        # Exponential interpolation in log-space keeps τ > 0 at all times
+        self._tau = self.tau_start * (self.tau_end / self.tau_start) ** smooth_t
+
+    # ── Private helpers ───────────────────────────────────────────────────────
 
     @staticmethod
     def _sigmoid_to_logit(x: Tensor) -> Tensor:
         x = x.clamp(_EPS, 1.0 - _EPS)
         return torch.log(x / (1.0 - x))
 
-    # ── forward ───────────────────────────────────────────────────────────────
+    def _gumbel_topk_weights(self, scores: Tensor, K: int) -> Tensor:
+        """
+        Vectorized Gumbel-Top-K with Straight-Through Estimator.
 
-    def forward(
+        scores : (B, N) — max-class heatmap score per spatial location.
+        returns: (B, K, N) weight matrix.
+          Forward : W_hard — one-hot at argmax(scores + G_k) for each query k.
+          Backward: gradient flows through W_soft = softmax((scores+G)/τ).
+
+        Gumbel-Max theorem: argmax(log p_i + G_i) ~ Categorical(p).
+        K independent noise tensors G_k give K diverse non-collapsing queries
+        without any explicit NMS or diversity regularization.
+        """
+        B, N = scores.shape
+        # K independent Gumbel(0,1) samples: (B, K, N)
+        # U ~ Uniform(eps, 1-eps) → G = -log(-log(U))
+        U = scores.new_empty(B, K, N).uniform_().clamp_(_EPS, 1.0 - _EPS)
+        G = -(-U.log()).log()
+
+        perturbed = scores.unsqueeze(1) + G          # (B, K, N)
+
+        # Soft weights: differentiable path for backward
+        W_soft = (perturbed / self._tau).softmax(dim=-1)   # (B, K, N)
+
+        # Hard weights: argmax per query — used in forward (STE)
+        hard_idx = perturbed.argmax(dim=-1, keepdim=True)  # (B, K, 1)
+        W_hard   = torch.zeros_like(W_soft).scatter_(-1, hard_idx, 1.0)
+
+        # STE trick: W_hard in forward, W_soft gradient in backward
+        #   forward : W_soft + (W_hard - W_soft)           = W_hard  ✓
+        #   backward: dL/dW_soft + d(W_hard-W_soft).detach = dL/dW_soft ✓
+        return W_soft + (W_hard - W_soft).detach()
+
+    # ── Forward paths ─────────────────────────────────────────────────────────
+
+    def _forward_gumbel(
         self,
-        hm:     Tensor,              # (B, C, H, W)  sigmoid heatmap
-        feat:   Tensor,              # (B, D, H, W)  spatial feature map
-        wh_map: Tensor | None = None,  # (B, 2, H, W)  Stage-1 wh output (pixel units at stride-4)
+        hm: Tensor, feat: Tensor, wh_map: Tensor | None,
+        B: int, C: int, Hs: int, Ws: int, D: int, N: int, K: int,
     ) -> QueryBundle:
-        """
-        Args:
-            hm     : sigmoid heatmap from CenterNetHead
-            feat   : stride-4 feature map (detached from Stage-1 grad)
-            wh_map : (optional) wh head output from Stage-1 — used to initialise
-                     reference box sizes. If None, falls back to fixed 0.05.
-        """
-        B, C, H, W = hm.shape
-        D = feat.shape[1]
+        """Gumbel-Top-K path (training): gradient flows to heatmap + wh head."""
 
-        # ── Step 1: local-max NMS ─────────────────────────────────────────────
-        hm_peaks = self._local_max_nms(hm, self.nms_kernel)
+        # Score distribution: max over class dimension
+        # Gradient propagates back through hm.max() → heatmap → Stage-1 head
+        s = hm.max(dim=1).values.reshape(B, N)          # (B, N)
 
-        # ── Step 2: suppress sub-threshold peaks before top-K ─────────────────
-        # Zeroing (not filtering) keeps K fixed for batching and ONNX export.
-        hm_peaks = hm_peaks * (hm_peaks >= self.score_thr).float()
+        # Gumbel-Top-K selection weights (STE): (B, K, N)
+        W = self._gumbel_topk_weights(s, K)
 
-        # ── Step 3: top-K over all classes × spatial ──────────────────────────
-        hm_flat   = hm_peaks.reshape(B, -1)                         # (B, C*H*W)
-        k         = min(self.top_k, hm_flat.shape[1])
-        scores, flat_idx = torch.topk(hm_flat, k, dim=1, sorted=True)
+        # ── Class scores and confidence ───────────────────────────────────────
+        # Weighted combination of class channels → class probability per query
+        hm_spatial  = hm.reshape(B, C, N).permute(0, 2, 1)   # (B, N, C)
+        class_scores = W @ hm_spatial                          # (B, K, C)
+        scores  = class_scores.max(dim=-1).values              # (B, K)
+        classes = class_scores.argmax(dim=-1)                  # (B, K)
 
-        classes     = flat_idx // (H * W)
-        spatial_idx = flat_idx %  (H * W)
+        # ── Weighted positions ────────────────────────────────────────────────
+        # grid is constant — no gradient needed, expand via broadcast
+        gy = torch.arange(Hs, device=hm.device, dtype=hm.dtype)
+        gx = torch.arange(Ws, device=hm.device, dtype=hm.dtype)
+        grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')
+        pos = torch.stack(
+            [(grid_x + 0.5) / Ws, (grid_y + 0.5) / Hs], dim=-1,
+        ).reshape(1, N, 2)                                     # (1, N, 2)
 
-        y_idx = (spatial_idx // W).float()
-        x_idx = (spatial_idx %  W).float()
+        cx_cy = W @ pos.expand(B, -1, -1)                     # (B, K, 2)
+        cx, cy = cx_cy[..., 0], cx_cy[..., 1]
 
-        cx = (x_idx + 0.5) / W
-        cy = (y_idx + 0.5) / H
-
-        # ── Step 4: reference box size from Stage-1 wh ────────────────────────
+        # ── Weighted wh (gradient flows to Stage-1 wh head) ──────────────────
         if wh_map is not None:
-            # wh_map: (B, 2, H, W) in stride-4 pixel units.
-            # Normalise to [0,1] w.r.t. the original image (H_orig=H*4, W_orig=W*4):
-            #   w_norm = w_stride4 / W_hm  (= w_orig / W_orig)
-            wh_flat  = wh_map.detach().reshape(B, 2, H * W)          # (B, 2, H*W)
-            idx_exp2 = spatial_idx.unsqueeze(1).expand(B, 2, k)      # (B, 2, K)
-            peak_wh  = wh_flat.gather(2, idx_exp2).permute(0, 2, 1)  # (B, K, 2)
+            wh_spatial = wh_map.reshape(B, 2, N).permute(0, 2, 1)  # (B, N, 2)
+            peak_wh    = W @ wh_spatial                              # (B, K, 2)
+            ref_w = (peak_wh[..., 0] / Ws).clamp(_EPS, 1.0 - _EPS)
+            ref_h = (peak_wh[..., 1] / Hs).clamp(_EPS, 1.0 - _EPS)
+        else:
+            ref_w = cx.new_full((B, K), 0.05)
+            ref_h = cx.new_full((B, K), 0.05)
 
-            ref_w = (peak_wh[..., 0] / W).clamp(_EPS, 1.0 - _EPS)   # (B, K)
-            ref_h = (peak_wh[..., 1] / H).clamp(_EPS, 1.0 - _EPS)
+        # ── Weighted content features ─────────────────────────────────────────
+        # feat is detached (backbone features protected from Stage-2 gradient).
+        # Gradient still flows through W → s → heatmap (the key path).
+        feat_spatial = feat.reshape(B, D, N).permute(0, 2, 1)  # (B, N, D)
+        content      = self.content_proj(W @ feat_spatial)      # (B, K, D)
+
+        ref_sig   = torch.stack([cx, cy, ref_w, ref_h], dim=-1)
+        ref_logit = self._sigmoid_to_logit(ref_sig)
+
+        score_mask = (scores >= self.score_thr).float().unsqueeze(-1)
+        content    = content * score_mask
+
+        return QueryBundle(ref_points=ref_logit, content=content,
+                           scores=scores, classes=classes)
+
+    def _forward_hard(
+        self,
+        hm: Tensor, feat: Tensor, wh_map: Tensor | None,
+        B: int, C: int, Hs: int, Ws: int, D: int, N: int, K: int,
+    ) -> QueryBundle:
+        """Hard TopK path (inference): fast, no NMS, no gradient needed."""
+
+        # Max over classes → TopK over spatial locations
+        hm_max_scores, hm_max_cls = hm.max(dim=1)      # (B, Hs, Ws) each
+        s_flat   = hm_max_scores.reshape(B, N)          # (B, N)
+        cls_flat = hm_max_cls.reshape(B, N)             # (B, N)
+
+        scores, spatial_idx = torch.topk(s_flat, K, dim=1, sorted=True)
+        classes = cls_flat.gather(1, spatial_idx)
+
+        y_idx = (spatial_idx // Ws).float()
+        x_idx = (spatial_idx %  Ws).float()
+        cx = (x_idx + 0.5) / Ws
+        cy = (y_idx + 0.5) / Hs
+
+        if wh_map is not None:
+            wh_flat  = wh_map.detach().reshape(B, 2, N)
+            idx_exp2 = spatial_idx.unsqueeze(1).expand(B, 2, K)
+            peak_wh  = wh_flat.gather(2, idx_exp2).permute(0, 2, 1)  # (B, K, 2)
+            ref_w = (peak_wh[..., 0] / Ws).clamp(_EPS, 1.0 - _EPS)
+            ref_h = (peak_wh[..., 1] / Hs).clamp(_EPS, 1.0 - _EPS)
         else:
             ref_w = torch.full_like(cx, 0.05)
             ref_h = torch.full_like(cy, 0.05)
 
-        ref_sig   = torch.stack([cx, cy, ref_w, ref_h], dim=-1)      # (B, K, 4) in [0,1]
-        ref_logit = self._sigmoid_to_logit(ref_sig)                   # (B, K, 4) unsigmoid
+        ref_sig   = torch.stack([cx, cy, ref_w, ref_h], dim=-1)
+        ref_logit = self._sigmoid_to_logit(ref_sig)
 
-        # ── Step 5: gather & project content features ─────────────────────────
-        feat_flat = feat.reshape(B, D, H * W)
-        idx_exp   = spatial_idx.unsqueeze(1).expand(B, D, k)
-        peak_feat = feat_flat.gather(2, idx_exp).permute(0, 2, 1)    # (B, K, D)
-        content   = self.content_proj(peak_feat)                      # (B, K, D)
+        feat_flat = feat.reshape(B, D, N)
+        idx_exp   = spatial_idx.unsqueeze(1).expand(B, D, K)
+        peak_feat = feat_flat.gather(2, idx_exp).permute(0, 2, 1)  # (B, K, D)
+        content   = self.content_proj(peak_feat)
 
-        # ── Step 6: soft-mask below-threshold queries ─────────────────────────
-        # Queries with score < score_thr have zeroed content — the decoder
-        # receives no signal from them without changing K or breaking batching.
-        score_mask = (scores >= self.score_thr).float().unsqueeze(-1)  # (B, K, 1)
+        score_mask = (scores >= self.score_thr).float().unsqueeze(-1)
         content    = content * score_mask
 
-        return QueryBundle(
-            ref_points=ref_logit,
-            content=content,
-            scores=scores,
-            classes=classes,
-        )
+        return QueryBundle(ref_points=ref_logit, content=content,
+                           scores=scores, classes=classes)
+
+    # ── forward ───────────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        hm:     Tensor,                  # (B, C, H, W)  sigmoid heatmap
+        feat:   Tensor,                  # (B, D, H, W)  spatial features (backbone detached)
+        wh_map: Tensor | None = None,    # (B, 2, H, W)  Stage-1 wh output (pixel units)
+    ) -> QueryBundle:
+        B, C, Hs, Ws = hm.shape
+        D = feat.shape[1]
+        N = Hs * Ws
+        K = min(self.top_k, N)
+
+        if self.use_gumbel and self.training:
+            return self._forward_gumbel(hm, feat, wh_map, B, C, Hs, Ws, D, N, K)
+        return self._forward_hard(hm, feat, wh_map, B, C, Hs, Ws, D, N, K)

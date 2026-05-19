@@ -123,10 +123,15 @@ class HybridCenterNetDETR(nn.Module):
         cn_out = self.centernet_head(finest_s4)   # CenterNetOutput
 
         # ── Query generation: heatmap peaks → DETR seeds ─────────────────────
-        # finest_s4 detached: Stage-2 gradients don't contaminate Stage-1.
-        # cn_out.wh passed so QueryGen initialises ref box sizes from Stage-1
-        # predictions instead of a fixed 0.05 default — better for VisDrone's
-        # wide object-size range (pedestrians ~1% to vehicles ~8% of image).
+        # Partial-detach strategy:
+        #   finest_s4.detach() — backbone content features stay protected;
+        #     Stage-2 gradients must not corrupt representation learning.
+        #   cn_out.hm  (no detach) — gradient flows Stage-2 → heatmap scores
+        #     so Stage-2 feedback teaches Stage-1 WHERE to place peaks.
+        #   cn_out.wh  (no detach) — gradient flows Stage-2 CIoU → wh head
+        #     so Stage-2 directly improves Stage-1 reference box sizes.
+        # In the Gumbel path the STE carries these gradients differentiably.
+        # In the hard path (inference) there is no gradient; detach is moot.
         queries = self.query_gen(
             cn_out.hm, finest_s4.detach(), wh_map=cn_out.wh,
         )  # QueryBundle(B, K, ·)
@@ -140,7 +145,12 @@ class HybridCenterNetDETR(nn.Module):
             'stage2':        detr_out,
             'query_scores':  queries.scores,    # (B, K) heatmap confidence
             'query_classes': queries.classes,   # (B, K) stage-1 class index
+            'tau_query':     torch.tensor(self.query_gen._tau, device=x.device),
         }
+
+    def set_epoch(self, epoch: int, total_epochs: int) -> None:
+        """Propagate epoch info to QueryGenerator for τ annealing."""
+        self.query_gen.set_tau(epoch, total_epochs)
 
     @staticmethod
     def _compatible_state(src: dict, model_state: dict) -> tuple[dict, list]:

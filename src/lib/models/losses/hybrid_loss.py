@@ -116,7 +116,8 @@ def _paired_iou(b1: Tensor, b2: Tensor) -> Tensor:
     return inter / (union + 1e-7)
 
 
-def ciou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor) -> Tensor:
+def ciou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor,
+              iou: Tensor | None = None) -> Tensor:
     """
     CIoU loss for N matched pairs (Complete-IoU).
 
@@ -132,7 +133,8 @@ def ciou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor) -> Tensor:
     pred_xyxy, tgt_xyxy : (N, 4) in xyxy format.
     Returns scalar mean CIoU loss.
     """
-    iou = _paired_iou(pred_xyxy, tgt_xyxy)   # (N,)
+    if iou is None:
+        iou = _paired_iou(pred_xyxy, tgt_xyxy)   # (N,)
 
     # Enclosing box diagonal squared
     enc_x1 = torch.min(pred_xyxy[:, 0], tgt_xyxy[:, 0])
@@ -205,7 +207,7 @@ class HybridLoss(nn.Module):
         lambda_ciou:           float = 2.0,
         lambda_reid:           float = 1.0,
         lambda_triplet:        float = 0.5,
-        lambda_consist:        float = 0.1,
+        lambda_consist:        float = 0.02,  # reduced: Gumbel STE now provides direct Stage-2→Stage-1
         consist_warmup_epochs: int   = 5,     # shorter: GT centers don't need long warmup
         lambda_stage1:         float = 2.0,
         lambda_stage2:         float = 1.0,
@@ -303,51 +305,49 @@ class HybridLoss(nn.Module):
         logits:  Tensor,       # (B, K, C)
         boxes:   Tensor,       # (B, K, 4) cxcywh
         targets: List[dict],
-        indices: list,
+        indices: list,         # list of {'src_i', 'tgt_i', 'iou'} dicts from matcher
     ) -> Dict[str, Tensor]:
         dev = logits.device
 
-        # ── Varifocal classification target ────────────────────────────────────
-        # tgt_cls[b, query_i, class_j] = IoU(pred_box_i, gt_box_j) for matched
-        #                               = 0                          for unmatched
-        # Varifocal quality target: q = IoU for positives, 0 for negatives.
-        # Floor q at Q_MIN so matched queries always receive positive gradient
-        # even when IoU≈0 (early training with random boxes).  Without the floor,
-        # positive weight = q = 0 → cls head only gets negative gradient until
-        # box regression is good enough to produce non-zero IoU — chicken-and-egg.
+        # ── Collect matched pairs + reuse cached IoU from matcher ──────────────
+        # IoU is pre-computed in HungarianMatcher to avoid a redundant _paired_iou
+        # call here. Saves one full forward over all matched pairs per layer.
         Q_MIN = 0.1
-        tgt_cls = torch.zeros_like(logits)
-        for b, (src_i, tgt_i) in enumerate(indices):
-            if len(src_i):
-                si = src_i.to(dev)
-                ti = tgt_i.to(dev)
-                with torch.no_grad():
-                    iou = _paired_iou(
-                        box_cxcywh_to_xyxy(boxes[b][si].detach()),
-                        box_cxcywh_to_xyxy(targets[b]['boxes'][ti]),
-                    )   # (n_matched,)
-                tgt_cls[b, si, targets[b]['labels'][ti]] = iou.clamp(min=Q_MIN)
+        tgt_cls    = torch.zeros_like(logits)
+        src_b_list, tgt_b_list, iou_list = [], [], []
+
+        for b, m in enumerate(indices):
+            src_i, tgt_i, iou_cached = m['src_i'], m['tgt_i'], m['iou']
+            if not len(src_i):
+                continue
+            si  = src_i.to(dev)
+            ti  = tgt_i.to(dev)
+            iou = iou_cached.to(dev)
+
+            # Varifocal quality target: q = IoU for positives (floored at Q_MIN),
+            # 0 for negatives.  Without Q_MIN floor, cls head gets zero positive
+            # gradient until box IoU > 0 — chicken-and-egg early in training.
+            tgt_cls[b, si, targets[b]['labels'][ti]] = iou.clamp(min=Q_MIN)
+
+            src_b_list.append(boxes[b][si])
+            tgt_b_list.append(targets[b]['boxes'][ti])
+            iou_list.append(iou)
+
         loss_cls = varifocal_loss(logits, tgt_cls)
 
         # ── CIoU box regression on matched pairs ───────────────────────────────
-        src_b_list, tgt_b_list = [], []
-        for b, (src_i, tgt_i) in enumerate(indices):
-            if len(src_i):
-                si = src_i.to(dev)
-                ti = tgt_i.to(dev)
-                src_b_list.append(boxes[b][si])
-                tgt_b_list.append(targets[b]['boxes'][ti])
-
         if src_b_list:
-            src_b    = torch.cat(src_b_list)
-            tgt_b    = torch.cat(tgt_b_list)
-            n_m      = src_b.shape[0]
+            src_b  = torch.cat(src_b_list)   # (N_total, 4) cxcywh
+            tgt_b  = torch.cat(tgt_b_list)
+            iou_all = torch.cat(iou_list)     # (N_total,) — pre-computed, reused
+            n_m    = src_b.shape[0]
             # SmoothL1 with beta=0.05: normalized box coords are in [0,1],
-            # threshold at 0.05 ≈ 64px error at 1280px width
+            # threshold at 0.05 ≈ 64px error at 1280px width.
             loss_bbox = F.smooth_l1_loss(src_b, tgt_b, beta=0.05, reduction='sum') / n_m
             loss_ciou = ciou_loss(
                 box_cxcywh_to_xyxy(src_b),
                 box_cxcywh_to_xyxy(tgt_b),
+                iou=iou_all,          # pass cached IoU — skips _paired_iou inside
             )
         else:
             loss_bbox = loss_ciou = logits.sum() * 0.0
@@ -368,7 +368,10 @@ class HybridLoss(nn.Module):
             L = detr_out.boxes_all.shape[0]
             n_aux = L - 1  # number of intermediate layers
             for layer in range(n_aux):
-                # Reuse final-layer indices (shared assignment standard in DN-DETR, Anchor DETR).
+                # Reuse final-layer indices for aux layers — standard practice in
+                # DN-DETR, Anchor-DETR; avoids O(K²·N) matching per layer.
+                # Cached IoU from final-layer matching is also reused, which means
+                # aux-layer IoU may be slightly stale but the assignment is correct.
                 aux = self._detr_layer_loss(
                     detr_out.logits_all[layer], detr_out.boxes_all[layer], targets, indices,
                 )
@@ -398,7 +401,8 @@ class HybridLoss(nn.Module):
         valid_emb, valid_ids = [], []
         dev = detr_out.reid.device
 
-        for b, (src_i, tgt_i) in enumerate(indices):
+        for b, m in enumerate(indices):
+            src_i, tgt_i = m['src_i'], m['tgt_i']
             if len(src_i) == 0:
                 continue
             if 'ids' not in targets[b]:
@@ -459,7 +463,8 @@ class HybridLoss(nn.Module):
         total = hm.sum() * 0.0
         n_batches = 0
 
-        for b, (src_i, tgt_i) in enumerate(indices):
+        for b, m in enumerate(indices):
+            src_i, tgt_i = m['src_i'], m['tgt_i']
             if len(src_i) == 0:
                 continue
 
@@ -526,6 +531,11 @@ class HybridLoss(nn.Module):
             'w_s1':      torch.tensor(eff_s1),   # log effective weights for monitoring
             'w_s2':      torch.tensor(eff_s2),
         }
+
+        # Gumbel temperature τ — passed through from model output for monitoring.
+        # Lets TensorBoard show the annealing curve alongside stage weights.
+        if 'tau_query' in outputs:
+            loss_stats['tau_query'] = outputs['tau_query'].detach()
 
         if self.reid_classifier is not None and 'ids' in targets[0]:
             l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])

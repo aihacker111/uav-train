@@ -35,6 +35,7 @@ class HybridTrainer(BaseTrainer):
             'loss_s1', 'loss_hm', 'loss_wh', 'loss_reg',
             'loss_s2', 'loss_cls', 'loss_bbox', 'loss_ciou', 'loss_consist',
             'w_s1', 'w_s2',   # effective stage weights (for monitoring curriculum)
+            'tau_query',       # Gumbel temperature τ annealing curve
         ]
 
         reid_classifier = None
@@ -53,7 +54,7 @@ class HybridTrainer(BaseTrainer):
             lambda_reid           = getattr(opt, 'id_weight',             1.0),
             lambda_stage1         = getattr(opt, 'stage1_weight',         2.0),
             lambda_stage2         = getattr(opt, 'stage2_weight',         1.0),
-            lambda_consist        = getattr(opt, 'consist_weight',        0.1),
+            lambda_consist        = getattr(opt, 'consist_weight',        0.02),
             consist_warmup_epochs = getattr(opt, 'consist_warmup_epochs', 5),
             aux_loss              = True,
             reid_classifier       = reid_classifier,
@@ -128,17 +129,21 @@ class HybridTrainer(BaseTrainer):
                 output   = model(batch['input'])
                 stage2: DETROutput = output['stage2']
 
+                # Batch GPU ops before CPU transfer: sigmoid + argmax/max in fp32
+                prob_t            = stage2.logits.sigmoid()           # (B, K, C) GPU
+                cls_scores_t, cls_labels_t = prob_t.max(dim=-1)      # (B, K) each
+
+                boxes_cpu  = stage2.boxes.cpu()       # (B, K, 4)
+                scores_cpu = cls_scores_t.cpu()       # (B, K)
+                labels_cpu = cls_labels_t.cpu()       # (B, K)
+
                 B = batch['input'].shape[0]
                 for b in range(B):
-                    boxes  = stage2.boxes[b].cpu().numpy()   # (K, 4) cxcywh [0,1]
-                    logits = stage2.logits[b].cpu().numpy()  # (K, C)
-                    prob   = 1.0 / (1.0 + np.exp(-logits))  # sigmoid (K, C)
-
-                    cls_scores = prob.max(axis=-1)           # (K,)
-                    cls_labels = prob.argmax(axis=-1)        # (K,)
+                    cls_scores = scores_cpu[b].numpy()   # (K,)
+                    cls_labels = labels_cpu[b].numpy()   # (K,)
 
                     keep = cls_scores >= score_thr
-                    pred_boxes  = _cxcywh_to_xyxy(boxes[keep])
+                    pred_boxes  = _cxcywh_to_xyxy(boxes_cpu[b].numpy()[keep])
                     pred_scores = cls_scores[keep].astype(np.float32)
                     pred_labels = cls_labels[keep].astype(np.int64)
 

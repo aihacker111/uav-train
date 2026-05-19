@@ -8,7 +8,7 @@ All box tensors are in normalised cxcywh format.
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -78,11 +78,17 @@ class HungarianMatcher(nn.Module):
         pred_logits: Tensor,       # (B, K, C)  raw logits
         pred_boxes:  Tensor,       # (B, K, 4)  normalised cxcywh
         targets:     List[dict],   # list of {'labels': (N,), 'boxes': (N, 4)}
-    ) -> List[Tuple[Tensor, Tensor]]:
+    ) -> List[Dict]:
         """
-        Returns list of (src_indices, tgt_indices) tensors, one tuple per image.
+        Returns list of dicts with keys:
+          'src_i'  : (n,) long — matched prediction indices
+          'tgt_i'  : (n,) long — matched target indices
+          'iou'    : (n,) float — paired IoU of matched boxes (cached for loss reuse)
+        IoU is pre-computed here once and reused in _detr_layer_loss to avoid a
+        redundant _paired_iou call for the varifocal quality target.
         """
         B, K = pred_logits.shape[:2]
+        dev  = pred_logits.device
 
         prob  = pred_logits.flatten(0, 1).sigmoid()    # (B*K, C)
         boxes = pred_boxes.flatten(0, 1)               # (B*K, 4)
@@ -99,11 +105,10 @@ class HungarianMatcher(nn.Module):
         # L1 box cost
         cost_l1   = torch.cdist(boxes, tgt_bbox, p=1)
 
-        # GIoU cost
-        cost_giou_mat = -generalized_box_iou(
-            box_cxcywh_to_xyxy(boxes),
-            box_cxcywh_to_xyxy(tgt_bbox),
-        )
+        # GIoU cost (all-pairs matrix, used for matching only)
+        boxes_xyxy   = box_cxcywh_to_xyxy(boxes)
+        tgt_bbox_xyxy = box_cxcywh_to_xyxy(tgt_bbox)
+        cost_giou_mat = -generalized_box_iou(boxes_xyxy, tgt_bbox_xyxy)
 
         C = (self.cost_class * cost_cls
              + self.cost_bbox  * cost_l1
@@ -114,8 +119,20 @@ class HungarianMatcher(nn.Module):
         indices = []
         for b, c_b in enumerate(C.split(sizes, dim=2)):
             i, j = linear_sum_assignment(c_b[b].numpy())
-            indices.append((
-                torch.as_tensor(i, dtype=torch.long),
-                torch.as_tensor(j, dtype=torch.long),
-            ))
+            si = torch.as_tensor(i, dtype=torch.long)
+            ti = torch.as_tensor(j, dtype=torch.long)
+
+            # Pre-compute paired IoU for matched pairs so _detr_layer_loss can
+            # reuse it for the varifocal quality target without recomputing.
+            if len(si):
+                pred_b  = pred_boxes[b][si.to(dev)]        # (n, 4) cxcywh
+                tgt_b   = targets[b]['boxes'][ti.to(dev)]  # (n, 4) cxcywh
+                iou_b   = _box_iou(
+                    box_cxcywh_to_xyxy(pred_b),
+                    box_cxcywh_to_xyxy(tgt_b),
+                )[0].diag().cpu()                           # element-wise IoU
+            else:
+                iou_b = si.new_empty(0, dtype=torch.float32)
+
+            indices.append({'src_i': si, 'tgt_i': ti, 'iou': iou_b})
         return indices
