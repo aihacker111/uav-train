@@ -108,8 +108,12 @@ class DETRHead(nn.Module):
         # 2-layer ReID MLP; output is L2-normalised in forward
         self.reid_mlp = _make_mlp(D, D, cfg.reid_dim, 2)
 
-        # Focal-loss bias init for classifier
-        nn.init.constant_(self.cls_head.bias, -4.595)
+        # Varifocal bias init: -2.0 → sigmoid≈0.12.
+        # -4.595 (CornerNet focal convention, p≈0.01) gives near-zero negative weight
+        # α*p^γ = 0.25*0.01² ≈ 2.5e-5, so cls head gets ~zero gradient from both
+        # positives (IoU=0 at init) and negatives — nothing learns.
+        # -2.0 gives p≈0.12 → negative weight ≈ 0.0036, 160× larger → training starts.
+        nn.init.constant_(self.cls_head.bias, -2.0)
 
         # Zero-init last box layer (standard DETR practice)
         last_box: nn.Linear = list(self.box_mlp.children())[-1]

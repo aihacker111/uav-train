@@ -310,6 +310,12 @@ class HybridLoss(nn.Module):
         # ── Varifocal classification target ────────────────────────────────────
         # tgt_cls[b, query_i, class_j] = IoU(pred_box_i, gt_box_j) for matched
         #                               = 0                          for unmatched
+        # Varifocal quality target: q = IoU for positives, 0 for negatives.
+        # Floor q at Q_MIN so matched queries always receive positive gradient
+        # even when IoU≈0 (early training with random boxes).  Without the floor,
+        # positive weight = q = 0 → cls head only gets negative gradient until
+        # box regression is good enough to produce non-zero IoU — chicken-and-egg.
+        Q_MIN = 0.1
         tgt_cls = torch.zeros_like(logits)
         for b, (src_i, tgt_i) in enumerate(indices):
             if len(src_i):
@@ -320,7 +326,7 @@ class HybridLoss(nn.Module):
                         box_cxcywh_to_xyxy(boxes[b][si].detach()),
                         box_cxcywh_to_xyxy(targets[b]['boxes'][ti]),
                     )   # (n_matched,)
-                tgt_cls[b, si, targets[b]['labels'][ti]] = iou
+                tgt_cls[b, si, targets[b]['labels'][ti]] = iou.clamp(min=Q_MIN)
         loss_cls = varifocal_loss(logits, tgt_cls)
 
         # ── CIoU box regression on matched pairs ───────────────────────────────

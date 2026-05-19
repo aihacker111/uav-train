@@ -97,8 +97,8 @@ class DETRHeadConfig:
 class QueryGenConfig:
     top_k: int             = 200    # matches opts.K=200; VisDrone dense scenes can have >150 objects
     nms_kernel: int        = 13     # 13×13 = 52px at stride4, fits clustered pedestrians
-    score_threshold: float = 0.1   # 0.05→0.1: reduces ~50% of noise queries entering decoder
-                                    # self-attention cost is O(K²), fewer valid queries = real speedup
+    score_threshold: float = 0.01  # Must be < CenterNet bias init sigmoid(-4.595)≈0.01 so content
+                                    # queries are NOT zeroed out at init. 0.1 kills all content early.
 
 
 @dataclass
