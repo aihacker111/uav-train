@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Dict, Any
@@ -106,7 +107,10 @@ class BaseTrainer:
         data_time       = AverageMeter()
         batch_time      = AverageMeter()
         avg_loss_stats  = {l: AverageMeter() for l in self.loss_stats}
-        num_iters       = len(data_loader) if opt.num_iters < 0 else opt.num_iters
+        data_iters      = len(data_loader) if opt.num_iters < 0 else opt.num_iters
+        # Bar tracks optimizer steps (1 per grad_accum data batches) so the
+        # displayed step count matches the actual number of weight updates.
+        num_iters       = max(1, math.ceil(data_iters / grad_accum))
         bar             = Bar('{}/{}'.format(opt.task, opt.exp_id), max=num_iters)
         if phase == 'train':
             self.optimizer.zero_grad()  # clear any stale grads before epoch starts
@@ -117,7 +121,7 @@ class BaseTrainer:
         end             = time.time()
 
         for batch_idx, batch in enumerate(data_loader):
-            if batch_idx >= num_iters:
+            if batch_idx >= data_iters:
                 break
 
             data_time.update(time.time() - end)
@@ -146,7 +150,8 @@ class BaseTrainer:
                               else (loss / grad_accum)
                 scaled_loss.backward()
 
-                if (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) >= num_iters:
+                is_opt_step = (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) >= data_iters
+                if is_opt_step:
                     grad_clip = getattr(opt, 'grad_clip', 0.0)
                     if amp_enabled:
                         # unscale_ restores true gradients before clipping/stepping
@@ -173,32 +178,37 @@ class BaseTrainer:
             batch_time.update(elapsed)
             end = time.time()
 
-            # Smoothed ETA using EMA of batch time (avoids wild spikes from I/O stalls)
-            _ema_batch_s = elapsed if _ema_batch_s is None \
-                else _EMA_ALPHA * elapsed + (1 - _EMA_ALPHA) * _ema_batch_s
-            _remaining   = (num_iters - batch_idx - 1) * _ema_batch_s
-            _eta_m, _eta_s = divmod(int(_remaining), 60)
-            _eta_h, _eta_m = divmod(_eta_m, 60)
-            _eta_str     = f'{_eta_h:d}:{_eta_m:02d}:{_eta_s:02d}' if _eta_h \
-                           else f'{_eta_m:d}:{_eta_s:02d}'
+            # Update bar only on optimizer steps so displayed count = weight updates.
+            is_opt_step = (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) >= data_iters
+            if phase != 'train' or is_opt_step:
+                opt_step_idx = (batch_idx + 1) // grad_accum  # current optimizer step
 
-            Bar.suffix = '{phase}: [{0}][{1}/{2}]|Tot: {total:} |ETA: {eta} '.format(
-                epoch, batch_idx, num_iters, phase=phase,
-                total=bar.elapsed_td, eta=_eta_str)
+                # Smoothed ETA using EMA of batch time × grad_accum (time per opt step)
+                _ema_batch_s = elapsed if _ema_batch_s is None \
+                    else _EMA_ALPHA * elapsed + (1 - _EMA_ALPHA) * _ema_batch_s
+                _remaining   = (num_iters - opt_step_idx) * _ema_batch_s * grad_accum
+                _eta_m, _eta_s = divmod(int(_remaining), 60)
+                _eta_h, _eta_m = divmod(_eta_m, 60)
+                _eta_str     = f'{_eta_h:d}:{_eta_m:02d}:{_eta_s:02d}' if _eta_h \
+                               else f'{_eta_m:d}:{_eta_s:02d}'
 
-            for l in avg_loss_stats:
-                avg_loss_stats[l].update(loss_stats[l].mean().item(), batch['input'].size(0))
-                Bar.suffix += '|{} {:.4f} '.format(l, avg_loss_stats[l].avg)
+                Bar.suffix = '{phase}: [{0}][{1}/{2}]|Tot: {total:} |ETA: {eta} '.format(
+                    epoch, opt_step_idx, num_iters, phase=phase,
+                    total=bar.elapsed_td, eta=_eta_str)
 
-            if not opt.hide_data_time:
-                Bar.suffix += '|Data {dt.val:.3f}s({dt.avg:.3f}s) |Net {bt.avg:.3f}s'.format(
-                    dt=data_time, bt=batch_time)
+                for l in avg_loss_stats:
+                    avg_loss_stats[l].update(loss_stats[l].mean().item(), batch['input'].size(0))
+                    Bar.suffix += '|{} {:.4f} '.format(l, avg_loss_stats[l].avg)
 
-            if opt.print_iter > 0:
-                if batch_idx % opt.print_iter == 0:
-                    print('{}/{}| {}'.format(opt.task, opt.exp_id, Bar.suffix))
-            else:
-                bar.next()
+                if not opt.hide_data_time:
+                    Bar.suffix += '|Data {dt.val:.3f}s({dt.avg:.3f}s) |Net {bt.avg:.3f}s'.format(
+                        dt=data_time, bt=batch_time)
+
+                if opt.print_iter > 0:
+                    if opt_step_idx % opt.print_iter == 0:
+                        print('{}/{}| {}'.format(opt.task, opt.exp_id, Bar.suffix))
+                else:
+                    bar.next()
 
             if opt.test:
                 self.save_result(outputs, batch, results)

@@ -264,14 +264,21 @@ def run(opt):
     trainer.set_device(opt.gpus, opt.chunk_sizes, opt.device)
 
     # ── Cosine LR scheduler with linear warmup ───────────────────────────────────
+    # IMPORTANT: scheduler.step() is called once per optimizer step, not per
+    # DataLoader batch.  With grad_accum=N, there are len(loader)/N optimizer
+    # steps per epoch, so total_iters and warmup_iters must use optimizer steps
+    # — otherwise LR decays grad_accum× faster than intended.
     use_cosine = getattr(opt, 'cosine_lr', False)
     scheduler  = None
     if use_cosine:
-        iters_per_epoch = len(train_loader)
-        total_iters     = iters_per_epoch * opt.num_epochs
-        warmup_iters    = getattr(opt, 'warmup_iters', min(1000, iters_per_epoch))
-        min_lr_ratio    = getattr(opt, 'min_lr_ratio', 0.01)
-        resumed_step    = start_epoch * iters_per_epoch
+        grad_accum         = max(1, getattr(opt, 'grad_accum', 1))
+        data_iters_per_ep  = len(train_loader)
+        # Optimizer steps per epoch (last partial accumulation still triggers a step)
+        opt_steps_per_ep   = max(1, math.ceil(data_iters_per_ep / grad_accum))
+        total_iters        = opt_steps_per_ep * opt.num_epochs
+        warmup_iters       = getattr(opt, 'warmup_iters', min(1000, opt_steps_per_ep))
+        min_lr_ratio       = getattr(opt, 'min_lr_ratio', 0.01)
+        resumed_step       = start_epoch * opt_steps_per_ep
 
         # LambdaLR requires 'initial_lr' in every param group when last_epoch > -1.
         # Param groups added after the scheduler was last saved (e.g. the loss/ReID
@@ -284,8 +291,9 @@ def run(opt):
             optimizer, warmup_iters, total_iters, min_lr_ratio,
             last_epoch=resumed_step - 1 if resumed_step > 0 else -1,
         )
-        print(f'Cosine LR: warmup={warmup_iters} iters, '
-              f'total={total_iters} iters, min_lr_ratio={min_lr_ratio}, '
+        print(f'Cosine LR: warmup={warmup_iters} opt-steps, '
+              f'total={total_iters} opt-steps ({opt_steps_per_ep}/epoch), '
+              f'grad_accum={grad_accum}, min_lr_ratio={min_lr_ratio}, '
               f'resumed_step={resumed_step}')
 
     # ── Training loop ────────────────────────────────────────────────────────────
