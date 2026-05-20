@@ -1,18 +1,18 @@
 """
-Hybrid CenterNet-DETR architecture for multi-object tracking.
+Hybrid DETR architecture for multi-object tracking on UAV imagery.
 
 Public API
 ----------
 build_hybrid_model(cfg)       — instantiate the full model
 HybridModelConfig             — top-level configuration dataclass
-ViTConfig, NeckConfig, ...    — per-component configuration dataclasses
 
-Output types (returned by HybridCenterNetDETR.forward)
-------------------------------------------------------
-CenterNetOutput   — stage-1 dense heatmap predictions
-DETROutput        — stage-2 per-query refined predictions
-QueryBundle       — intermediate query representation
-DecoderOutput     — raw decoder hidden states + reference points
+Output types (returned by HybridDETR.forward)
+---------------------------------------------
+ScorerOutput  — stride-8 objectness score map + stride-8 features
+DETROutput    — stage-2 per-query refined predictions
+QueryBundle   — intermediate query representation
+DecoderOutput — raw decoder hidden states + reference points
+DNMeta        — DN query assignment metadata (training only)
 
 Import notes
 ------------
@@ -27,38 +27,44 @@ from .config import (
     ViTConfig,
     NeckConfig,
     DecoderConfig,
-    CenterNetHeadConfig,
+    TokenScorerConfig,
     DETRHeadConfig,
     QueryGenConfig,
+    DNConfig,
 )
-from .heads import CenterNetOutput, DETROutput
+from .heads import ScorerOutput, DETROutput
 from .query_gen import QueryBundle
 from .neck import MultiScaleNeckOutput
+from .dn_gen import DNMeta
 
 __all__ = [
     # Model factory (lazy — requires compiled CUDA ops)
     'build_hybrid_model',
-    'HybridCenterNetDETR',
+    'HybridDETR',
+    'HybridCenterNetDETR',   # backward-compat alias
     # Configs
     'HybridModelConfig',
     'ViTConfig',
     'NeckConfig',
     'DecoderConfig',
-    'CenterNetHeadConfig',
+    'TokenScorerConfig',
     'DETRHeadConfig',
     'QueryGenConfig',
+    'DNConfig',
     # Output types
-    'CenterNetOutput',
+    'ScorerOutput',
     'DETROutput',
     'QueryBundle',
     'DecoderOutput',
     'MultiScaleNeckOutput',
+    'DNMeta',
 ]
 
 _LAZY = {
-    'HybridCenterNetDETR': ('.model',   'HybridCenterNetDETR'),
-    'build_hybrid_model':  ('.model',   'build_hybrid_model'),
-    'DecoderOutput':       ('.decoder', 'DecoderOutput'),
+    'HybridDETR':           ('.model',   'HybridDETR'),
+    'HybridCenterNetDETR':  ('.model',   'HybridCenterNetDETR'),
+    'build_hybrid_model':   ('.model',   'build_hybrid_model'),
+    'DecoderOutput':        ('.decoder', 'DecoderOutput'),
 }
 
 
@@ -66,7 +72,7 @@ def __getattr__(name: str):
     if name in _LAZY:
         module_rel, attr = _LAZY[name]
         import importlib
-        mod = importlib.import_module(module_rel, package=__name__)
+        mod   = importlib.import_module(module_rel, package=__name__)
         value = getattr(mod, attr)
         globals()[name] = value
         return value

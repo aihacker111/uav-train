@@ -91,12 +91,19 @@ class HybridDecoder(nn.Module):
         nn.init.zeros_(self.bbox_embed.layers[-1].weight)
         nn.init.zeros_(self.bbox_embed.layers[-1].bias)
 
-    def forward(self, queries: QueryBundle, neck: MultiScaleNeckOutput) -> DecoderOutput:
+    def forward(
+        self,
+        queries:   QueryBundle,
+        neck:      MultiScaleNeckOutput,
+        attn_mask: 'torch.Tensor | None' = None,
+    ) -> DecoderOutput:
         """
         Args:
-            queries : QueryBundle — content (B, K, D), ref_points (B, K, 4) unsigmoid
-            neck    : MultiScaleNeckOutput — memory (B, Σ, D), pos_embed, spatial_shapes,
-                      level_start_idx, valid_ratios
+            queries   : QueryBundle — content (B, K, D), ref_points (B, K, 4) unsigmoid
+            neck      : MultiScaleNeckOutput — memory, pos_embed, spatial_shapes, …
+            attn_mask : optional bool (Q, Q) self-attention mask for DN training.
+                        True = blocked.  Shape (K_total, K_total) applied to all
+                        batch elements and heads uniformly.
         Returns:
             DecoderOutput with hs and refs_logit, both (num_layers, B, K, ·)
         """
@@ -108,5 +115,6 @@ class HybridDecoder(nn.Module):
             level_start_index   = neck.level_start_idx,
             spatial_shapes      = neck.spatial_shapes,
             valid_ratios        = neck.valid_ratios,
+            tgt_mask            = attn_mask,
         )
         return DecoderOutput(hs=hs, refs_logit=refs_logit)

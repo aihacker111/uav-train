@@ -36,9 +36,8 @@ def create_model(arch: str, heads: dict, head_conv: int, reid_dim: int = 256, nu
         variant = suffix if suffix in ('tiny', 'small', 'base') else 'small'
         cfg = HybridModelConfig()
         cfg.vit.variant = variant
-        cfg.detr.reid_dim         = reid_dim
-        cfg.centernet.num_classes = num_classes
-        cfg.detr.num_classes      = num_classes
+        cfg.detr.reid_dim    = reid_dim
+        cfg.detr.num_classes = num_classes
         # Wire opt flags into model config when called from train.py
         if isinstance(heads, dict) and '__opt__' in heads:
             opt = heads['__opt__']
@@ -47,6 +46,25 @@ def create_model(arch: str, heads: dict, head_conv: int, reid_dim: int = 256, nu
             cfg.neck.top_down_fusion     = getattr(opt, 'top_down_fusion',    False)
             if cfg.neck.top_down_fusion and cfg.neck.num_output_levels == 1:
                 print('[warn] --top_down_fusion has no effect when --num_output_levels=1')
+            # Scorer opts
+            cfg.scorer.head_conv             = getattr(opt, 'scorer_head_conv',       64)
+            cfg.scorer.use_multiscale_fusion = getattr(opt, 'use_multiscale_fusion',  True)
+            # QueryGen opts
+            cfg.query_gen.use_gumbel            = getattr(opt, 'use_gumbel',            True)
+            cfg.query_gen.tau_start             = getattr(opt, 'tau_start',             1.0)
+            cfg.query_gen.tau_end               = getattr(opt, 'tau_end',               0.1)
+            cfg.query_gen.top_k                 = getattr(opt, 'K',                    200)
+            cfg.query_gen.use_spatial_partition = getattr(opt, 'use_spatial_partition', False)
+            cfg.query_gen.sp_grid_rows          = getattr(opt, 'sp_grid_rows',          4)
+            cfg.query_gen.sp_grid_cols          = getattr(opt, 'sp_grid_cols',          4)
+            cfg.query_gen.sp_queries_per_region = getattr(opt, 'sp_queries_per_region', 50)
+            cfg.query_gen.sp_overlap_ratio      = getattr(opt, 'sp_overlap_ratio',      0.25)
+            cfg.query_gen.sp_global_queries     = getattr(opt, 'sp_global_queries',     32)
+            # DN opts
+            cfg.dn.num_dn_groups        = getattr(opt, 'num_dn_groups',        5)
+            cfg.dn.dn_label_noise_ratio = getattr(opt, 'dn_label_noise_ratio', 0.5)
+            cfg.dn.dn_box_noise_scale   = getattr(opt, 'dn_box_noise_scale',   0.4)
+            cfg.dn.max_dn_queries       = getattr(opt, 'dn_max_queries',       500)
         return build_hybrid_model(cfg)
 
     num_layers = _SIZE_MAP.get(suffix, 0)

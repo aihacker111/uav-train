@@ -4,10 +4,6 @@ from typing import List
 
 
 # ── ViT variant table ─────────────────────────────────────────────────────────
-# Matches LWDETR_*_60e_coco.pth checkpoints exactly.
-# Both tiny and small use the vit_tiny encoder (embed_dim=192);
-# they differ only in depth and attention window layout.
-
 _VIT_VARIANTS = {
     #        embed  depth  window_blocks            out_feat_indexes     num_feat_levels
     'tiny':  (192,  6,  [0, 2, 4],                [1, 3, 5]),          # 3 levels
@@ -43,46 +39,34 @@ class ViTConfig:
 
 @dataclass
 class NeckConfig:
-    """
-    Projects ViT features to uniform hidden_dim for the decoder.
-
-    num_output_levels controls how many spatial scales the neck emits to the
-    decoder.  Set to 1 to match the pretrained LW-DETR checkpoints (P4 only,
-    single H/16 × W/16 scale).  Set to >1 to get a feature pyramid (each extra
-    level is produced by a stride-2 conv, giving H/32, H/64, …).
-
-    top_down_fusion: when True and num_output_levels > 1, adds an FPN-style
-    top-down pathway so coarser levels share context with finer levels.
-    No-op when num_output_levels == 1.
-    """
     hidden_dim: int        = 256
-    num_output_levels: int = 1    # 1 = pretrained-compatible (P4 single scale)
-    top_down_fusion: bool  = False # FPN top-down; only active when num_output_levels > 1
+    num_output_levels: int = 1
+    top_down_fusion: bool  = False
 
 
 @dataclass
 class DecoderConfig:
-    # All values verified against LWDETR_tiny/small_60e_coco.pth weight shapes:
-    #   attention_weights  (32, 256) = ca_nheads(16) × n_levels(1) × n_points(2)
-    #   sampling_offsets   (64, 256) = ca_nheads(16) × n_levels(1) × n_points(2) × 2
-    #   linear1           (2048, 256) → dim_feedforward=2048
-    # num_feature_levels is propagated at build time from NeckConfig.num_output_levels.
     hidden_dim: int         = 256
-    num_layers: int         = 3     # matches pretrained LW-DETR checkpoint exactly
+    num_layers: int         = 3
     sa_nheads: int          = 8
-    ca_nheads: int          = 16    # verified from checkpoint
-    dim_feedforward: int    = 2048  # verified from checkpoint (was wrongly 1024)
+    ca_nheads: int          = 16
+    dim_feedforward: int    = 2048
     dropout: float          = 0.0
-    num_feature_levels: int = 1     # set at build time from neck.num_output_levels
-    num_points: int         = 2     # verified from checkpoint
-    bbox_reparam: bool      = False # False: logit refs + additive delta (QueryGen compatible)
+    num_feature_levels: int = 1
+    num_points: int         = 2
+    bbox_reparam: bool      = False
 
 
 @dataclass
-class CenterNetHeadConfig:
-    """Stage-1 dense detection head."""
-    head_conv: int   = 32   # 64→32 halves first-conv FLOPs at stride-4 (saves ~19G GFLOPs)
-    num_classes: int = 7
+class TokenScorerConfig:
+    """Lightweight objectness scorer at stride-8.
+
+    use_multiscale_fusion: fuse an s16-branch score signal into the s8 score map.
+    This rescues tiny objects (<10px) that are only ~1 cell at stride-16:
+      logit_fused = logit_s8 + bilinear_upsample(logit_s16)  → sigmoid
+    """
+    head_conv: int              = 64
+    use_multiscale_fusion: bool = True
 
 
 @dataclass
@@ -95,25 +79,47 @@ class DETRHeadConfig:
 
 @dataclass
 class QueryGenConfig:
-    top_k: int             = 200    # matches opts.K=200; VisDrone dense scenes can have >150 objects
-    score_threshold: float = 0.01  # Must be < CenterNet bias init sigmoid(-4.595)≈0.01 so content
-                                    # queries are NOT zeroed out at init. 0.1 kills all content early.
-    # Gumbel-Top-K differentiable selection (replaces local-max NMS)
-    use_gumbel: bool       = True   # True: Gumbel-Top-K+STE during training, hard TopK at inference
-    tau_start: float       = 1.0   # initial temperature (soft, stable gradients, high diversity)
-    tau_end: float         = 0.1   # final temperature (sharp, near-hard selection, precise seeds)
+    top_k: int             = 200
+    score_threshold: float = 0.01
+    use_gumbel: bool       = True
+    tau_start: float       = 1.0
+    tau_end: float         = 0.1
+    use_spatial_partition: bool  = False
+    sp_grid_rows: int            = 4
+    sp_grid_cols: int            = 4
+    sp_queries_per_region: int   = 50
+    sp_overlap_ratio: float      = 0.25
+    sp_global_queries: int       = 32
+
+
+@dataclass
+class DNConfig:
+    """Denoising (DN) training configuration.
+
+    During training, num_dn_groups noisy copies of each GT box/label are appended
+    to the detect queries and processed by the decoder in parallel.  A structured
+    attention mask prevents detect↔DN and cross-group cross-attention.  The DN
+    reconstruction loss (L1 + focal) provides direct supervision without matching.
+
+    num_dn_groups       : number of independently-noised GT copies per image.
+    dn_label_noise_ratio: fraction of DN queries whose class label is randomised.
+    dn_box_noise_scale  : noise magnitude applied to normalised box coordinates.
+    max_dn_queries      : per-image cap on total DN queries (memory safety).
+    """
+    num_dn_groups:          int   = 5
+    dn_label_noise_ratio:   float = 0.5
+    dn_box_noise_scale:     float = 0.4
+    max_dn_queries:         int   = 500
 
 
 @dataclass
 class HybridModelConfig:
-    vit: ViTConfig               = field(default_factory=lambda: ViTConfig('small'))
-    neck: NeckConfig             = field(default_factory=NeckConfig)
-    decoder: DecoderConfig       = field(default_factory=DecoderConfig)
-    centernet: CenterNetHeadConfig = field(default_factory=CenterNetHeadConfig)
-    detr: DETRHeadConfig         = field(default_factory=DETRHeadConfig)
-    query_gen: QueryGenConfig    = field(default_factory=QueryGenConfig)
-    pretrained_path: str         = ''
-    # Gradient checkpointing: recomputes activations during backward instead of
-    # storing them — trades compute for memory. Enables larger batch sizes on the
-    # ViT backbone (the memory bottleneck) at the cost of ~15-20% slower backward.
-    grad_checkpoint: bool        = False
+    vit:        ViTConfig          = field(default_factory=lambda: ViTConfig('small'))
+    neck:       NeckConfig         = field(default_factory=NeckConfig)
+    decoder:    DecoderConfig      = field(default_factory=DecoderConfig)
+    scorer:     TokenScorerConfig  = field(default_factory=TokenScorerConfig)
+    detr:       DETRHeadConfig     = field(default_factory=DETRHeadConfig)
+    query_gen:  QueryGenConfig     = field(default_factory=QueryGenConfig)
+    dn:         DNConfig           = field(default_factory=DNConfig)
+    pretrained_path: str           = ''
+    grad_checkpoint: bool          = False

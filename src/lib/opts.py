@@ -317,6 +317,57 @@ class opts(object):
                                  help='Initial Gumbel temperature (soft distribution, epoch 0).')
         self.parser.add_argument('--tau_end', type=float, default=0.1,
                                  help='Final Gumbel temperature (sharp distribution, last epoch).')
+        self.parser.add_argument('--use_spatial_partition', action='store_true',
+                                 help='Divide the heatmap into sp_grid_rows×sp_grid_cols regions, '
+                                      'each contributing sp_queries_per_region local queries via '
+                                      'independent Gumbel-Top-K, plus sp_global_queries full-image '
+                                      'queries. Total = rows*cols*per_region + global (default 832). '
+                                      'Breaks the K=200 recall ceiling on dense VisDrone scenes.')
+        self.parser.add_argument('--sp_grid_rows', type=int, default=4,
+                                 help='Partition grid rows (default 4).')
+        self.parser.add_argument('--sp_grid_cols', type=int, default=4,
+                                 help='Partition grid cols (default 4).')
+        self.parser.add_argument('--sp_queries_per_region', type=int, default=50,
+                                 help='Local Gumbel/TopK queries per grid region (default 50; '
+                                      '4×4×50=800 local + 32 global = 832 total).')
+        self.parser.add_argument('--sp_overlap_ratio', type=float, default=0.25,
+                                 help='Fractional overlap between adjacent regions (default 0.25). '
+                                      '0.25 means each region extends 12.5%% beyond its boundary '
+                                      'on each side, ensuring boundary objects are fully visible '
+                                      'in at least one region.')
+        self.parser.add_argument('--sp_global_queries', type=int, default=32,
+                                 help='Full-image global queries appended after regional ones '
+                                      '(default 32). Catches large objects spanning multiple regions.')
+
+        # TokenScorer opts
+        self.parser.add_argument('--scorer_head_conv', type=int, default=64,
+                                 help='Intermediate channels in the TokenScorer objectness head.')
+        self.parser.add_argument('--use_multiscale_fusion',
+                                 action=argparse.BooleanOptionalAction,
+                                 default=True,
+                                 help='Fuse stride-16 score signal into the stride-8 score map. '
+                                      'Rescues tiny objects (<10px) that span <1 cell at stride-16. '
+                                      'Use --no-use_multiscale_fusion to disable.')
+
+        # DN (Denoising) training opts
+        self.parser.add_argument('--num_dn_groups', type=int, default=5,
+                                 help='Number of independently-noised GT copies per image for '
+                                      'denoising training. More groups → stronger DN signal but '
+                                      'more memory. 0 disables DN training.')
+        self.parser.add_argument('--dn_label_noise_ratio', type=float, default=0.5,
+                                 help='Fraction of DN query labels replaced with a random class '
+                                      '(0=no noise, 1=all random). Default 0.5.')
+        self.parser.add_argument('--dn_box_noise_scale', type=float, default=0.4,
+                                 help='Gaussian noise magnitude applied to normalised box coords '
+                                      'during DN training. Larger = harder denoising task. Default 0.4.')
+        self.parser.add_argument('--dn_max_queries', type=int, default=500,
+                                 help='Per-image cap on total DN queries. Limits memory usage '
+                                      'on images with many GT objects. Default 500.')
+        self.parser.add_argument('--dn_l1_weight', type=float, default=1.0,
+                                 help='Weight for DN box L1 reconstruction loss. Default 1.0.')
+        self.parser.add_argument('--dn_cls_weight', type=float, default=1.0,
+                                 help='Weight for DN class focal reconstruction loss. Default 1.0.')
+
         self.parser.add_argument('--grad_accum', type=int, default=1,
                                  help='Gradient accumulation steps. Effective batch = '
                                       'batch_size * grad_accum. Use to simulate larger '
@@ -447,8 +498,7 @@ class opts(object):
 
         opt.reg_offset = not opt.not_reg_offset
 
-        # Hybrid CenterNet head uses upsampled stride-4 feature → same down_ratio as MOT
-        # (CenterNetUpsampleNeck in model.py handles the stride-16 → stride-4 upsampling)
+        # Hybrid model uses TokenScorer at stride-8; down_ratio kept at 4 for dataset compat.
 
         if opt.head_conv == -1:  # init default head_conv
             opt.head_conv = 256 if 'dla' in opt.arch else 256

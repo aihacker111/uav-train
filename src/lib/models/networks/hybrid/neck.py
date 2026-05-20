@@ -5,7 +5,6 @@ Changes vs. original:
   - proj0 replaced by LWDetrProjector (C2f block matching backbone.0.projector.*)
   - Takes ALL vit_features (concatenated) instead of only the last one
   - forward() returns (MultiScaleNeckOutput, finest_feat) in one pass (no double projection)
-  - CenterNetUpsampleNeck upsamples finest stride-16 → stride-4 for small-object detection
   - Optional FPN top-down pathway (top_down_fusion=True) when num_output_levels > 1:
       coarser levels are fused with upsampled context from one level coarser,
       propagating global semantics back toward the fine-grained level.
@@ -117,37 +116,6 @@ class LWDetrProjector(nn.Module):
         x = self.stages[0][0](x)                                   # C2f
         x = self.stages[0][1](x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # LayerNorm
         return x
-
-
-# ── Stride-4 upsample neck for CenterNet head ─────────────────────────────────
-
-class CenterNetUpsampleNeck(nn.Module):
-    """
-    4× upsample from ViT stride-16 to stride-4 for the CenterNet head.
-
-    Small objects (20-50px) are only ~1-3px at stride 16, making CenterNet
-    heatmap learning near-impossible.  Upsampling to stride 4 gives 5-12px,
-    providing enough spatial resolution for Gaussian peak supervision.
-
-    Two 2× ConvTranspose2d steps keep channels at hidden_dim throughout so the
-    DETR decoder memory (stride-16) stays completely unchanged.
-    """
-    def __init__(self, ch: int) -> None:
-        super().__init__()
-        # kernel_size=2, padding=0 gives identical 2× upsample as k=4,p=1
-        # but 4× fewer MACs per ConvTranspose step — critical at stride-4 resolution
-        self.up = nn.Sequential(
-            nn.ConvTranspose2d(ch, ch, kernel_size=2, stride=2, padding=0, bias=False),
-            nn.GroupNorm(32, ch),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(ch, ch, kernel_size=2, stride=2, padding=0, bias=False),
-            nn.GroupNorm(32, ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        """(B, ch, H/16, W/16) → (B, ch, H/4, W/4)"""
-        return self.up(x)
 
 
 # ── MultiScaleNeckOutput ──────────────────────────────────────────────────────

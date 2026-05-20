@@ -24,7 +24,13 @@ class ModelWithLoss(nn.Module):
         self.loss  = loss
 
     def forward(self, batch: Dict[str, Any]):
-        outputs    = self.model(batch['input'])
+        # Pass targets to model when present (enables DN training in HybridDETR).
+        # Models that don't accept targets (e.g. lwdetr_centernet) are unaffected
+        # because their batches do not contain a 'targets' key.
+        if 'targets' in batch:
+            outputs = self.model(batch['input'], targets=batch['targets'])
+        else:
+            outputs = self.model(batch['input'])
         loss, loss_stats = self.loss(outputs=outputs, batch=batch)
         return outputs, loss, loss_stats
 

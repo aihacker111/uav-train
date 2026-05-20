@@ -1,33 +1,38 @@
 """
-HybridCenterNetDETR — main model composing all pipeline components.
+HybridDETR — main model composing all pipeline components.
 
 Forward pass:
   image (B, 3, H, W)
     ↓  ViT backbone
   vit_features: list of (B, embed_dim, H/16, W/16)
     ↓  MultiScaleNeck
-  MultiScaleNeckOutput   +   finest (B, hidden_dim, H/16, W/16)
-    ↓  CenterNetHead
-  CenterNetOutput  (hm, wh, reg)
-    ↓  QueryGenerator  [hm + finest]
-  QueryBundle  (K dynamic queries)
-    ↓  HybridDecoder  [queries + neck memory]
-  DecoderOutput  (hs, refs_logit)
-    ↓  DETRHead
+  MultiScaleNeckOutput   +   finest_s16 (B, D, H/16, W/16)
+    ↓  TokenScorer
+  ScorerOutput  (score_map: B×1×H/8×W/8,  feat_s8: B×D×H/8×W/8)
+    ↓  QueryGenerator  [score_map + feat_s8]
+  detect_bundle  (K dynamic queries)
+    ↓  [training only] DNQueryGenerator → dn_bundle
+  concat [detect_bundle ‖ dn_bundle] + attention mask
+    ↓  HybridDecoder  [all_queries + neck memory]
+  DecoderOutput  (hs, refs_logit)  split → detect / dn slices
+    ↓  DETRHead  (shared weights)
   DETROutput  (boxes, logits, reid, …)
 
 Returns dict:
   {
-      'stage1':        CenterNetOutput,
+      'score_map':     (B, 1, H/8, W/8)   — objectness logit (post-sigmoid)
       'stage2':        DETROutput,
-      'query_scores':  (B, K),  — heatmap confidence of each query
-      'query_classes': (B, K),  — class predicted at each heatmap peak
+      'dn_out':        DETROutput | None,  — DN reconstruction output (train only)
+      'dn_meta':       DNMeta | None,
+      'query_scores':  (B, K),
+      'query_classes': (B, K),
+      'tau_query':     scalar tensor,
   }
 """
 from __future__ import annotations
 
 from functools import partial
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import torch
 import torch.nn as nn
@@ -35,9 +40,10 @@ import torch.utils.checkpoint as grad_ckpt
 from torch import Tensor
 
 from .config import HybridModelConfig, ViTConfig
-from .neck import MultiScaleNeck, CenterNetUpsampleNeck
-from .heads import CenterNetHead, DETRHead
-from .query_gen import QueryGenerator
+from .neck import MultiScaleNeck
+from .heads import TokenScorer, DETRHead
+from .query_gen import QueryGenerator, QueryBundle
+from .dn_gen import DNQueryGenerator, DNMeta
 from .decoder import HybridDecoder
 from ..lwdetr_vit import ViT
 
@@ -45,7 +51,6 @@ from ..lwdetr_vit import ViT
 # ── Backbone factory ───────────────────────────────────────────────────────────
 
 def _build_vit(cfg: ViTConfig) -> ViT:
-    """Instantiate ViT matching LW-DETR checkpoint architecture."""
     return ViT(
         img_size               = 1024,
         patch_size             = 16,
@@ -67,16 +72,24 @@ def _build_vit(cfg: ViTConfig) -> ViT:
 
 # ── Main model ─────────────────────────────────────────────────────────────────
 
-class HybridCenterNetDETR(nn.Module):
+class HybridDETR(nn.Module):
     """
-    Two-stage detector/tracker backbone for AMOT.
+    Two-stage detector/tracker for AMOT on UAV imagery.
 
-    Stage 1  — CenterNet: produces an unlimited-resolution heatmap and
-               selects the top-K peaks as dynamic query seeds.
+    Stage 1 — TokenScorer (stride-8):
+      Lightweight objectness scorer with multi-scale s16+s8 score fusion.
+      Rescues tiny objects (<10px) that would be invisible at stride-16 alone.
 
-    Stage 2  — DETR decoder: refines each query through L layers of
-               MSDeformAttn cross-attention over multi-scale ViT features,
-               producing accurate boxes, class logits, and ReID embeddings.
+    Stage 2 — DETR decoder:
+      Refines top-K scored locations through L layers of MSDeformAttn
+      cross-attention over ViT features, producing accurate boxes, class
+      logits, and ReID embeddings.
+
+    DN training:
+      num_dn_groups noisy copies of GT boxes/labels are appended to detect
+      queries as additional decoder input.  A structured attention mask
+      isolates DN groups from detect queries and from each other.
+      DN reconstruction loss provides direct supervision without matching.
     """
 
     def __init__(self, cfg: HybridModelConfig) -> None:
@@ -85,30 +98,31 @@ class HybridCenterNetDETR(nn.Module):
         neck_cfg = cfg.neck
         dec_cfg  = cfg.decoder
 
-        # Propagate neck output level count → MSDeformAttn n_levels in decoder
         dec_cfg.num_feature_levels = neck_cfg.num_output_levels
 
-        self.backbone = _build_vit(vit_cfg)
-        # Neck takes ALL ViT output features concatenated along the channel axis
-        neck_in_ch    = vit_cfg.embed_dim * vit_cfg.num_feature_levels
-        self.neck     = MultiScaleNeck(neck_in_ch, neck_cfg)
-        # Upsample stride-16 finest feature → stride-4 for small-object CenterNet
-        self.cn_upsample = CenterNetUpsampleNeck(neck_cfg.hidden_dim)
+        self.backbone     = _build_vit(vit_cfg)
+        neck_in_ch        = vit_cfg.embed_dim * vit_cfg.num_feature_levels
+        self.neck         = MultiScaleNeck(neck_in_ch, neck_cfg)
+        self.token_scorer = TokenScorer(neck_cfg.hidden_dim, cfg.scorer)
+        self.query_gen    = QueryGenerator(neck_cfg.hidden_dim, cfg.query_gen)
+        self.decoder      = HybridDecoder(dec_cfg)
+        self.detr_head    = DETRHead(cfg.detr, bbox_reparam=dec_cfg.bbox_reparam)
 
-        self.centernet_head = CenterNetHead(neck_cfg.hidden_dim, cfg.centernet)
-        self.query_gen      = QueryGenerator(neck_cfg.hidden_dim, cfg.query_gen)
-        self.decoder        = HybridDecoder(dec_cfg)
-        self.detr_head      = DETRHead(cfg.detr, bbox_reparam=dec_cfg.bbox_reparam)
+        self.dn_gen = DNQueryGenerator(
+            hidden_dim  = neck_cfg.hidden_dim,
+            num_classes = cfg.detr.num_classes,
+            cfg         = cfg.dn,
+        )
 
-        # Gradient checkpointing: recompute backbone activations during backward
-        # instead of retaining them. Reduces ViT memory by ~50% at cost of ~20%
-        # slower backward. Enables larger batch sizes on memory-constrained GPUs.
         self.grad_checkpoint = cfg.grad_checkpoint
 
-    def forward(self, x: Tensor) -> Dict[str, Any]:
+    def forward(
+        self,
+        x:       Tensor,
+        targets: Optional[List[dict]] = None,
+    ) -> Dict[str, Any]:
         # ── ViT backbone ──────────────────────────────────────────────────────
         if self.grad_checkpoint and self.training:
-            # use_reentrant=False: safer with autocast/AMP and avoids double-backward issues
             vit_features: List[Tensor] = grad_ckpt.checkpoint(
                 self.backbone, x, use_reentrant=False,
             )
@@ -116,45 +130,89 @@ class HybridCenterNetDETR(nn.Module):
             vit_features: List[Tensor] = self.backbone(x)
 
         # ── Multi-scale neck ──────────────────────────────────────────────────
-        neck_out, finest_s16 = self.neck(vit_features)   # (NeckOut, B×D×H/16×W/16)
-        finest_s4            = self.cn_upsample(finest_s16)  # (B, D, H/4, W/4)
+        neck_out, finest_s16 = self.neck(vit_features)
 
-        # ── Stage 1: dense heatmap detection ─────────────────────────────────
-        cn_out = self.centernet_head(finest_s4)   # CenterNetOutput
+        # ── TokenScorer (stride-8, multi-scale fusion) ────────────────────────
+        scorer_out = self.token_scorer(finest_s16)
+        # score_map: (B, 1, H/8, W/8)  feat_s8: (B, D, H/8, W/8)
 
-        # ── Query generation: heatmap peaks → DETR seeds ─────────────────────
-        # Partial-detach strategy:
-        #   finest_s4.detach() — backbone content features stay protected;
-        #     Stage-2 gradients must not corrupt representation learning.
-        #   cn_out.hm  (no detach) — gradient flows Stage-2 → heatmap scores
-        #     so Stage-2 feedback teaches Stage-1 WHERE to place peaks.
-        #   cn_out.wh  (no detach) — gradient flows Stage-2 CIoU → wh head
-        #     so Stage-2 directly improves Stage-1 reference box sizes.
-        # In the Gumbel path the STE carries these gradients differentiably.
-        # In the hard path (inference) there is no gradient; detach is moot.
-        queries = self.query_gen(
-            cn_out.hm, finest_s4.detach(), wh_map=cn_out.wh,
-        )  # QueryBundle(B, K, ·)
+        # ── Query generation: score peaks → DETR seeds ───────────────────────
+        # feat_s8 is detached so Stage-2 gradients don't corrupt backbone features;
+        # score_map is NOT detached so Gumbel-STE carries Stage-2 gradient back
+        # to the scorer through the selection weights.
+        detect_bundle = self.query_gen(
+            scorer_out.score_map, scorer_out.feat_s8.detach(),
+        )
+        K_detect = detect_bundle.content.shape[1]
 
-        # ── Stage 2: DETR decoder refinement ─────────────────────────────────
-        dec_out  = self.decoder(queries, neck_out)
-        detr_out = self.detr_head(dec_out.hs, dec_out.refs_logit)
+        # ── DN training: append noisy GT queries ─────────────────────────────
+        dn_bundle: Optional[QueryBundle] = None
+        dn_meta:   Optional[DNMeta]      = None
+        attn_mask: Optional[Tensor]      = None
+
+        if self.training and targets is not None:
+            dn_bundle, dn_meta = self.dn_gen(targets, x.device)
+
+        if dn_bundle is not None and dn_meta is not None:
+            K_dn = dn_meta.dn_num_queries
+
+            # Concatenate detect + DN queries along the query dimension
+            all_bundle = QueryBundle(
+                ref_points = torch.cat([detect_bundle.ref_points,
+                                        dn_bundle.ref_points], dim=1),
+                content    = torch.cat([detect_bundle.content,
+                                        dn_bundle.content],    dim=1),
+                scores     = torch.cat([detect_bundle.scores,
+                                        dn_bundle.scores],     dim=1),
+                classes    = torch.cat([detect_bundle.classes,
+                                        dn_bundle.classes],    dim=1),
+            )
+
+            max_gt = K_dn // max(dn_meta.dn_num_groups, 1)
+            attn_mask = DNQueryGenerator.build_attn_mask(
+                K_detect       = K_detect,
+                K_dn           = K_dn,
+                dn_num_groups  = dn_meta.dn_num_groups,
+                max_gt         = max_gt,
+                device         = x.device,
+            )
+        else:
+            all_bundle = detect_bundle
+            K_dn       = 0
+
+        # ── Decoder ───────────────────────────────────────────────────────────
+        dec_out = self.decoder(all_bundle, neck_out, attn_mask=attn_mask)
+
+        # ── Split detect / DN hidden states ───────────────────────────────────
+        if K_dn > 0:
+            hs_det   = dec_out.hs[:, :, :K_detect, :]
+            refs_det = dec_out.refs_logit[:, :, :K_detect, :]
+            hs_dn    = dec_out.hs[:, :, K_detect:, :]
+            refs_dn  = dec_out.refs_logit[:, :, K_detect:, :]
+            dn_out_detr  = self.detr_head(hs_dn, refs_dn)   # shared head weights
+        else:
+            hs_det   = dec_out.hs
+            refs_det = dec_out.refs_logit
+            dn_out_detr = None
+
+        detr_out = self.detr_head(hs_det, refs_det)
 
         return {
-            'stage1':        cn_out,
+            'score_map':     scorer_out.score_map,           # (B, 1, H/8, W/8)
             'stage2':        detr_out,
-            'query_scores':  queries.scores,    # (B, K) heatmap confidence
-            'query_classes': queries.classes,   # (B, K) stage-1 class index
+            'dn_out':        dn_out_detr,                    # DETROutput or None
+            'dn_meta':       dn_meta,                        # DNMeta or None
+            'query_scores':  detect_bundle.scores,           # (B, K)
+            'query_classes': detect_bundle.classes,          # (B, K)
             'tau_query':     torch.tensor(self.query_gen._tau, device=x.device),
         }
 
     def set_epoch(self, epoch: int, total_epochs: int) -> None:
-        """Propagate epoch info to QueryGenerator for τ annealing."""
+        """Propagate epoch to QueryGenerator for τ annealing."""
         self.query_gen.set_tau(epoch, total_epochs)
 
     @staticmethod
     def _compatible_state(src: dict, model_state: dict) -> tuple[dict, list]:
-        """Return (compatible_src, skipped_keys) filtering shape-mismatched entries."""
         ok, skipped = {}, []
         for k, v in src.items():
             if k in model_state and model_state[k].shape == v.shape:
@@ -166,68 +224,50 @@ class HybridCenterNetDETR(nn.Module):
     def load_pretrained(self, path: str) -> None:
         """
         Load LW-DETR COCO pretrained weights into backbone and decoder.
-
-        Backbone (backbone.encoder.*) transfers completely.
-
-        Decoder (transformer.decoder.*) transfers only when shapes match — layers
-        with mismatched shapes (e.g. if num_feature_levels or dim_feedforward
-        differ from the checkpoint) are silently skipped so training can proceed
-        from a mix of pretrained and fresh weights.
-
-        Task-specific heads (class_embed, bbox_embed, reid_mlp) are always
-        trained from scratch (different num_classes and task).
+        Backbone and neck projector transfer completely; decoder transfers
+        shape-matched weights only.
         """
         ckpt  = torch.load(path, map_location='cpu', weights_only=False)
         state = ckpt.get('model', ckpt)
 
         # ── Backbone ──────────────────────────────────────────────────────────
-        # Checkpoint key format: 'backbone.0.encoder.<param>'
-        _bb_prefix = 'backbone.0.encoder.'
-        backbone_src = {
-            k[len(_bb_prefix):]: v
-            for k, v in state.items() if k.startswith(_bb_prefix)
-        }
+        _bb_prefix   = 'backbone.0.encoder.'
+        backbone_src = {k[len(_bb_prefix):]: v
+                        for k, v in state.items() if k.startswith(_bb_prefix)}
         miss1, _ = self.backbone.load_state_dict(backbone_src, strict=False)
         print(f'[load_pretrained] backbone: {len(backbone_src)} tensors'
               + (f', {len(miss1)} missing' if miss1 else ''))
 
-        # ── Neck projector (backbone.0.projector.* → self.neck.proj0.*) ──────
+        # ── Neck projector ────────────────────────────────────────────────────
         _proj_prefix = 'backbone.0.projector.'
-        proj_src = {
-            k[len(_proj_prefix):]: v
-            for k, v in state.items() if k.startswith(_proj_prefix)
-        }
+        proj_src = {k[len(_proj_prefix):]: v
+                    for k, v in state.items() if k.startswith(_proj_prefix)}
         if proj_src:
             proj_model = self.neck.proj0.state_dict()
             ok_proj, skip_proj = self._compatible_state(proj_src, proj_model)
             self.neck.proj0.load_state_dict(ok_proj, strict=False)
             print(f'[load_pretrained] neck.proj0: {len(ok_proj)} tensors transferred'
                   + (f', {len(skip_proj)} shape-mismatched (skipped)' if skip_proj else ''))
-            if skip_proj:
-                print(f'  skipped: {skip_proj[:4]}{"..." if len(skip_proj) > 4 else ""}')
 
         # ── Decoder ───────────────────────────────────────────────────────────
-        decoder_src = {
-            k[len('transformer.decoder.'):]: v
-            for k, v in state.items() if k.startswith('transformer.decoder.')
-        }
+        decoder_src = {k[len('transformer.decoder.'):]: v
+                       for k, v in state.items() if k.startswith('transformer.decoder.')}
         model_dec = self.decoder.transformer_decoder.state_dict()
         ok, skipped = self._compatible_state(decoder_src, model_dec)
-
-        _, unexp = self.decoder.transformer_decoder.load_state_dict(ok, strict=False)
-        print(f'[load_pretrained] decoder : {len(ok)} tensors transferred'
+        self.decoder.transformer_decoder.load_state_dict(ok, strict=False)
+        print(f'[load_pretrained] decoder: {len(ok)} tensors transferred'
               + (f', {len(skipped)} shape-mismatched (skipped)' if skipped else ''))
-        if skipped:
-            print(f'  skipped: {skipped[:4]}{"..." if len(skipped) > 4 else ""}')
-
         print(f'[load_pretrained] done — {path}')
 
 
 # ── Factory ────────────────────────────────────────────────────────────────────
 
-def build_hybrid_model(cfg: HybridModelConfig) -> HybridCenterNetDETR:
-    """Create the hybrid model and optionally load pretrained weights."""
-    model = HybridCenterNetDETR(cfg)
+def build_hybrid_model(cfg: HybridModelConfig) -> HybridDETR:
+    model = HybridDETR(cfg)
     if cfg.pretrained_path:
         model.load_pretrained(cfg.pretrained_path)
     return model
+
+
+# Backward-compat alias used by existing checkpoints / evaluation scripts
+HybridCenterNetDETR = HybridDETR

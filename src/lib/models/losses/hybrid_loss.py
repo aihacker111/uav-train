@@ -1,33 +1,22 @@
 """
-HybridLoss: combined Stage-1 (CenterNet) + Stage-2 (DETR + ReID) loss.
+HybridLoss: simplified loss for HybridDETR.
 
-Stage 1 — CenterNet:
-  L_s1 = L_focal(hm) + λ_wh * L_L1(wh) + λ_reg * L_L1(reg)
+  Scorer loss (Stage-1 replacement):
+    L_score = centernet_focal_loss(score_map, gt_score_s8)
+    gt_score_s8 is derived from batch['hm'] (stride-4 GT) via max-pool + class-max.
 
-Stage 2 — DETR (Hungarian matching, applied per decoder layer):
-  L_s2 = L_varifocal(cls) + λ_bbox * L_L1(box) + λ_ciou * L_CIoU(box)
-        + λ_reid * (L_CE + L_triplet)(reid)  [if reid_classifier is set]
-        + λ_consist * L_consist(Stage-1 hm ↔ GT centers of Stage-2 matched objects)
+  Stage-2 DETR loss (unchanged from previous version):
+    L_s2 = varifocal(cls) + λ_bbox * L1(box) + λ_ciou * CIoU(box)
+         + λ_reid * (CE + triplet)(reid)   [if reid_classifier is set]
+    Auxiliary losses from intermediate decoder layers with progressive weights.
 
-Auxiliary losses from intermediate decoder layers use progressive weights:
-  layer i weight = aux_weight_base * (i + 1) / num_aux_layers
-  (shallower layers get smaller weight since their predictions are less refined)
+  DN reconstruction loss (new):
+    Direct supervision on denoising queries — no Hungarian matching needed.
+    L_dn = λ_dn_l1 * L1(pred_box, gt_box) + λ_dn_cls * focal(pred_cls, gt_cls)
+    Applied across all decoder layers (like aux loss).
 
-Stage balance curriculum (when total_epochs > 0):
-  t = epoch / total_epochs  ∈ [0, 1]
-  eff_λ_s1 = λ_stage1  →  1.0   (decays: Stage-1 is dominant early, balanced late)
-  eff_λ_s2 = λ_stage2  →  λ_stage1  (rises: Stage-2 gains more weight over time)
-  This implements a natural curriculum: CenterNet bootstraps Stage-2 first, then
-  the decoder takes over as the primary learning signal.
-
-Changes vs. v1:
-  • sigmoid_focal_loss → varifocal_loss for Stage-2 cls (IoU-quality-weighted)
-  • GIoU → CIoU for box regression (more stable for tiny boxes)
-  • ReID: CE + TripletLoss (hard mining) instead of CE-only
-  • Consistency loss: uses GT box centers (not Stage-2 predicted centers) for
-    a stable, Stage-2-quality-independent supervision signal on Stage-1 heatmap
-  • Dynamic stage weighting: curriculum from Stage-1-heavy to Stage-2-heavy
-  • Progressive aux weights: shallower decoder layers receive lower loss weight
+Removed:
+  wh/reg losses, consistency loss, curriculum stage weighting.
 """
 from __future__ import annotations
 
@@ -40,7 +29,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .matcher import HungarianMatcher, box_cxcywh_to_xyxy, generalized_box_iou
-from ..networks.hybrid.heads import CenterNetOutput, DETROutput
+from ..networks.hybrid.heads import DETROutput
+from ..networks.hybrid.dn_gen import DNMeta
 from ..base_losses import TripletLoss
 
 
@@ -49,7 +39,6 @@ from ..base_losses import TripletLoss
 def centernet_focal_loss(pred_hm: Tensor, gt_hm: Tensor) -> Tensor:
     """
     Modified CenterNet focal loss on Gaussian-rendered heatmaps.
-
     pred_hm : (B, C, H, W) — sigmoid output
     gt_hm   : (B, C, H, W) — Gaussian-rendered ground-truth in [0, 1]
     """
@@ -65,92 +54,63 @@ def centernet_focal_loss(pred_hm: Tensor, gt_hm: Tensor) -> Tensor:
 
 
 def varifocal_loss(
-    pred:    Tensor,   # (*, C) raw logits
-    q:       Tensor,   # (*, C) quality targets — IoU score for positives, 0 for negatives
-    alpha:   float = 0.75,
-    gamma:   float = 2.0,
+    pred:  Tensor,
+    q:     Tensor,
+    alpha: float = 0.75,
+    gamma: float = 2.0,
 ) -> Tensor:
-    """
-    Varifocal Loss (VarifocalNet, Zhang et al. 2021).
-
-    Unlike sigmoid focal loss that uses a fixed α weight for positives,
-    varifocal uses the IoU-quality score q as the positive weight:
-
-      VFL(p, q) =
-        q > 0 (positive):  -q * (q·log(p) + (1-q)·log(1-p))
-        q = 0 (negative):  -α * p^γ * log(1-p)
-
-    This gives stronger gradient to high-quality predictions and naturally
-    down-weights low-quality (low-IoU) matches — better aligned with AP metric.
-    Normalised by number of positive cells (q > 0).
-    """
     p    = pred.sigmoid()
     ce   = F.binary_cross_entropy_with_logits(pred, q.clamp(0, 1), reduction='none')
 
     pos_mask = (q > 0).float()
     neg_mask = 1.0 - pos_mask
 
-    pos_weight = q          # q itself for positives
-    neg_weight = alpha * p.pow(gamma)
-
-    loss = (pos_mask * pos_weight + neg_mask * neg_weight) * ce
+    loss = (pos_mask * q + neg_mask * alpha * p.pow(gamma)) * ce
     n_pos = pos_mask.sum().clamp(min=1)
     return loss.sum() / n_pos
 
 
+def _sigmoid_focal_loss(
+    pred:   Tensor,
+    target: Tensor,
+    alpha:  float = 0.25,
+    gamma:  float = 2.0,
+) -> Tensor:
+    """Standard sigmoid focal loss for DN cls supervision."""
+    p   = pred.sigmoid()
+    ce  = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+    w   = target * (alpha * (1 - p).pow(gamma)) + (1 - target) * ((1 - alpha) * p.pow(gamma))
+    return (w * ce).mean()
+
+
 def _paired_iou(b1: Tensor, b2: Tensor) -> Tensor:
-    """
-    Element-wise IoU for N matched box pairs.
-    b1, b2 : (N, 4) in xyxy format.
-    Returns (N,) IoU values.
-    """
     inter_x1 = torch.max(b1[:, 0], b2[:, 0])
     inter_y1 = torch.max(b1[:, 1], b2[:, 1])
     inter_x2 = torch.min(b1[:, 2], b2[:, 2])
     inter_y2 = torch.min(b1[:, 3], b2[:, 3])
-
     inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
     a1    = (b1[:, 2] - b1[:, 0]).clamp(0) * (b1[:, 3] - b1[:, 1]).clamp(0)
     a2    = (b2[:, 2] - b2[:, 0]).clamp(0) * (b2[:, 3] - b2[:, 1]).clamp(0)
-    union = a1 + a2 - inter
-    return inter / (union + 1e-7)
+    return inter / (a1 + a2 - inter + 1e-7)
 
 
 def ciou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor,
               iou: Tensor | None = None) -> Tensor:
-    """
-    CIoU loss for N matched pairs (Complete-IoU).
-
-    CIoU = 1 - IoU + ρ²(centre_pred, centre_gt)/c² + α·ν
-      ρ²  : squared Euclidean distance between box centres
-      c²  : squared diagonal of the smallest enclosing box
-      ν   : aspect-ratio consistency term
-      α   : trade-off coefficient = ν / (1 - IoU + ν + ε)
-
-    More stable than GIoU for tiny boxes because it additionally penalises
-    centre misalignment and aspect-ratio difference.
-
-    pred_xyxy, tgt_xyxy : (N, 4) in xyxy format.
-    Returns scalar mean CIoU loss.
-    """
     if iou is None:
-        iou = _paired_iou(pred_xyxy, tgt_xyxy)   # (N,)
+        iou = _paired_iou(pred_xyxy, tgt_xyxy)
 
-    # Enclosing box diagonal squared
     enc_x1 = torch.min(pred_xyxy[:, 0], tgt_xyxy[:, 0])
     enc_y1 = torch.min(pred_xyxy[:, 1], tgt_xyxy[:, 1])
     enc_x2 = torch.max(pred_xyxy[:, 2], tgt_xyxy[:, 2])
     enc_y2 = torch.max(pred_xyxy[:, 3], tgt_xyxy[:, 3])
     c2 = (enc_x2 - enc_x1).pow(2) + (enc_y2 - enc_y1).pow(2) + 1e-7
 
-    # Centre-distance penalty
     pred_cx = (pred_xyxy[:, 0] + pred_xyxy[:, 2]) / 2
     pred_cy = (pred_xyxy[:, 1] + pred_xyxy[:, 3]) / 2
     tgt_cx  = (tgt_xyxy[:, 0]  + tgt_xyxy[:, 2])  / 2
     tgt_cy  = (tgt_xyxy[:, 1]  + tgt_xyxy[:, 3])  / 2
     rho2    = (pred_cx - tgt_cx).pow(2) + (pred_cy - tgt_cy).pow(2)
 
-    # Aspect-ratio consistency
     pred_w = (pred_xyxy[:, 2] - pred_xyxy[:, 0]).clamp(1e-7)
     pred_h = (pred_xyxy[:, 3] - pred_xyxy[:, 1]).clamp(1e-7)
     tgt_w  = (tgt_xyxy[:, 2]  - tgt_xyxy[:, 0]).clamp(1e-7)
@@ -163,157 +123,75 @@ def ciou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor,
     return (1 - iou + rho2 / c2 + alpha_c * v).mean()
 
 
-def _gather_at_ind(feat: Tensor, ind: Tensor) -> Tensor:
-    """
-    Gather spatial predictions at flat peak indices.
-
-    feat : (B, C, H, W)
-    ind  : (B, max_obj)  — flat HW index
-    Returns (B, max_obj, C)
-    """
-    B, C, H, W = feat.shape
-    flat = feat.permute(0, 2, 3, 1).reshape(B, H * W, C)
-    idx  = ind.unsqueeze(-1).expand(B, ind.shape[1], C)
-    return flat.gather(1, idx)
-
-
 # ── HybridLoss ─────────────────────────────────────────────────────────────────
 
 class HybridLoss(nn.Module):
     """
-    Combined CenterNet + DETR loss for HybridCenterNetDETR.
+    Simplified loss for HybridDETR.
 
-    The batch dict must contain:
-      Stage-1 targets (CenterNet format):
-        'hm'       : (B, C, H, W)        — Gaussian rendered heatmap
-        'wh'       : (B, max_obj, 2)      — width/height at peak locations
-        'reg'      : (B, max_obj, 2)      — sub-pixel offset at peak locations
-        'ind'      : (B, max_obj)         — flat spatial index of each peak
-        'reg_mask' : (B, max_obj)         — 1 for valid objects, 0 for padding
-
-      Stage-2 targets (DETR format):
-        'targets'  : List[dict] with keys 'labels' (N,) and 'boxes' (N, 4) cxcywh
-
-      ReID targets (optional):
-        'ids'      : (B, max_obj)         — track ID (−1 = ignore)
+    Scorer loss:   centernet focal on objectness score_map (stride-8).
+    Stage-2 loss:  varifocal + CIoU + ReID (Hungarian matching, aux layers).
+    DN loss:       L1 + focal on DN reconstruction (direct assignment).
     """
 
     def __init__(
         self,
-        num_classes:           int   = 7,
-        lambda_wh:             float = 0.1,
-        lambda_reg:            float = 1.0,
-        lambda_bbox:           float = 2.0,   # matches trainer default (was 5.0, misleading)
-        lambda_ciou:           float = 2.0,
-        lambda_reid:           float = 1.0,
-        lambda_triplet:        float = 0.5,
-        lambda_consist:        float = 0.02,  # reduced: Gumbel STE now provides direct Stage-2→Stage-1
-        consist_warmup_epochs: int   = 5,     # shorter: GT centers don't need long warmup
-        lambda_stage1:         float = 2.0,
-        lambda_stage2:         float = 1.0,
-        aux_loss:              bool  = True,
-        reid_classifier:       Optional[nn.Linear] = None,
-        total_epochs:          int   = 0,     # 0 = disable dynamic weighting
+        num_classes:     int   = 7,
+        lambda_bbox:     float = 2.0,
+        lambda_ciou:     float = 2.0,
+        lambda_reid:     float = 1.0,
+        lambda_triplet:  float = 0.5,
+        lambda_dn_l1:    float = 1.0,
+        lambda_dn_cls:   float = 1.0,
+        aux_loss:        bool  = True,
+        reid_classifier: Optional[nn.Linear] = None,
     ) -> None:
         super().__init__()
-        self.num_classes           = num_classes
-        self.lambda_wh             = lambda_wh
-        self.lambda_reg            = lambda_reg
-        self.lambda_bbox           = lambda_bbox
-        self.lambda_ciou           = lambda_ciou
-        self.lambda_reid           = lambda_reid
-        self.lambda_triplet        = lambda_triplet
-        self.lambda_consist        = lambda_consist
-        self.consist_warmup_epochs = consist_warmup_epochs
-        self.lambda_stage1         = lambda_stage1
-        self.lambda_stage2         = lambda_stage2
-        self.aux_loss              = aux_loss
-        self._epoch                = 0      # updated each epoch via set_epoch()
-        self.total_epochs          = total_epochs
+        self.num_classes    = num_classes
+        self.lambda_bbox    = lambda_bbox
+        self.lambda_ciou    = lambda_ciou
+        self.lambda_reid    = lambda_reid
+        self.lambda_triplet = lambda_triplet
+        self.lambda_dn_l1   = lambda_dn_l1
+        self.lambda_dn_cls  = lambda_dn_cls
+        self.aux_loss       = aux_loss
 
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
+        self.matcher         = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
 
-        self.matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
+    # ── Scorer loss ────────────────────────────────────────────────────────────
 
-    def set_epoch(self, epoch: int) -> None:
-        """Call at the start of each epoch so warmup ramps and dynamic weights update."""
-        self._epoch = epoch
-
-    def _effective_stage_weights(self) -> tuple[float, float]:
+    def _scorer_loss(self, score_map: Tensor, batch: dict) -> Tensor:
         """
-        Compute dynamic per-epoch stage weights.
+        Focal loss on stride-8 objectness score_map.
 
-        Curriculum schedule (t = epoch / total_epochs ∈ [0, 1]):
-          eff_λ_s1: lambda_stage1 → 1.0  (Stage-1 weight decays as it stabilises)
-          eff_λ_s2: lambda_stage2 → lambda_stage1  (Stage-2 rises to share load equally)
+        GT is derived from batch['hm'] (stride-4 Gaussian heatmap, C classes):
+          1. max over class channels → single-channel objectness (B,1,H/4,W/4)
+          2. max_pool2d kernel=2 → stride-8 (B,1,H/8,W/8)
 
-        Rationale:
-          - Early training: Stage-1 (CenterNet) must learn before Stage-2 can get
-            good query seeds. A higher Stage-1 weight drives faster heatmap convergence.
-          - Late training: Stage-1 heatmap is stable; Stage-2 decoder needs more
-            gradient to fine-tune boxes and classification for VisDrone's small objects.
-          - The endpoint eff_λ_s1 = eff_λ_s2 = 1.0 gives balanced supervision
-            so neither stage dominates at convergence.
-
-        When total_epochs == 0, returns the static configured weights unchanged.
+        Using max-pool preserves the peak value of 1.0 at GT centers, so the
+        centernet focal loss pos_mask (gt == 1) fires correctly.
         """
-        if self.total_epochs <= 0:
-            return self.lambda_stage1, self.lambda_stage2
-
-        t = min(1.0, self._epoch / self.total_epochs)   # ∈ [0, 1]
-
-        # Cosine interpolation: smoother than linear at the endpoints
-        # t=0 → start values, t=1 → end values
-        smooth_t = 0.5 * (1.0 - math.cos(math.pi * t))
-
-        eff_s1 = self.lambda_stage1 + smooth_t * (1.0 - self.lambda_stage1)
-        eff_s2 = self.lambda_stage2 + smooth_t * (self.lambda_stage1 - self.lambda_stage2)
-        return eff_s1, eff_s2
-
-    # ── Stage-1 ────────────────────────────────────────────────────────────────
-
-    def _stage1_loss(self, cn_out: CenterNetOutput, batch: dict) -> Dict[str, Tensor]:
-        dev = cn_out.hm.device
-
-        # Scatter.apply moves batch tensors to the replica device, but add an
-        # explicit guard so this function is safe even if called without scatter.
-        hm       = batch['hm'].to(dev,       non_blocking=True)
-        reg_mask = batch['reg_mask'].to(dev, non_blocking=True)
-        ind      = batch['ind'].to(dev,      non_blocking=True)
-        gt_wh    = batch['wh'].to(dev,       non_blocking=True)
-        gt_reg   = batch['reg'].to(dev,      non_blocking=True)
-
-        loss_hm  = centernet_focal_loss(cn_out.hm, hm)
-        n        = reg_mask.sum().clamp(min=1).float()
-
-        pred_wh  = _gather_at_ind(cn_out.wh,  ind)   # (B, max_obj, 2)
-        pred_reg = _gather_at_ind(cn_out.reg, ind)
-
-        mask     = reg_mask.unsqueeze(-1).float()
-        # SmoothL1: quadratic for |err|<beta (stable for small offsets), L1 beyond
-        loss_wh  = (F.smooth_l1_loss(pred_wh,  gt_wh,  beta=1.0, reduction='none') * mask).sum() / n
-        loss_reg = (F.smooth_l1_loss(pred_reg, gt_reg, beta=0.5, reduction='none') * mask).sum() / n
-
-        total = loss_hm + self.lambda_wh * loss_wh + self.lambda_reg * loss_reg
-        return {'total': total, 'hm': loss_hm, 'wh': loss_wh, 'reg': loss_reg}
+        dev    = score_map.device
+        gt_s4  = batch['hm'].to(dev, non_blocking=True)          # (B, C, H/4, W/4)
+        gt_s8  = F.max_pool2d(
+            gt_s4.max(dim=1, keepdim=True).values, kernel_size=2, stride=2,
+        )                                                          # (B, 1, H/8, W/8)
+        return centernet_focal_loss(score_map, gt_s8)
 
     # ── Stage-2 ────────────────────────────────────────────────────────────────
 
     def _detr_layer_loss(
         self,
-        logits:  Tensor,       # (B, K, C)
-        boxes:   Tensor,       # (B, K, 4) cxcywh
+        logits:  Tensor,
+        boxes:   Tensor,
         targets: List[dict],
-        indices: list,         # list of {'src_i', 'tgt_i', 'iou'} dicts from matcher
+        indices: list,
     ) -> Dict[str, Tensor]:
-        dev = logits.device
-
-        # ── Collect matched pairs + reuse cached IoU from matcher ──────────────
-        # IoU is pre-computed in HungarianMatcher to avoid a redundant _paired_iou
-        # call here. Saves one full forward over all matched pairs per layer.
-        Q_MIN = 0.1
-        tgt_cls    = torch.zeros_like(logits)
+        dev     = logits.device
+        Q_MIN   = 0.1
+        tgt_cls = torch.zeros_like(logits)
         src_b_list, tgt_b_list, iou_list = [], [], []
 
         for b, m in enumerate(indices):
@@ -323,32 +201,20 @@ class HybridLoss(nn.Module):
             si  = src_i.to(dev)
             ti  = tgt_i.to(dev)
             iou = iou_cached.to(dev)
-
-            # Varifocal quality target: q = IoU for positives (floored at Q_MIN),
-            # 0 for negatives.  Without Q_MIN floor, cls head gets zero positive
-            # gradient until box IoU > 0 — chicken-and-egg early in training.
             tgt_cls[b, si, targets[b]['labels'][ti]] = iou.clamp(min=Q_MIN)
-
             src_b_list.append(boxes[b][si])
             tgt_b_list.append(targets[b]['boxes'][ti])
             iou_list.append(iou)
 
         loss_cls = varifocal_loss(logits, tgt_cls)
 
-        # ── CIoU box regression on matched pairs ───────────────────────────────
         if src_b_list:
-            src_b  = torch.cat(src_b_list)   # (N_total, 4) cxcywh
-            tgt_b  = torch.cat(tgt_b_list)
-            iou_all = torch.cat(iou_list)     # (N_total,) — pre-computed, reused
-            n_m    = src_b.shape[0]
-            # SmoothL1 with beta=0.05: normalized box coords are in [0,1],
-            # threshold at 0.05 ≈ 64px error at 1280px width.
+            src_b   = torch.cat(src_b_list)
+            tgt_b   = torch.cat(tgt_b_list)
+            iou_all = torch.cat(iou_list)
+            n_m     = src_b.shape[0]
             loss_bbox = F.smooth_l1_loss(src_b, tgt_b, beta=0.05, reduction='sum') / n_m
-            loss_ciou = ciou_loss(
-                box_cxcywh_to_xyxy(src_b),
-                box_cxcywh_to_xyxy(tgt_b),
-                iou=iou_all,          # pass cached IoU — skips _paired_iou inside
-            )
+            loss_ciou = ciou_loss(box_cxcywh_to_xyxy(src_b), box_cxcywh_to_xyxy(tgt_b), iou=iou_all)
         else:
             loss_bbox = loss_ciou = logits.sum() * 0.0
 
@@ -365,24 +231,19 @@ class HybridLoss(nn.Module):
         total   = d['total']
 
         if self.aux_loss:
-            L = detr_out.boxes_all.shape[0]
-            n_aux = L - 1  # number of intermediate layers
+            L     = detr_out.boxes_all.shape[0]
+            n_aux = L - 1
             for layer in range(n_aux):
-                # Reuse final-layer indices for aux layers — standard practice in
-                # DN-DETR, Anchor-DETR; avoids O(K²·N) matching per layer.
-                # Cached IoU from final-layer matching is also reused, which means
-                # aux-layer IoU may be slightly stale but the assignment is correct.
-                aux = self._detr_layer_loss(
+                aux   = self._detr_layer_loss(
                     detr_out.logits_all[layer], detr_out.boxes_all[layer], targets, indices,
                 )
-                # Progressive aux weights: shallower layers get lower weight since
-                # their predictions are less refined. Linearly from 0.25 (layer 0)
-                # to 0.5 (layer n_aux-1). Final layer always has weight 1.0.
                 aux_w = 0.25 + 0.25 * (layer / max(n_aux - 1, 1))
                 total = total + aux_w * aux['total']
 
-        return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'], 'ciou': d['ciou'],
-                'indices': indices}
+        return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'],
+                'ciou': d['ciou'], 'indices': indices}
+
+    # ── ReID ───────────────────────────────────────────────────────────────────
 
     def _reid_loss(
         self,
@@ -390,45 +251,28 @@ class HybridLoss(nn.Module):
         targets:  List[dict],
         indices:  list,
     ) -> Tensor:
-        """
-        CE + Triplet ReID loss on Hungarian-matched query embeddings.
-
-        CE loss learns discriminative class boundaries in softmax space.
-        Triplet loss (hard-negative mining) additionally pulls same-ID
-        embeddings together and pushes different-ID embeddings apart in the
-        metric space — improves re-identification across occlusions.
-        """
         valid_emb, valid_ids = [], []
         dev = detr_out.reid.device
 
         for b, m in enumerate(indices):
             src_i, tgt_i = m['src_i'], m['tgt_i']
-            if len(src_i) == 0:
+            if len(src_i) == 0 or 'ids' not in targets[b]:
                 continue
-            if 'ids' not in targets[b]:
-                continue
-
-            src_i = src_i.to(dev)
-            tgt_i = tgt_i.to(dev)
-
-            track_ids = targets[b]['ids'][tgt_i]
+            track_ids = targets[b]['ids'][tgt_i.to(dev)]
             keep      = track_ids >= 0
             if not keep.any():
                 continue
-
-            valid_emb.append(detr_out.reid[b][src_i[keep]])
+            valid_emb.append(detr_out.reid[b][src_i.to(dev)[keep]])
             valid_ids.append(track_ids[keep])
 
         if not valid_emb:
             return detr_out.reid.sum() * 0.0
 
-        emb    = torch.cat(valid_emb)                  # (N, reid_dim)
-        ids_t  = torch.cat(valid_ids).to(emb.device)  # (N,)
-        logits = self.reid_classifier(emb)             # (N, total_ids)
-
+        emb    = torch.cat(valid_emb)
+        ids_t  = torch.cat(valid_ids).to(emb.device)
+        logits = self.reid_classifier(emb)
         loss_ce = F.cross_entropy(logits, ids_t)
 
-        # Triplet needs ≥ 2 unique IDs and ≥ 2 samples; skip if batch is too small
         unique_ids = ids_t.unique()
         if unique_ids.numel() >= 2 and emb.shape[0] >= 2:
             loss_tri = self.triplet_loss(emb, ids_t)
@@ -437,60 +281,78 @@ class HybridLoss(nn.Module):
 
         return loss_ce + self.lambda_triplet * loss_tri
 
-    def _consistency_loss(
+    # ── DN loss ────────────────────────────────────────────────────────────────
+
+    def _dn_loss(
         self,
-        cn_out:   CenterNetOutput,
-        targets:  List[dict],
-        indices:  list,
-    ) -> Tensor:
+        dn_out:  DETROutput,
+        dn_meta: DNMeta,
+        targets: List[dict],
+    ) -> Dict[str, Tensor]:
         """
-        Stage-1 / Stage-2 consistency: the Stage-1 heatmap value at the GT center
-        of each Stage-2 Hungarian-matched object should be high (≈ 1).
+        Direct-assignment DN reconstruction loss — no Hungarian matching.
 
-        Uses GT box centers (not Stage-2 predicted centers) for a stable supervision
-        signal that is independent of Stage-2 prediction quality. This avoids the
-        risk of training Stage-1 to place peaks at wrong positions when Stage-2 is
-        still noisy early in training.
+        For each DN query slot (group g, GT index j), we know it was initialised
+        from GT box j. The loss supervises the decoder output at that slot to
+        reconstruct the original GT box and class.
 
-        Only objects that appear in the Stage-2 matching (i.e., objects the decoder
-        sees) are supervised — objects filtered out before Stage-2 are ignored.
-        Only updates Stage-1 heatmap head (no gradient to Stage-2 decoder).
+        Layout of dn_out queries per image:
+          [group_0: gt_0 .. gt_{max_gt-1} | group_1: ... | group_G: ...]
+          Slots beyond n_gt_b within each group are padding (ignored by valid_mask).
         """
-        hm = cn_out.hm                       # (B, C, H_hm, W_hm) — sigmoid
-        B, C, H_hm, W_hm = hm.shape
-        dev = hm.device
+        dev    = dn_out.boxes_all.device
+        B      = len(targets)
+        K_dn   = dn_meta.dn_num_queries
+        G      = dn_meta.dn_num_groups
+        max_gt = K_dn // max(G, 1)
+        L      = dn_out.boxes_all.shape[0]
 
-        total = hm.sum() * 0.0
-        n_batches = 0
+        zero = dn_out.boxes_all.sum() * 0.0
 
-        for b, m in enumerate(indices):
-            src_i, tgt_i = m['src_i'], m['tgt_i']
-            if len(src_i) == 0:
+        if K_dn == 0 or G == 0:
+            return {'total': zero, 'l1': zero, 'cls': zero}
+
+        # Build (B, K_dn) target boxes / labels and validity mask
+        gt_boxes_tgt  = torch.zeros(B, K_dn, 4,                  device=dev)
+        gt_labels_tgt = torch.zeros(B, K_dn, dtype=torch.long,   device=dev)
+        valid_mask    = torch.zeros(B, K_dn, dtype=torch.bool,    device=dev)
+
+        for b in range(B):
+            n_gt = int(dn_meta.batch_sizes[b].item())
+            if n_gt == 0:
                 continue
+            gt_b   = dn_meta.gt_boxes[b][:n_gt].to(dev)    # (n_gt, 4)
+            lbl_b  = dn_meta.gt_labels[b][:n_gt].to(dev)   # (n_gt,)
+            for g in range(G):
+                s, e = g * max_gt, g * max_gt + n_gt
+                gt_boxes_tgt[b, s:e]  = gt_b
+                gt_labels_tgt[b, s:e] = lbl_b
+                valid_mask[b, s:e]    = True
 
-            ti = tgt_i.to(dev)
+        # Expand valid_mask across all decoder layers: (L, B, K_dn)
+        valid_L = valid_mask.unsqueeze(0).expand(L, -1, -1)
 
-            # GT box centers from Stage-2 targets — stable regardless of decoder quality.
-            # cxcywh normalised, so cx/cy ∈ [0, 1] directly.
-            gt_boxes = targets[b]['boxes'][ti]           # (n, 4) cxcywh normalised
-            cx       = gt_boxes[:, 0].clamp(0, 1)
-            cy       = gt_boxes[:, 1].clamp(0, 1)
+        # Gather valid predictions and targets
+        pred_boxes  = dn_out.boxes_all[valid_L]             # (N_valid, 4)
+        tgt_boxes   = gt_boxes_tgt.unsqueeze(0).expand(
+                          L, -1, -1, -1)[valid_L]           # (N_valid, 4)
+        pred_logits = dn_out.logits_all[valid_L]            # (N_valid, C)
+        gt_labels_L = gt_labels_tgt.unsqueeze(0).expand(
+                          L, -1, -1)[valid_L]               # (N_valid,)
 
-            # GT class for each matched object
-            cls_idx = targets[b]['labels'][ti]           # (n,) long
+        if pred_boxes.shape[0] == 0:
+            return {'total': zero, 'l1': zero, 'cls': zero}
 
-            # Map normalised coords → heatmap pixel indices
-            x_hm = (cx * (W_hm - 1)).long().clamp(0, W_hm - 1)
-            y_hm = (cy * (H_hm - 1)).long().clamp(0, H_hm - 1)
+        # Box loss: L1 on normalised cxcywh
+        loss_l1  = F.l1_loss(pred_boxes, tgt_boxes)
 
-            # Sample heatmap at GT object centers and push toward 1.0
-            hm_vals = hm[b, cls_idx, y_hm, x_hm]        # (n,)
-            total   = total + F.binary_cross_entropy(
-                hm_vals, torch.ones_like(hm_vals), reduction='mean',
-            )
-            n_batches += 1
+        # Class loss: sigmoid focal (one-hot target)
+        tgt_cls  = torch.zeros_like(pred_logits)
+        tgt_cls.scatter_(1, gt_labels_L.unsqueeze(1), 1.0)
+        loss_cls = _sigmoid_focal_loss(pred_logits, tgt_cls)
 
-        return total / max(n_batches, 1)
+        total = self.lambda_dn_l1 * loss_l1 + self.lambda_dn_cls * loss_cls
+        return {'total': total, 'l1': loss_l1, 'cls': loss_cls}
 
     # ── Forward ────────────────────────────────────────────────────────────────
 
@@ -499,59 +361,47 @@ class HybridLoss(nn.Module):
         outputs: Dict[str, Any],
         batch:   dict,
     ) -> tuple[Tensor, Dict[str, Tensor]]:
-        # Move per-image target dicts to the replica device once here so that
-        # _stage2_loss, _reid_loss, and _consistency_loss all see the right device.
         dev = outputs['stage2'].logits.device
-        # scatter_gather already moved each chunk's tensors to the replica device,
-        # so this is a no-op safety guard for any caller that bypasses scatter.
         targets = [
             {k: v.to(dev, non_blocking=True) if isinstance(v, torch.Tensor) else v
              for k, v in t.items()}
             for t in batch['targets']
         ]
 
-        s1 = self._stage1_loss(outputs['stage1'], batch)
+        # Scorer focal loss
+        l_score = self._scorer_loss(outputs['score_map'], batch)
+
+        # Stage-2 DETR loss
         s2 = self._stage2_loss(outputs['stage2'], targets)
 
-        # Dynamic curriculum weights: Stage-1 heavy early, Stage-2 heavy late.
-        # Falls back to static lambda_stage1/2 when total_epochs == 0.
-        eff_s1, eff_s2 = self._effective_stage_weights()
-        total = eff_s1 * s1['total'] + eff_s2 * s2['total']
+        total = l_score + s2['total']
 
         loss_stats: Dict[str, Tensor] = {
-            'loss':      total,
-            'loss_s1':   s1['total'],
-            'loss_hm':   s1['hm'],
-            'loss_wh':   s1['wh'],
-            'loss_reg':  s1['reg'],
-            'loss_s2':   s2['total'],
-            'loss_cls':  s2['cls'],
-            'loss_bbox': s2['bbox'],
-            'loss_ciou': s2['ciou'],
-            'w_s1':      torch.tensor(eff_s1),   # log effective weights for monitoring
-            'w_s2':      torch.tensor(eff_s2),
+            'loss':       total,
+            'loss_score': l_score,
+            'loss_s2':    s2['total'],
+            'loss_cls':   s2['cls'],
+            'loss_bbox':  s2['bbox'],
+            'loss_ciou':  s2['ciou'],
         }
 
-        # Gumbel temperature τ — passed through from model output for monitoring.
-        # Lets TensorBoard show the annealing curve alongside stage weights.
+        # Gumbel temperature monitoring
         if 'tau_query' in outputs:
             loss_stats['tau_query'] = outputs['tau_query'].detach()
 
+        # ReID loss
         if self.reid_classifier is not None and 'ids' in targets[0]:
             l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])
             total  = total + self.lambda_reid * l_reid
             loss_stats['loss_reid'] = l_reid
 
-        # Consistency loss: ramped from 0 → lambda_consist over consist_warmup_epochs.
-        # Now uses GT centers (not Stage-2 predictions), so warmup is shorter (5 epochs):
-        # it still prevents matching noise from corrupting Stage-1 on epoch 0, but
-        # the signal itself is stable so it doesn't need a long warmup.
-        consist_scale = min(1.0, self._epoch / max(1, self.consist_warmup_epochs))
-        l_consist = self._consistency_loss(
-            outputs['stage1'], targets, s2['indices'],
-        )
-        total = total + self.lambda_consist * consist_scale * l_consist
-        loss_stats['loss_consist'] = l_consist
-        loss_stats['loss'] = total
+        # DN reconstruction loss
+        if outputs.get('dn_out') is not None and outputs.get('dn_meta') is not None:
+            l_dn = self._dn_loss(outputs['dn_out'], outputs['dn_meta'], targets)
+            total = total + l_dn['total']
+            loss_stats['loss_dn']     = l_dn['total']
+            loss_stats['loss_dn_l1']  = l_dn['l1']
+            loss_stats['loss_dn_cls'] = l_dn['cls']
 
+        loss_stats['loss'] = total
         return total, loss_stats

@@ -14,7 +14,7 @@ class _DataParallel(Module):
     - scatter: correctly chunks list-of-dict targets (DETR annotations) to each
       GPU rather than splitting tensors inside each per-image dict.
     - gather:  handles (model_out, loss, loss_stats) tuples whose model_out may
-      contain dataclass objects (CenterNetOutput, DETROutput) that PyTorch's
+      contain dataclass objects (ScorerOutput, DETROutput) that PyTorch's
       built-in gather cannot recurse into.
     """
 
@@ -66,7 +66,7 @@ class _DataParallel(Module):
         """Gather (model_out, loss, loss_stats) tuples from all GPU replicas.
 
         PyTorch's built-in gather recurses into dicts and hits dataclass objects
-        (CenterNetOutput, DETROutput) which are neither tensors, plain dicts, nor
+        (ScorerOutput, DETROutput) which are neither tensors, plain dicts, nor
         namedtuples — causing TypeError.
 
         Strategy:

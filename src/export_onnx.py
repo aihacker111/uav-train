@@ -57,11 +57,10 @@ from torch import Tensor
 
 class HybridONNXWrapper(nn.Module):
     """
-    Thin wrapper around HybridCenterNetDETR that:
-      1. Calls model.forward() normally.
+    Thin wrapper around HybridDETR that:
+      1. Calls model.forward() normally (inference — no targets, no DN).
       2. Unwraps all dataclass outputs into plain Tensors.
-      3. Drops auxiliary tensors only needed for training loss (boxes_all,
-         logits_all — per-decoder-layer outputs used for auxiliary DETR losses).
+      3. Drops auxiliary tensors only needed for training loss.
 
     This makes the graph straightforward for ONNX serialisation.
     """
@@ -73,13 +72,10 @@ class HybridONNXWrapper(nn.Module):
     def forward(self, images: Tensor):
         out = self.model(images)
 
-        s1 = out['stage1']      # CenterNetOutput
         s2 = out['stage2']      # DETROutput
 
         return (
-            s1.hm,                   # (B, C, H/4, W/4)
-            s1.wh,                   # (B, 2, H/4, W/4)
-            s1.reg,                  # (B, 2, H/4, W/4)
+            out['score_map'],        # (B, 1, H/8, W/8)
             s2.boxes,                # (B, K, 4)
             s2.logits,               # (B, K, C)
             s2.reid,                 # (B, K, reid_dim)
