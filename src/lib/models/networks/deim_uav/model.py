@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from typing import Dict, Any, List, Optional
 
@@ -27,6 +28,7 @@ class HybridDEIM(nn.Module):
         num_classes: int,
         hidden_dim: int = 192,
         head_conv: int  = 32,
+        reid_dim: int   = 0,
     ) -> None:
         super().__init__()
         self.deim = deim
@@ -37,6 +39,12 @@ class HybridDEIM(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.cn_head = CenterNetHead(hidden_dim, CenterNetHeadConfig(head_conv=head_conv, num_classes=num_classes))
+
+        self.reid_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, reid_dim),
+        ) if reid_dim > 0 else None
 
     def forward(
         self,
@@ -77,10 +85,15 @@ class HybridDEIM(nn.Module):
         else:
             boxes_all  = pred_boxes.unsqueeze(0)
             logits_all = pred_logits.unsqueeze(0)
+
+        reid = None
+        if self.reid_mlp is not None and 'hs' in deim_out:
+            reid = F.normalize(self.reid_mlp(deim_out['hs']), dim=-1)
+
         return DETROutput(
             boxes      = pred_boxes,
             logits     = pred_logits,
-            reid       = None,
+            reid       = reid,
             boxes_all  = boxes_all,
             logits_all = logits_all,
         )

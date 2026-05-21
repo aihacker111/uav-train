@@ -64,6 +64,7 @@ def create_model(arch: str, heads: dict, head_conv: int,
         num_classes=num_classes,
         hidden_dim=hidden_dim,
         head_conv=head_conv,
+        reid_dim=reid_dim,
     )
 
 
