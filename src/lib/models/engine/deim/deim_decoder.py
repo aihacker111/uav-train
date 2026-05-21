@@ -1076,16 +1076,7 @@ class DEIMTransformer(nn.Module):
                            denoising_bbox_unact=None):
 
         # prepare input for decoder
-        if self.training or self.eval_spatial_size is None:
-            anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
-        else:
-            # Use precomputed buffers only when actual spatial positions match.
-            # Falls back to on-the-fly generation when inference resolution differs
-            # from eval_spatial_size (e.g. non-square or multi-scale test inputs).
-            if self.anchors.shape[1] == memory.shape[1]:
-                anchors, valid_mask = self.anchors, self.valid_mask
-            else:
-                anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
+        anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
         if memory.shape[0] > 1:
             anchors = anchors.repeat(memory.shape[0], 1, 1)
 

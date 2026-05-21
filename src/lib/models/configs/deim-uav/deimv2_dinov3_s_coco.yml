@@ -8,8 +8,6 @@ __include__: [
 
 output_dir: ./outputs/deimv2_dinov3_s_coco
 
-eval_spatial_size: ~  # disable precomputed anchor/PE buffers — handles dynamic input resolution
-
 DEIM:
   backbone: DINOv3STAs
 
