@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from collections import defaultdict
+from tqdm import tqdm
 from lib.tracker.multitracker import MCJDETracker, HybridMCJDETracker
 from lib.tracking_utils import visualization as vis
 from lib.tracking_utils.log import logger
@@ -115,8 +116,9 @@ def eval_seq(opt,
     Returns:
         (n_frames, avg_time, n_calls, frame_det_results)
 
-        frame_det_results : {frame_id: list of (tlwh, score, cls_id)}
-            — raw per-frame detections for mAP computation
+        frame_det_results : {frame_id: list of (xyxy, score, cls_id)}
+            — raw detector outputs at score>=0.01 for mAP computation,
+              independent of tracking conf_thres
     """
     if save_dir:
         mkdir_if_missing(save_dir)
@@ -126,19 +128,20 @@ def eval_seq(opt,
 
     timer = Timer()
     results_dict = defaultdict(list)
-    frame_det_results: dict = {}   # {frame_id: [(tlwh, score, cls_id)]}
+    frame_det_results: dict = {}   # {frame_id: [(xyxy, score, cls_id)]}
     frame_id = 0
 
-    for path, img, img0 in data_loader:
-        if frame_id % 30 == 0 and frame_id != 0:
-            logger.info('Processing frame {} ({:.2f} fps)'.format(
-                frame_id, 1.0 / max(1e-5, timer.average_time)))
+    pbar = tqdm(data_loader, desc='Tracking', unit='frame', dynamic_ncols=True)
+    for path, img, img0 in pbar:
         frame_id += 1
 
         blob = torch.from_numpy(img).unsqueeze(0).to(opt.device)
         timer.tic()
         online_targets_dict = tracker.update_tracking(blob, img0)
         timer.toc()
+
+        fps = 1.0 / max(1e-5, timer.average_time)
+        pbar.set_postfix(fps=f'{fps:.1f}')
 
         online_tlwhs_dict  = defaultdict(list)
         online_ids_dict    = defaultdict(list)
@@ -155,11 +158,13 @@ def eval_seq(opt,
                     online_ids_dict[cls_id].append(t_id)
                     online_scores_dict[cls_id].append(score)
 
-        # Collect raw detections for mAP (before track-ID filtering)
+        # Collect raw detector outputs for mAP (score >= 0.01, no tracking filters).
+        # tracker.last_raw_dets contains xyxy boxes — no conversion needed.
         frame_dets_this = []
-        for cls_id in range(opt.num_classes):
-            for tlwh, score in zip(online_tlwhs_dict[cls_id], online_scores_dict[cls_id]):
-                frame_dets_this.append((np.array(tlwh, dtype=np.float32), float(score), int(cls_id)))
+        if hasattr(tracker, 'last_raw_dets'):
+            for cls_id, raw in tracker.last_raw_dets.items():
+                for det in raw:
+                    frame_dets_this.append((det[:4].copy(), float(det[4]), int(cls_id)))
         frame_det_results[frame_id] = frame_dets_this
 
         for cls_id in range(opt.num_classes):
@@ -236,15 +241,17 @@ def main(opt,
         ann_file = osp.join(ann_root, f'{seq}.txt')
         gt_frame_dets, gt_frame_ignores = load_gt_detections(ann_file)
 
-        all_frame_ids = set(frame_det_results.keys()) | set(gt_frame_dets.keys())
-        for fid in sorted(all_frame_ids):
+        all_frame_ids = sorted(set(frame_det_results.keys()) | set(gt_frame_dets.keys()))
+        for fid in tqdm(all_frame_ids, desc=f'  mAP [{seq}]', unit='frame',
+                        dynamic_ncols=True, leave=False):
             preds   = frame_det_results.get(fid, [])
             gts     = gt_frame_dets.get(fid, [])
             ignores = gt_frame_ignores.get(fid, [])
 
             if preds:
                 pb, ps, pl = zip(*preds)
-                pred_boxes  = _tlwh_to_xyxy(np.stack(pb))
+                # pred_boxes are already xyxy from last_raw_dets
+                pred_boxes  = np.stack(pb).astype(np.float32)
                 pred_scores = np.array(ps, dtype=np.float32)
                 pred_labels = np.array(pl, dtype=np.int64)
             else:

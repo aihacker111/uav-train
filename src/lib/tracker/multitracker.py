@@ -846,6 +846,18 @@ class HybridMCJDETracker(MCJDETracker):
         xyxy_orig = _detr_boxes_to_orig_xyxy(
             boxes_norm, net_width, net_height, width, height)  # (K, 4)
 
+        # Raw detections at COCO score threshold (0.01) — used by mAP evaluator.
+        # Must be collected before tracking filters are applied.
+        _det_thr = 0.01
+        self.last_raw_dets: dict = {}
+        for _c in range(self.opt.num_classes):
+            _cs   = scores[:, _c]
+            _keep = _cs > _det_thr
+            self.last_raw_dets[_c] = (
+                np.concatenate([xyxy_orig[_keep], _cs[_keep, None]], axis=-1)
+                if _keep.any() else np.zeros((0, 5), dtype=np.float32)
+            )
+
         # ── Step 2: per-class tracking loop ──────────────────────────────────
         nms_thr = getattr(self.opt, 'nms_thres', 0.4)
 
