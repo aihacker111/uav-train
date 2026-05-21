@@ -7,7 +7,8 @@
       "Bash(cp -r /Users/tinvo0908/Desktop/uav-train/DEIMv2/configs /Users/tinvo0908/Desktop/uav-train/src/)",
       "Bash(sed -i '' 's|from \\\\.\\\\.networks\\\\.hybrid\\\\.heads import CenterNetOutput, DETROutput|from ..networks.deim_uav.heads import CenterNetOutput, DETROutput|' /Users/tinvo0908/Desktop/uav-train/src/lib/models/losses/hybrid_loss.py)",
       "Bash(sed -i '' 's|from \\\\.\\\\.networks\\\\.hybrid\\\\.heads import CenterNetOutput|from ..networks.deim_uav.heads import CenterNetOutput|' /Users/tinvo0908/Desktop/uav-train/src/lib/models/losses/centernet_aux_loss.py)",
-      "Bash(sed -i '' 's|from lib\\\\.models\\\\.networks\\\\.hybrid\\\\.heads import CenterNetOutput, DETROutput|from lib.models.networks.deim_uav.heads import CenterNetOutput, DETROutput|' /Users/tinvo0908/Desktop/uav-train/src/lib/trains/hybrid.py)"
+      "Bash(sed -i '' 's|from lib\\\\.models\\\\.networks\\\\.hybrid\\\\.heads import CenterNetOutput, DETROutput|from lib.models.networks.deim_uav.heads import CenterNetOutput, DETROutput|' /Users/tinvo0908/Desktop/uav-train/src/lib/trains/hybrid.py)",
+      "Bash(python3)"
     ],
     "additionalDirectories": [
       "/Users/tinvo0908/Desktop/uav-train/src/lib/models/networks"

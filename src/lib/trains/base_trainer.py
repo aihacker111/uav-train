@@ -24,7 +24,8 @@ class ModelWithLoss(nn.Module):
         self.loss  = loss
 
     def forward(self, batch: Dict[str, Any]):
-        outputs    = self.model(batch['input'])
+        targets    = batch.get('targets', None)   # DETR-format targets for denoising (hybrid task)
+        outputs    = self.model(batch['input'], targets=targets)
         loss, loss_stats = self.loss(outputs=outputs, batch=batch)
         return outputs, loss, loss_stats
 

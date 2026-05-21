@@ -50,7 +50,19 @@ class HybridDEIM(nn.Module):
         cn_out   = self.cn_head(self.cn_upsample(feats[0].detach()))
 
         # Branch 2 — DEIMv2 decoder (gradients flow to backbone + encoder)
-        deim_out = self.deim.decoder(feats, targets)
+        # Normalize targets: labels from dataset are (N, 2) = [cls_id, track_id],
+        # DEIM denoising expects (N,) class indices only.
+        deim_targets = None
+        if targets is not None:
+            deim_targets = [
+                {
+                    'boxes':  t['boxes'].to(x.device),
+                    'labels': (t['labels'][:, 0].long() if t['labels'].ndim == 2
+                               else t['labels'].long()).to(x.device),
+                }
+                for t in targets
+            ]
+        deim_out = self.deim.decoder(feats, deim_targets)
 
         return {'stage1': cn_out, 'stage2': self._wrap_deim(deim_out)}
 
