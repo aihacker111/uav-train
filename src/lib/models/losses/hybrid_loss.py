@@ -40,7 +40,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .matcher import HungarianMatcher, box_cxcywh_to_xyxy, generalized_box_iou
-from ..networks.hybrid.heads import CenterNetOutput, DETROutput
+from ..networks.deim_uav.heads import CenterNetOutput, DETROutput
 from ..base_losses import TripletLoss
 
 
@@ -181,7 +181,7 @@ def _gather_at_ind(feat: Tensor, ind: Tensor) -> Tensor:
 
 class HybridLoss(nn.Module):
     """
-    Combined CenterNet + DETR loss for HybridCenterNetDETR.
+    Combined CenterNet + DETR loss.
 
     The batch dict must contain:
       Stage-1 targets (CenterNet format):
@@ -390,14 +390,9 @@ class HybridLoss(nn.Module):
         targets:  List[dict],
         indices:  list,
     ) -> Tensor:
-        """
-        CE + Triplet ReID loss on Hungarian-matched query embeddings.
+        if detr_out.reid is None:
+            return detr_out.logits.sum() * 0.0
 
-        CE loss learns discriminative class boundaries in softmax space.
-        Triplet loss (hard-negative mining) additionally pulls same-ID
-        embeddings together and pushes different-ID embeddings apart in the
-        metric space — improves re-identification across occlusions.
-        """
         valid_emb, valid_ids = [], []
         dev = detr_out.reid.device
 

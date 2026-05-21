@@ -16,7 +16,6 @@ from torchvision.transforms import transforms as T
 
 from lib.opts import opts
 from lib.models.model import create_model, load_model, save_model
-from lib.models.data_parallel import DataParallel
 from lib.logger import Logger
 from lib.datasets.dataset_factory import get_dataset
 from lib.trains.train_factory import train_factory
@@ -117,7 +116,7 @@ def run(opt):
     trainset_paths = data_config['train']
     print('Dataset root:', dataset_root)
 
-    use_imagenet_norm = 'lwdetr' in opt.arch or 'hybrid' in opt.arch
+    use_imagenet_norm = 'hybrid' in opt.arch
     pil_transform = build_aerial_mot_transforms()
 
     # ── Collate function (hybrid task needs variable-length DETR targets) ────────
@@ -219,17 +218,28 @@ def run(opt):
                          reid_dim=getattr(opt, 'reid_dim', 256),
                          num_classes=opt.num_classes)
 
-    # Split optimizer: backbone (small LR) + heads (full LR)
-    _use_split_opt = ('lwdetr' in opt.arch or 'hybrid' in opt.arch) and hasattr(model, 'backbone')
-    if _use_split_opt:
-        backbone_ids = {id(p) for p in model.backbone.parameters()}
+    # Build optimizer: 3-way split for HybridDEIM (backbone / norm / rest)
+    if 'hybrid' in opt.arch and hasattr(model, 'deim'):
+        backbone_params, norm_params, rest_params = [], [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            in_norm     = any(x in name for x in ('.bn.', '.norm.', 'bn.weight', 'bn.bias',
+                                                   'norm.weight', 'norm.bias'))
+            in_backbone = name.startswith('deim.backbone')
+            if in_norm:
+                norm_params.append(p)
+            elif in_backbone:
+                backbone_params.append(p)
+            else:
+                rest_params.append(p)
+        _blr = opt.lr * getattr(opt, 'backbone_lr_scale', 0.1)
         optimizer = torch.optim.AdamW([
-            {'params': [p for p in model.parameters() if id(p) in backbone_ids],
-             'lr': opt.lr * opt.backbone_lr_scale, 'weight_decay': 0.05},
-            {'params': [p for p in model.parameters() if id(p) not in backbone_ids],
-             'lr': opt.lr, 'weight_decay': 0.0},
-        ])
-        print(f'Split AdamW: backbone lr={opt.lr * opt.backbone_lr_scale:.2e}, heads lr={opt.lr:.2e}')
+            {'params': backbone_params, 'lr': _blr,   'weight_decay': 0.05},
+            {'params': norm_params,     'lr': opt.lr, 'weight_decay': 0.0},
+            {'params': rest_params,     'lr': opt.lr, 'weight_decay': 0.0001},
+        ], betas=(0.9, 0.999))
+        print(f'AdamW 3-group: backbone lr={_blr:.2e}, norm wd=0, rest lr={opt.lr:.2e}')
     else:
         optimizer = torch.optim.Adam(model.parameters(), opt.lr)
 
@@ -303,9 +313,16 @@ def run(opt):
     _freeze_epochs     = getattr(opt, 'freeze_backbone_epochs', 0)
     _backbone_frozen   = False
 
+    # HybridDEIM: backbone lives at model.deim.backbone; fallback to model.backbone
+    def _get_backbone(m):
+        if hasattr(m, 'deim') and hasattr(m.deim, 'backbone'):
+            return m.deim.backbone
+        return getattr(m, 'backbone', None)
+
     # Apply backbone freeze if we are resuming mid-freeze
-    if _freeze_epochs > 0 and start_epoch < _freeze_epochs and hasattr(model, 'backbone'):
-        for p in model.backbone.parameters():
+    _bb = _get_backbone(model)
+    if _freeze_epochs > 0 and start_epoch < _freeze_epochs and _bb is not None:
+        for p in _bb.parameters():
             p.requires_grad_(False)
         _backbone_frozen = True
         print(f'Backbone frozen (resuming mid-freeze, unfreeze at epoch {_freeze_epochs + 1})')
@@ -317,14 +334,15 @@ def run(opt):
             train_sampler.set_epoch(epoch)
 
         # ── Backbone freeze / unfreeze ────────────────────────────────────────────
-        if _freeze_epochs > 0 and hasattr(model, 'backbone'):
+        _bb = _get_backbone(model)
+        if _freeze_epochs > 0 and _bb is not None:
             if epoch == 1 and not _backbone_frozen:
-                for p in model.backbone.parameters():
+                for p in _bb.parameters():
                     p.requires_grad_(False)
                 _backbone_frozen = True
                 print(f'Epoch {epoch}: backbone frozen for {_freeze_epochs} epoch(s)')
             elif epoch == _freeze_epochs + 1 and _backbone_frozen:
-                for p in model.backbone.parameters():
+                for p in _bb.parameters():
                     p.requires_grad_(True)
                 _backbone_frozen = False
                 print(f'Epoch {epoch}: backbone unfrozen')

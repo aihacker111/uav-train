@@ -201,7 +201,7 @@ def main(opt,
     mkdir_if_missing(result_root)
     data_type = 'mot'
 
-    use_imagenet_norm = 'lwdetr' in opt.arch or 'hybrid' in opt.arch
+    use_imagenet_norm = 'hybrid' in opt.arch
 
     accs = []
     n_frame = 0

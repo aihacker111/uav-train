@@ -63,10 +63,15 @@ class opts(object):
 
         # model: backbone and so on...
         self.parser.add_argument('--arch',
-                                 default='lwdetr_tiny',
-                                 help='model architecture. Currently supported: '
-                                      'lwdetr_tiny | lwdetr_small | lwdetr_base | '
-                                      'hybrid_tiny | hybrid_small | hybrid_base')
+                                 default='hybrid_deim',
+                                 help='model architecture string; any value containing '
+                                      '"hybrid" activates the HybridDEIM path.')
+        self.parser.add_argument('--deim_config',
+                                 type=str,
+                                 default='',
+                                 help='Path to DEIM-UAV YAML config '
+                                      '(e.g. configs/deim-uav/deimv2_hgnetv2_s_coco.yml). '
+                                      'Required for hybrid architectures.')
         self.parser.add_argument('--head_conv',
                                  type=int,
                                  default=-1,
@@ -86,7 +91,7 @@ class opts(object):
         self.parser.add_argument('--backbone_weights',
                                  type=str,
                                  default='',
-                                 help='Path to LW-DETR COCO pretrained checkpoint (.pth). '
+                                 help='Path to DEIM-UAV COCO pretrained checkpoint (.pth). '
                                       'Empty string = train from scratch.')
         self.parser.add_argument('--grad_checkpoint',
                                  action='store_true',
@@ -370,10 +375,8 @@ class opts(object):
                                  #   Person @ 500m standoff, 100m AGL, 10× zoom → 36px at 1280×704 ✓
                                  #   Vehicle @ 800m standoff, 10× zoom          → 54px at 1280×704 ✓
                                  #   Person @ 100m AGL, 1× zoom                 → 15px at 1280×704 ✓ min
-                                 #   Inference (lwdetr_small, Jetson Orin NX): ~90–140ms ✓ fits 200ms budget
                                  #   Aspect ratio: 1280/704=1.818 vs ZR10 native 1.778 (2.2% diff)
                                  #   Both dims divisible by 64: 1280/64=20 ✓, 704/64=11 ✓
-                                 #   -- lwdetr_tiny @ 1088×640: ~50–90ms if tighter latency needed
                                  help='net input resolution as W,H (both must be divisible by 64). '
                                       'KPI balanced: 1280,704 (≤200ms + 500m person detection). '
                                       'Fastest option: 1088,640 (~70ms, zoom-mode only).')
@@ -536,7 +539,7 @@ class opts(object):
     def init(self, args=''):
         opt = self.parse(args)
 
-        use_imagenet_norm = 'lwdetr' in opt.arch or 'hybrid' in opt.arch
+        use_imagenet_norm = 'hybrid' in opt.arch
         _common = {
             'default_input_wh': [opt.input_wh[1], opt.input_wh[0]],
             'num_classes': len(opt.reid_cls_ids.split(',')),

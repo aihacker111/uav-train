@@ -575,7 +575,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
         self.transforms = transforms
         self.pil_transform = pil_transform
 
-        use_imagenet = 'lwdetr' in opt.arch or 'hybrid' in opt.arch
+        use_imagenet = 'hybrid' in opt.arch
         self.mean = [0.485, 0.456, 0.406] if use_imagenet else [0.408, 0.447, 0.470]
         self.std  = [0.229, 0.224, 0.225] if use_imagenet else [0.289, 0.274, 0.278]
 

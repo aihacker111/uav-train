@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from lib.models.losses.hybrid_loss import HybridLoss
-from lib.models.networks.hybrid.heads import CenterNetOutput, DETROutput
+from lib.models.networks.deim_uav.heads import CenterNetOutput, DETROutput
 from lib.utils.det_eval import COCOEvaluator, VISDRONE_CLASSES
 from .base_trainer import BaseTrainer
 

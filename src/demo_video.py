@@ -173,7 +173,7 @@ class VideoTracker:
     def __init__(self, opt):
         self.opt     = opt
         self.is_hybrid = 'hybrid' in opt.arch
-        self._use_imagenet = 'lwdetr' in opt.arch or 'hybrid' in opt.arch
+        self._use_imagenet = 'hybrid' in opt.arch
 
         if self.is_hybrid:
             self.tracker = HybridMCJDETracker(opt, frame_rate=opt.frame_rate)
