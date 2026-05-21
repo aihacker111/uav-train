@@ -1,7 +1,9 @@
 {
     "root": "/workspace/uav-train/VisDrone2019-7cls",
     "train": {
-        "visdrone_train": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.train",
+        "visdrone_train": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.train"
+    },
+    "val": {
         "visdrone_val": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.val"
     },
     "test_emb": {

@@ -8,7 +8,10 @@
       "Bash(sed -i '' 's|from \\\\.\\\\.networks\\\\.hybrid\\\\.heads import CenterNetOutput, DETROutput|from ..networks.deim_uav.heads import CenterNetOutput, DETROutput|' /Users/tinvo0908/Desktop/uav-train/src/lib/models/losses/hybrid_loss.py)",
       "Bash(sed -i '' 's|from \\\\.\\\\.networks\\\\.hybrid\\\\.heads import CenterNetOutput|from ..networks.deim_uav.heads import CenterNetOutput|' /Users/tinvo0908/Desktop/uav-train/src/lib/models/losses/centernet_aux_loss.py)",
       "Bash(sed -i '' 's|from lib\\\\.models\\\\.networks\\\\.hybrid\\\\.heads import CenterNetOutput, DETROutput|from lib.models.networks.deim_uav.heads import CenterNetOutput, DETROutput|' /Users/tinvo0908/Desktop/uav-train/src/lib/trains/hybrid.py)",
-      "Bash(python3)"
+      "Bash(python3)",
+      "Bash(python tools/viz_augmentation.py --data-root VisDrone2019-7cls --list-file VisDrone2019-7cls/VisDrone6cls.train --n 16 --input-wh 1280,704 --out-dir /tmp/aug_viz --seed 42)",
+      "Read(//tmp/aug_viz/**)",
+      "Read(//private/tmp/aug_viz/**)"
     ],
     "additionalDirectories": [
       "/Users/tinvo0908/Desktop/uav-train/src/lib/models/networks"

@@ -4,8 +4,6 @@ Ported from RF-DETR/LW-DETR transforms — rfdetr dependencies removed.
 
 Added augmentations:
   ScaleBiasedCrop — zoom-in biased random crop for small-object detection
-  CopyPaste       — paste objects from a donor image to increase object density
-  Mosaic          — 4-image 2×2 grid (needs dataset reference via sample_fn)
 """
 import io
 import random
@@ -450,227 +448,9 @@ class ScaleBiasedCrop:
         return crop(img, target, region)
 
 
-class CopyPaste:
-    """
-    Copy-Paste augmentation (Ghiasi et al. 2021) for dense small-object datasets.
-
-    Randomly pastes objects from a donor (image, target) pair onto the current
-    image.  Requires a `sample_fn` callable that returns a random (PIL.Image,
-    target_dict) pair from the dataset — typically `dataset[random_idx]`.
-
-    Only objects whose pasted bounding box has area ≥ min_area (in the
-    destination image) are kept.  Pasted boxes are appended to the existing
-    target boxes/labels/ids, giving the model more objects to learn from per
-    sample without changing the scene geometry.
-
-    NOTE: sample_fn is called lazily inside __call__, so this transform can
-    be constructed before the dataset is fully loaded.  Pass it a lambda:
-        CopyPaste(sample_fn=lambda: dataset[random.randint(0, len(dataset)-1)])
-    """
-
-    def __init__(
-        self,
-        sample_fn:      Callable,         # () → (PIL.Image, target_dict)
-        max_objects:    int   = 20,        # max number of objects to paste
-        paste_prob:     float = 0.5,       # probability of pasting each object
-        p:              float = 0.5,       # probability of applying at all
-        min_area:       float = 4.0,       # discard pasted boxes smaller than this (px²)
-        alpha:          float = 1.0,       # blend alpha (1.0 = hard paste)
-    ) -> None:
-        self.sample_fn   = sample_fn
-        self.max_objects = max_objects
-        self.paste_prob  = paste_prob
-        self.p           = p
-        self.min_area    = min_area
-        self.alpha       = alpha
-
-    def __call__(
-        self,
-        img:    PIL.Image.Image,
-        target: Dict,
-    ) -> Tuple[PIL.Image.Image, Dict]:
-        if random.random() >= self.p:
-            return img, target
-
-        donor_img, donor_tgt = self.sample_fn()
-
-        if 'boxes' not in donor_tgt or len(donor_tgt['boxes']) == 0:
-            return img, target
-
-        dst_w, dst_h = img.size
-        src_w, src_h = donor_img.size
-
-        # Resize donor to destination size so boxes are in the same coord space
-        if (src_w, src_h) != (dst_w, dst_h):
-            donor_img = donor_img.resize((dst_w, dst_h), PIL.Image.BILINEAR)
-            if 'boxes' in donor_tgt and len(donor_tgt['boxes']) > 0:
-                donor_tgt = donor_tgt.copy()
-                boxes = donor_tgt['boxes'].clone().float()
-                boxes[:, [0, 2]] *= dst_w / src_w
-                boxes[:, [1, 3]] *= dst_h / src_h
-                donor_tgt['boxes'] = boxes
-
-        donor_boxes  = donor_tgt['boxes']    # (N, 4) xyxy
-        donor_labels = donor_tgt['labels']
-
-        # Sample objects to paste
-        n  = min(len(donor_boxes), self.max_objects)
-        idx = [i for i in range(len(donor_boxes)) if random.random() < self.paste_prob]
-        idx = idx[:n]
-        if not idx:
-            return img, target
-
-        dst_img = img.copy()
-        paste_boxes, paste_labels = [], []
-
-        for i in idx:
-            x1, y1, x2, y2 = donor_boxes[i].int().tolist()
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(dst_w, x2), min(dst_h, y2)
-            if (x2 - x1) < 1 or (y2 - y1) < 1:
-                continue
-
-            # Crop the object patch from donor
-            patch = donor_img.crop((x1, y1, x2, y2))
-
-            # Random paste location (keep fully inside destination)
-            pw, ph = patch.size
-            max_px = max(0, dst_w - pw)
-            max_py = max(0, dst_h - ph)
-            px = random.randint(0, max_px)
-            py = random.randint(0, max_py)
-
-            area = pw * ph
-            if area < self.min_area:
-                continue
-
-            dst_img.paste(patch, (px, py))
-
-            paste_boxes.append(torch.tensor([px, py, px + pw, py + ph], dtype=torch.float32))
-            paste_labels.append(donor_labels[i])
-
-        if not paste_boxes:
-            return img, target
-
-        target = target.copy()
-        new_boxes  = torch.stack(paste_boxes)                # (M, 4)
-        new_labels = torch.stack(paste_labels)               # (M,)
-
-        if 'boxes' in target and len(target['boxes']) > 0:
-            target['boxes']  = torch.cat([target['boxes'],  new_boxes],  dim=0)
-            target['labels'] = torch.cat([target['labels'], new_labels], dim=0)
-            if 'ids' in target:
-                # Pasted objects get id=-1 (no valid track id)
-                target['ids'] = torch.cat([
-                    target['ids'],
-                    torch.full((len(new_boxes),), -1, dtype=target['ids'].dtype),
-                ])
-        else:
-            target['boxes']  = new_boxes
-            target['labels'] = new_labels
-
-        return dst_img, target
-
-
-class Mosaic:
-    """
-    4-image 2×2 Mosaic augmentation (YOLOv5 style) for dense small-object training.
-
-    Combines 4 images into a single 2×2 grid at the target resolution.
-    Each quadrant is filled with a randomly cropped region of one image.
-    All bounding boxes are adjusted to the new coordinate system.
-
-    Like CopyPaste, requires a `sample_fn` callable that returns a random
-    (PIL.Image, target_dict) pair from the dataset.
-
-    The output image has the same (H, W) as the input.
-    """
-
-    def __init__(
-        self,
-        sample_fn: Callable,    # () → (PIL.Image, target_dict)
-        p:         float = 0.5,
-    ) -> None:
-        self.sample_fn = sample_fn
-        self.p         = p
-
-    def _place(
-        self,
-        canvas:  PIL.Image.Image,
-        img:     PIL.Image.Image,
-        target:  Dict,
-        x_off:   int,
-        y_off:   int,
-        cell_w:  int,
-        cell_h:  int,
-    ) -> Dict:
-        """Resize img to cell size, paste onto canvas, return adjusted boxes."""
-        src_w, src_h = img.size
-        scale_x = cell_w / max(src_w, 1)
-        scale_y = cell_h / max(src_h, 1)
-
-        rimg, rtgt = resize(img, target, (cell_h, cell_w))
-        canvas.paste(rimg, (x_off, y_off))
-
-        new_boxes = []
-        if 'boxes' in rtgt and len(rtgt['boxes']) > 0:
-            b = rtgt['boxes'].clone()
-            b[:, [0, 2]] += x_off
-            b[:, [1, 3]] += y_off
-            new_boxes = b
-        return rtgt, new_boxes
-
-    def __call__(
-        self,
-        img:    PIL.Image.Image,
-        target: Dict,
-    ) -> Tuple[PIL.Image.Image, Dict]:
-        if random.random() >= self.p:
-            return img, target
-
-        W, H = img.size
-        cw, ch = W // 2, H // 2
-
-        canvas = PIL.Image.new('RGB', (W, H))
-
-        samples = [(img, target)] + [self.sample_fn() for _ in range(3)]
-        placements = [
-            (0,  0),           # top-left
-            (cw, 0),           # top-right
-            (0,  ch),          # bottom-left
-            (cw, ch),          # bottom-right
-        ]
-
-        all_boxes, all_labels, all_ids = [], [], []
-        has_ids = 'ids' in target
-
-        for (simg, stgt), (ox, oy) in zip(samples, placements):
-            rtgt, boxes = self._place(canvas, simg, stgt, ox, oy, cw, ch)
-            if len(boxes) > 0:
-                all_boxes.append(boxes)
-                all_labels.append(rtgt['labels'])
-                if has_ids and 'ids' in rtgt:
-                    all_ids.append(rtgt['ids'])
-                elif has_ids:
-                    all_ids.append(torch.full((len(boxes),), -1, dtype=torch.long))
-
-        new_target = target.copy()
-        if all_boxes:
-            new_target['boxes']  = torch.cat(all_boxes)
-            new_target['labels'] = torch.cat(all_labels)
-            if has_ids and all_ids:
-                new_target['ids'] = torch.cat(all_ids)
-        new_target['size'] = torch.tensor([H, W])
-
-        return canvas, new_target
-
-
 class RandomPerspective:
     """
-    Random affine / perspective transform — the standard geometric companion to Mosaic.
-
-    Applied right after Mosaic so the stitched grid gets additional geometric variety
-    (scale jitter, rotation, translation, shear, optional perspective warp).
+    Random affine / perspective transform for geometric augmentation variety.
 
     Box corners are transformed through the full matrix and re-fitted as axis-aligned
     bounding boxes.  Boxes that become too small after clipping are discarded.
@@ -774,62 +554,6 @@ class RandomPerspective:
                 target['ids'] = target['ids'][keep]
 
         return PIL.Image.fromarray(img_np), target
-
-
-class MixUp:
-    """
-    MixUp augmentation (Zhang et al. 2018) — blends two images pixel-wise and merges labels.
-
-    In YOLOv5/v8 this is applied after Mosaic+Perspective with p=0.15.
-    The blend ratio r ~ Beta(alpha, alpha): high alpha → ratio near 0.5,
-    low alpha → more extreme blends.
-
-    Labels from both images are concatenated (not blended) — the model
-    learns to detect objects from both the dominant and ghost image.
-    """
-    def __init__(
-        self,
-        sample_fn: Callable,
-        alpha:     float = 8.0,
-        p:         float = 0.15,
-    ) -> None:
-        self.sample_fn = sample_fn
-        self.alpha     = alpha
-        self.p         = p
-
-    def __call__(self, img: PIL.Image.Image, target: Dict) -> Tuple:
-        if random.random() >= self.p:
-            return img, target
-
-        img2, target2 = self.sample_fn()
-        w, h = img.size
-        if img2.size != (w, h):
-            # Use PIL resize directly to avoid the (H,W)/(W,H) reversal inside resize().
-            orig_w2, orig_h2 = img2.size
-            img2 = img2.resize((w, h), PIL.Image.BILINEAR)
-            if 'boxes' in target2 and len(target2.get('boxes', [])) > 0:
-                target2 = target2.copy()
-                boxes = target2['boxes'].clone().float()
-                boxes[:, [0, 2]] *= w / orig_w2
-                boxes[:, [1, 3]] *= h / orig_h2
-                target2['boxes'] = boxes
-
-        r      = float(np.random.beta(self.alpha, self.alpha))
-        mixed  = (r * np.array(img, np.float32) +
-                  (1 - r) * np.array(img2, np.float32)).clip(0, 255).astype(np.uint8)
-
-        target = target.copy()
-        if 'boxes' in target2 and len(target2['boxes']) > 0:
-            if 'boxes' in target and len(target['boxes']) > 0:
-                target['boxes']  = torch.cat([target['boxes'],  target2['boxes']],  dim=0)
-                target['labels'] = torch.cat([target['labels'], target2['labels']], dim=0)
-                if 'ids' in target and 'ids' in target2:
-                    target['ids'] = torch.cat([target['ids'], target2['ids']], dim=0)
-            else:
-                target['boxes']  = target2['boxes']
-                target['labels'] = target2['labels']
-
-        return PIL.Image.fromarray(mixed), target
 
 
 class Normalize:
@@ -1142,90 +866,52 @@ class RandomOcclusionPatch:
 
 # ── recommended pipeline for aerial MOT (VisDrone) ──────────────────────────
 
-def build_aerial_mot_transforms(sample_fn=None):
+def build_aerial_mot_transforms():
     """
-    PIL-based pre-letterbox augmentation for aerial MOT (VisDrone 1920x1080).
+    PIL-based pre-letterbox augmentation for aerial MOT at 892×512.
 
-    Design goals:
-      - Mutually exclusive "slots" for atmosphere and blur: no two heavy degradations stack.
-      - Conservative geometric scale so small objects (5-15 px) survive after Mosaic.
-      - Expected ~3 active augmentations without Mosaic, ~4-5 with Mosaic — down from ~6.
+    Target resolution: 892 W × 512 H  (aspect ≈ 1.74, both divisible by 64).
 
-    Pipeline order (with sample_fn):
-      0. Mosaic (p=0.5)          — 4-image grid; each sub-image at W/2 × H/2.
-      1. RandomPerspective       — scale=(0.8,1.2) keeps small objects above noise floor.
-      2. MixUp (p=0.15)          — ghost-blend for regularisation.
-      3. Flip                    — free spatial symmetry.
-      4. ScaleBiasedCrop         — zoom-in so post-letterbox objects are larger.
-      5. CopyPaste (p=0.35)      — extra objects before appearance distortion.
-      6. ColorJitter             — mild, moderate probability.
-      7. Grayscale               — rare IR/night simulation.
-      8. RandomOneOf atmosphere  — NightMode | Fog | SunGlare (never combined).
-      9. RandomOneOf blur        — MotionBlur | GaussianBlur (never combined).
-     10. JPEG + SensorNoise      — lightweight, independent.
-     11. OcclusionPatch          — re-id difficulty.
-     12. RandomResize            — multi-scale letterbox prep.
-
-    When sample_fn is None, steps 0-2 and CopyPaste are omitted.
+    Key design decisions:
+      • ScaleBiasedCrop(min_scale=0.45, p=0.65): primary mechanism for making
+        small objects appear larger.  At 892×512 a 45% crop gives 401×230 px —
+        objects appear ~2.2× bigger.  Beta(2, 3.5) biases toward zoom-in.
+      • RandomPerspective(scale=(0.90,1.10), p=0.4): mild affine for spatial
+        variety; exact 4-corner box transform, no approximation.
+      • Post-letterbox random_affine in get_data is SKIPPED when pil_transform
+        is active (see jde.py get_data).
     """
-    transforms = [
-        # ── geometric ─────────────────────────────────────────────────────────
+    return Compose([
+        # ── geometric ──────────────────────────────────────────────────────────
         RandomHorizontalFlip(p=0.5),
-        # min_scale raised to 0.5: avoids cropping so tight that sub-Mosaic objects disappear.
-        ScaleBiasedCrop(min_scale=0.5, max_scale=0.9, beta_alpha=2.0, beta_beta=4.0, p=0.5),
-        # ── appearance: mild, always-on colour variation ───────────────────────
-        RandomColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.6),
+        # Zoom-in bias: 45% crop → 401×230 px, objects ~2.2× bigger at 892×512
+        ScaleBiasedCrop(min_scale=0.45, max_scale=0.88, beta_alpha=2.0, beta_beta=3.5, p=0.65),
+        # Mild affine for spatial variety (exact 4-corner transform)
+        RandomPerspective(
+            degrees=3.0, translate=0.05, scale=(0.90, 1.10),
+            shear=1.0, perspective=0.0, min_area=16.0, p=0.4,
+        ),
+        # ── appearance: colour variation ───────────────────────────────────────
+        RandomColorJitter(brightness=0.35, contrast=0.35, saturation=0.35, hue=0.12, p=0.7),
         RandomGrayscale(p=0.1),
-        # ── atmosphere slot: pick AT MOST ONE of NightMode / Fog / SunGlare ───
-        # p=1.0 on each inner transform — the outer p=0.45 is the only gate.
-        # This prevents the ~7% chance of NightMode+Fog stacking that caused
-        # completely undetectable images in the old pipeline.
+        # ── atmosphere slot: pick AT MOST ONE ──────────────────────────────────
         RandomOneOf([
-            RandomNightMode(brightness_range=(0.1, 0.4), noise_std_range=(8.0, 20.0),
+            # brightness min=0.20 keeps objects visible even with noise; 0.10 was too dark
+            RandomNightMode(brightness_range=(0.20, 0.50), noise_std_range=(5.0, 15.0),
                             desaturate_p=0.5, p=1.0),
-            RandomFog(fog_coeff_range=(0.1, 0.4), p=1.0),
+            RandomFog(fog_coeff_range=(0.08, 0.35), p=1.0),
             RandomSunGlare(intensity_range=(0.3, 0.6), p=1.0),
         ], p=0.45),
-        # ── blur slot: pick AT MOST ONE of MotionBlur / GaussianBlur ──────────
+        # ── blur slot: pick AT MOST ONE ────────────────────────────────────────
         RandomOneOf([
             RandomMotionBlur(kernel_size_range=(5, 13), p=1.0),
             RandomGaussianBlur(kernel_size=5, sigma=(0.1, 1.5), p=1.0),
         ], p=0.3),
-        # ── lightweight independent degradations ──────────────────────────────
-        RandomJPEGCompression(quality_range=(50, 90), p=0.2),
-        RandomSensorNoise(gaussian_std_range=(3.0, 15.0), poisson_scale=0.05, p=0.15),
-        # ── re-id occlusion difficulty ────────────────────────────────────────
-        RandomOcclusionPatch(patch_scale_range=(0.04, 0.15), num_patches=2, p=0.2),
-        # ── multi-scale resize (must be last) ─────────────────────────────────
-        RandomResize([576, 608, 640, 672, 704], max_size=1333),
-    ]
-
-    if sample_fn is not None:
-        transforms.insert(0, Mosaic(sample_fn=sample_fn, p=0.5))
-        # scale=(0.8, 1.2): was (0.5, 1.5) — the old range zoomed sub-Mosaic objects
-        # down to 1/8 of original resolution, pushing 10-px objects below 2 px.
-        transforms.insert(1, RandomPerspective(
-            degrees=3.0, translate=0.1, scale=(0.8, 1.2), shear=1.5,
-            perspective=0.0, min_area=4.0, p=0.5))
-        transforms.insert(2, MixUp(sample_fn=sample_fn, alpha=8.0, p=0.15))
-        # CopyPaste after ScaleBiasedCrop (index 5 with the 3 inserts above).
-        transforms.insert(5, CopyPaste(sample_fn=sample_fn, max_objects=15,
-                                        paste_prob=0.5, p=0.35))
-
-    return Compose(transforms)
-
-
-def disable_mosaic(pipeline: Compose) -> Compose:
-    """
-    Return a new Compose with Mosaic, RandomPerspective, and MixUp removed.
-
-    Call this in the last `close_mosaic_epochs` epochs so the model sees
-    full-resolution images before the end of training — the standard
-    YOLOv5/v8 close-mosaic trick for convergence.
-
-    Usage in train.py::
-        if epoch == opt.num_epochs - opt.close_mosaic_epochs + 1:
-            train_dataset.pil_transform = disable_mosaic(train_dataset.pil_transform)
-    """
-    _remove = (Mosaic, RandomPerspective, MixUp)
-    return Compose([t for t in pipeline.transforms if not isinstance(t, _remove)])
+        # ── lightweight independent degradations ───────────────────────────────
+        RandomJPEGCompression(quality_range=(45, 90), p=0.25),
+        RandomSensorNoise(gaussian_std_range=(3.0, 15.0), poisson_scale=0.05, p=0.2),
+        # ── re-id occlusion difficulty ─────────────────────────────────────────
+        RandomOcclusionPatch(patch_scale_range=(0.04, 0.15), num_patches=2, p=0.25),
+        # ── multi-scale resize around 512-height / 892-width ───────────────────
+        RandomResize([448, 480, 512, 544, 576], max_size=1024),
+    ])

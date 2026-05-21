@@ -296,16 +296,15 @@ class LoadImagesAndLabels:  # for training
         else:
             labels = np.array([])
 
-        # Random affine (rotation, scale, translate) on fixed-size image.
-        # scale=(0.80, 1.05): the old (0.50, 1.20) range could shrink already-tiny
-        # UAV objects (~10px) to <5px, pushing them below the Gaussian supervision
-        # threshold at stride-4.  Mosaic + ScaleBiasedCrop already cover scale
-        # diversity, so this step only needs a mild jitter.
-        if self.augment:
+        # Post-letterbox affine jitter — only when pil_transform is NOT active.
+        # When pil_transform is used, RandomPerspective already applies exact
+        # 4-corner geometric transforms before letterbox.  Applying random_affine
+        # again here would double-apply geometric augmentation.
+        if self.augment and self.pil_transform is None:
             img, labels, M = random_affine(img, labels,
-                                           degrees=(-5, 5),
-                                           translate=(0.10, 0.10),
-                                           scale=(0.80, 1.05))
+                                           degrees=(-3, 3),
+                                           translate=(0.05, 0.05),
+                                           scale=(0.95, 1.05))
 
         num_labels = len(labels)
         if num_labels > 0:
@@ -639,8 +638,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
     def _raw_pil_sample(self, idx: int):
         """Return (PIL.Image, target_dict) for index idx without any transforms.
 
-        Used as the sample_fn for CopyPaste / Mosaic augmentations so donor
-        images are always in their original, unaugmented state.
+        Returns raw (PIL.Image, target_dict) for a given index without transforms.
         """
         import PIL.Image
         for i, c in enumerate(self.cds):
@@ -760,7 +758,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
         draw_gaussian = draw_msra_gaussian if self.opt.mse_loss else draw_umich_gaussian
 
         # 遍历每一个ground truth检测目标
-        # Cap at max_objs: Mosaic/CopyPaste can push num_objs well above 200.
+        # Cap at max_objs to avoid unbounded memory usage.
         for k in range(min(num_objs, self.max_objs)):
             label = labels[k]
 

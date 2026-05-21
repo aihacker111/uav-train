@@ -19,7 +19,7 @@ from lib.models.model import create_model, load_model, save_model
 from lib.logger import Logger
 from lib.datasets.dataset_factory import get_dataset
 from lib.trains.train_factory import train_factory
-from lib.datasets.transforms import build_aerial_mot_transforms, disable_mosaic
+from lib.datasets.transforms import build_aerial_mot_transforms
 
 
 def build_transforms(use_imagenet_norm, augment):
@@ -135,12 +135,6 @@ def run(opt):
         transforms=build_transforms(use_imagenet_norm, augment=True),
         pil_transform=pil_transform,
     )
-    # Wire CopyPaste with dataset sample_fn now that the dataset exists.
-    # pil_transform was built without sample_fn above; rebuild it here so
-    # CopyPaste gets a callable that draws raw PIL images from the training set.
-    def _sample_fn():
-        return train_dataset._raw_pil_sample(random.randint(0, len(train_dataset) - 1))
-    train_dataset.pil_transform = build_aerial_mot_transforms(sample_fn=_sample_fn)
 
     opt = opts().update_dataset_info_and_set_heads(opt, train_dataset)
     if rank == 0:
@@ -235,7 +229,7 @@ def run(opt):
                 rest_params.append(p)
         _blr = opt.lr * getattr(opt, 'backbone_lr_scale', 0.1)
         optimizer = torch.optim.AdamW([
-            {'params': backbone_params, 'lr': _blr,   'weight_decay': 0.05},
+            {'params': backbone_params, 'lr': _blr,   'weight_decay': 0.01},
             {'params': norm_params,     'lr': opt.lr, 'weight_decay': 0.0},
             {'params': rest_params,     'lr': opt.lr, 'weight_decay': 0.0001},
         ], betas=(0.9, 0.999))
@@ -310,6 +304,7 @@ def run(opt):
     if rank == 0:
         print('Starting training...')
     _global_step       = start_epoch * len(train_loader)
+    best_map           = 0.0
     _freeze_epochs     = getattr(opt, 'freeze_backbone_epochs', 0)
     _backbone_frozen   = False
 
@@ -351,13 +346,6 @@ def run(opt):
         if hasattr(trainer.loss, 'set_epoch'):
             trainer.loss.set_epoch(epoch)
 
-        # ── Close-mosaic: disable Mosaic/Perspective/MixUp in last N epochs ─────
-        _close_mosaic = getattr(opt, 'close_mosaic_epochs', 10)
-        if _close_mosaic > 0 and epoch == opt.num_epochs - _close_mosaic + 1:
-            train_dataset.pil_transform = disable_mosaic(train_dataset.pil_transform)
-            remaining = [type(t).__name__ for t in train_dataset.pil_transform.transforms]
-            print(f'Epoch {epoch}: close-mosaic — pipeline now: {remaining}')
-
         # ── Train ────────────────────────────────────────────────────────────────
         # Inject scheduler so base_trainer can call .step() after each batch
         if scheduler is not None:
@@ -382,6 +370,12 @@ def run(opt):
                 for k, v in val_stats.items():
                     logger.write(f' {k} {v:.4f} |')
                 logger.write('\n')
+                cur_map = val_stats.get('mAP50', val_stats.get('AP50', 0.0))
+                if cur_map > best_map:
+                    best_map = cur_map
+                    save_model(os.path.join(opt.save_dir, 'model_best.pth'),
+                               epoch, model, optimizer, loss=trainer.loss)
+                    logger.write(f'  ** new best mAP50={best_map:.4f} -> model_best.pth\n')
 
         # ── Checkpointing (rank 0 only) ──────────────────────────────────────────
         if rank == 0:
