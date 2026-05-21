@@ -5,9 +5,11 @@ Architecture:
     image
       ├─ deim.backbone → [f1(S8), f2(S16), f3(S32)]
       │       └─ deim.encoder → same scales, richer features
-      │               └─ deim.decoder → pred_boxes, pred_logits
+      │               └─ deim.decoder(feats_guided) → pred_boxes, pred_logits
       └─ cn_upsample(f1.detach()) → S4 feature
                 └─ CenterNetHead → hm, wh, reg
+                        └─ spatial prior → modulates f1 → feats_guided
+                                (S2 loss trains cn_head via this path)
 """
 from __future__ import annotations
 
@@ -46,6 +48,10 @@ class HybridDEIM(nn.Module):
             nn.Linear(hidden_dim, reid_dim),
         ) if reid_dim > 0 else None
 
+        # Learnable scale for heatmap spatial prior injected into encoder features.
+        # Initialised small (0.1) so early training is stable before heatmap is reliable.
+        self.heatmap_scale = nn.Parameter(torch.tensor(0.1))
+
     def forward(
         self,
         x: Tensor,
@@ -54,11 +60,27 @@ class HybridDEIM(nn.Module):
         feats    = self.deim.backbone(x)
         feats    = self.deim.encoder(feats)
 
-        # Branch 1 — CenterNet (detached: Stage-2 DETR owns the encoder;
-        # Stage-1 head is coupled to Stage-2 via consistency loss, not shared gradients)
-        cn_out   = self.cn_head(self.cn_upsample(feats[0].detach()))
+        # Branch 1 — CenterNet on detached features: S1 loss only trains cn_head/cn_upsample,
+        # never the encoder. Gradient from S2 will reach cn_head via the spatial prior below.
+        cn_out = self.cn_head(self.cn_upsample(feats[0].detach()))
 
-        # Branch 2 — DEIMv2 decoder (gradients flow to backbone + encoder)
+        # Spatial prior: sum heatmap over classes → (B,1,H_hm,W_hm), normalize to [0,1].
+        # NOT detached so S2 loss backprops through prior → cn_head (cooperative learning).
+        # Gradient stops at feats[0].detach() inside cn_upsample — encoder stays clean.
+        prior = cn_out.hm.sum(dim=1, keepdim=True)
+        prior = prior / prior.amax(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+
+        # Resize from stride-4 heatmap → stride-8 encoder feature spatial size
+        prior_s8 = F.interpolate(prior, size=feats[0].shape[2:],
+                                  mode='bilinear', align_corners=False)
+
+        # Amplify encoder features at high-confidence object regions.
+        # heatmap_scale is learnable and clamped ≥ 0 so prior only amplifies, never suppresses.
+        scale = self.heatmap_scale.clamp(min=0.0)
+        feats_guided = list(feats)
+        feats_guided[0] = feats[0] * (1.0 + scale * prior_s8)
+
+        # Branch 2 — DEIMv2 decoder sees spatially-guided encoder features.
         # Normalize targets: labels from dataset are (N, 2) = [cls_id, track_id],
         # DEIM denoising expects (N,) class indices only.
         deim_targets = None
@@ -71,7 +93,7 @@ class HybridDEIM(nn.Module):
                 }
                 for t in targets
             ]
-        deim_out = self.deim.decoder(feats, deim_targets)
+        deim_out = self.deim.decoder(feats_guided, deim_targets)
 
         return {'stage1': cn_out, 'stage2': self._wrap_deim(deim_out)}
 
