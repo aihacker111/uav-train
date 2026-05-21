@@ -793,6 +793,8 @@ class HybridMCJDETracker(MCJDETracker):
         self.model = load_model(self.model, opt.load_model)
         self.model = self.model.to(opt.device)
         self.model.eval()
+        if getattr(opt, 'compile_model', False):
+            self.model = torch.compile(self.model, mode='reduce-overhead')
 
         self.tracked_tracks_dict  = defaultdict(list)
         self.lost_tracks_dict     = defaultdict(list)
@@ -826,14 +828,15 @@ class HybridMCJDETracker(MCJDETracker):
         net_height, net_width = im_blob.shape[2], im_blob.shape[3]
 
         # ── Step 1: forward pass, extract stage-2 detections ─────────────────
-        with torch.no_grad():
+        use_amp = getattr(self.opt, 'use_amp', False)
+        with torch.no_grad(), torch.autocast('cuda', enabled=use_amp):
             output = self.model(im_blob)          # dict: {stage1, stage2, ...}
             stage2 = output['stage2']
 
             # Compute sigmoid and keep reid (already L2-normalized in _wrap_deim)
             # on GPU before transferring — avoids 3 separate GPU→CPU syncs and
             # redundant numpy sigmoid / norm operations.
-            scores_gpu = stage2.logits[0].sigmoid()   # (K, C)
+            scores_gpu = stage2.logits[0].float().sigmoid()   # (K, C)
 
         boxes_norm  = stage2.boxes[0].cpu().numpy()   # (K, 4) cxcywh [0,1]
         scores      = scores_gpu.cpu().numpy()         # (K, C)  already sigmoid

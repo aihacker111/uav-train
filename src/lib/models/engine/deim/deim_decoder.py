@@ -955,9 +955,6 @@ class DEIMTransformer(nn.Module):
             anchors, valid_mask = self._generate_anchors()
             self.register_buffer('anchors', anchors)
             self.register_buffer('valid_mask', valid_mask)
-        # init encoder output anchors and valid_mask
-        if self.eval_spatial_size:
-            self.anchors, self.valid_mask = self._generate_anchors()
 
 
         self._reset_parameters(feat_channels)
@@ -1082,15 +1079,7 @@ class DEIMTransformer(nn.Module):
         if self.training or self.eval_spatial_size is None:
             anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
         else:
-            shapes_key = tuple(map(tuple, spatial_shapes))
-            _cache = getattr(self, '_anchor_cache', {})
-            if shapes_key not in _cache:
-                a, m = self._generate_anchors(spatial_shapes, device=memory.device)
-                _cache[shapes_key] = (a, m)
-                self._anchor_cache = _cache
-            anchors, valid_mask = _cache[shapes_key]
-            anchors    = anchors.to(memory.device)
-            valid_mask = valid_mask.to(memory.device)
+            anchors, valid_mask = self.anchors, self.valid_mask
         if memory.shape[0] > 1:
             anchors = anchors.repeat(memory.shape[0], 1, 1)
 

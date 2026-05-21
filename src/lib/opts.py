@@ -780,6 +780,12 @@ class opts(object):
                                  help='Enable Automatic Mixed Precision (fp16 forward + fp32 '
                                       'weights). Gives ~1.5-2x training speedup and ~50%% VRAM '
                                       'reduction with negligible accuracy loss. Requires CUDA.')
+        self.parser.add_argument('--compile_model',
+                                 action='store_true',
+                                 default=False,
+                                 help='Apply torch.compile(mode=reduce-overhead) to the model '
+                                      'at inference. First frame is slow (compilation), subsequent '
+                                      'frames are 1.5-3x faster. Requires PyTorch >= 2.0.')
         self.parser.add_argument('--grad_clip',
                                  type=float,
                                  default=0.1,
