@@ -5,11 +5,25 @@ Architecture:
     image
       ├─ deim.backbone → [f1(S8), f2(S16), f3(S32)]
       │       └─ deim.encoder → same scales, richer features
-      │               └─ deim.decoder(feats_guided) → pred_boxes, pred_logits
-      └─ cn_upsample(f1.detach()) → S4 feature
-                └─ CenterNetHead → hm, wh, reg
-                        └─ spatial prior → modulates f1 → feats_guided
-                                (S2 loss trains cn_head via this path)
+      │
+      ├─ cn_upsample(f1.detach()) → S4 feature
+      │       └─ CenterNetHead → hm, wh, reg
+      │               ↓
+      │         top-K heatmap peaks  ←── object proposals
+      │               ↓
+      └─ deim.decoder(feats, ref_points=peaks) → refined pred_boxes, pred_logits
+
+Design rationale:
+  CenterNet acts as a lightweight proposal generator: its heatmap peaks at S4
+  resolution are converted to reference points that seed the DETR decoder's
+  cross-attention, replacing the generic encoder-anchor selection.
+
+  Gradient flow:
+    - Stage-1 loss  → cn_head, cn_upsample only  (feats[0] is detached)
+    - Stage-2 loss  → full encoder + decoder      (feats not detached)
+    - Heatmap peaks are detached before reference-point conversion, so
+      Stage-2 does NOT backprop through the peak extraction step — the
+      two branches have clean, non-conflicting gradient paths.
 """
 from __future__ import annotations
 
@@ -31,16 +45,21 @@ class HybridDEIM(nn.Module):
         hidden_dim: int = 192,
         head_conv: int  = 32,
         reid_dim: int   = 0,
+        default_wh: float = 0.05,   # default half-size for heatmap-derived proposals
     ) -> None:
         super().__init__()
         self.deim = deim
+        self.default_wh = default_wh
 
         self.cn_upsample = nn.Sequential(
             nn.ConvTranspose2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False),
             nn.GroupNorm(32, hidden_dim),
             nn.ReLU(inplace=True),
         )
-        self.cn_head = CenterNetHead(hidden_dim, CenterNetHeadConfig(head_conv=head_conv, num_classes=num_classes))
+        self.cn_head = CenterNetHead(
+            hidden_dim,
+            CenterNetHeadConfig(head_conv=head_conv, num_classes=num_classes),
+        )
 
         self.reid_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -48,43 +67,83 @@ class HybridDEIM(nn.Module):
             nn.Linear(hidden_dim, reid_dim),
         ) if reid_dim > 0 else None
 
-        # Learnable scale for heatmap spatial prior: stored as raw logit, applied via
-        # sigmoid so the effective scale is always in (0, 1). logit(0.1) ≈ -2.197.
-        self.heatmap_scale = nn.Parameter(torch.tensor(-2.197))
+    # ── Heatmap → reference points ─────────────────────────────────────────────
+
+    def _heatmap_to_ref_points(self, hm: Tensor, k: int) -> Tensor:
+        """
+        Extract top-K peaks from the CenterNet heatmap and convert to DETR
+        reference points in logit (inverse-sigmoid) space.
+
+        Args:
+            hm : (B, C, H, W) — sigmoid heatmap, values in (0, 1)
+            k  : number of reference points to produce (= num_queries)
+
+        Returns:
+            (B, k, 4) — cxcywh reference points in logit space, same format
+            as DEIMTransformer's enc_topk_bbox_unact so they can be dropped in
+            as a direct replacement.
+
+        Steps:
+          1. Flatten all classes × spatial locations → score per pixel
+          2. top-K over the flattened space (avoids per-class NMS, fast on GPU)
+          3. Convert flat index → (cx, cy) normalised [0, 1]
+          4. Append a fixed default wh (small prior for UAV objects)
+          5. Apply inverse sigmoid (logit) to match the decoder's expected format
+        """
+        B, C, H, W = hm.shape
+
+        # Flatten C×H×W and pick the K highest-scoring pixels globally.
+        # Using max-score across classes per pixel first to avoid class-heavy peaks
+        # dominating all K slots (e.g. one dominant class taking all K positions).
+        score_map = hm.max(dim=1).values          # (B, H, W) — max class score per pixel
+        flat      = score_map.reshape(B, H * W)   # (B, H*W)
+
+        _, topk_idx = flat.topk(k, dim=-1)        # (B, k)
+
+        # Flat index → 2D grid coordinates
+        y_idx = (topk_idx // W).float()           # row index
+        x_idx = (topk_idx  % W).float()           # col index
+
+        # Normalize to [0, 1] (pixel centres: +0.5 / size)
+        cx = (x_idx + 0.5) / W
+        cy = (y_idx + 0.5) / H
+
+        # Fixed small wh: UAV objects are tiny; 0.05 ≈ 64px at 1280px width.
+        # Using a constant avoids the chicken-and-egg problem of estimating sizes
+        # from an early, potentially noisy cn_head.wh output.
+        wh = torch.full_like(cx, self.default_wh)
+
+        # cxcywh in [0, 1] — clamp away from boundaries before logit
+        boxes = torch.stack([cx, cy, wh, wh], dim=-1).clamp(1e-4, 1.0 - 1e-4)
+
+        # Inverse sigmoid → logit space, matching enc_topk_bbox_unact format
+        return torch.log(boxes / (1.0 - boxes))   # (B, k, 4)
+
+    # ── Forward ────────────────────────────────────────────────────────────────
 
     def forward(
         self,
         x: Tensor,
         targets: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        feats    = self.deim.backbone(x)
-        feats    = self.deim.encoder(feats)
+        # ── Shared backbone + encoder ──────────────────────────────────────────
+        feats = self.deim.backbone(x)
+        feats = self.deim.encoder(feats)
 
-        # Branch 1 — CenterNet on detached features: S1 loss only trains cn_head/cn_upsample,
-        # never the encoder. Gradient from S2 will reach cn_head via the spatial prior below.
-        cn_out = self.cn_head(self.cn_upsample(feats[0].detach()))
+        # ── Branch 1: CenterNet on detached S8 feature ────────────────────────
+        # .detach() ensures Stage-1 loss only trains cn_head + cn_upsample.
+        # Stage-2 loss trains the encoder via its own clean gradient path.
+        cn_feat = self.cn_upsample(feats[0].detach())   # S4 feature map
+        cn_out  = self.cn_head(cn_feat)
 
-        # Spatial prior: sum heatmap over classes → (B,1,H_hm,W_hm).
-        # Detached: prior is a fixed spatial signal per forward pass.
-        # Keeping gradient here would let S2 loss train cn_head via a second path,
-        # conflicting with S1 focal loss and causing heatmap oscillation → noisy prior.
-        prior = cn_out.hm.sum(dim=1, keepdim=True).detach()
-        prior = prior / prior.amax(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        # ── Heatmap peaks → DETR reference points ─────────────────────────────
+        # Detach heatmap so Stage-2 loss does not backprop through peak extraction.
+        num_queries = self.deim.decoder.num_queries
+        heatmap_ref = self._heatmap_to_ref_points(
+            cn_out.hm.detach(), k=num_queries,
+        )   # (B, num_queries, 4) in logit space
 
-        # Resize from stride-4 heatmap → stride-8 encoder feature spatial size
-        prior_s8 = F.interpolate(prior, size=feats[0].shape[2:],
-                                  mode='bilinear', align_corners=False)
-
-        # Amplify encoder features at high-confidence object regions.
-        # sigmoid(heatmap_scale) ∈ (0,1) — bounded by construction, never explodes.
-        # Starts at sigmoid(-2.197) ≈ 0.1 and grows as heatmap becomes more reliable.
-        scale = torch.sigmoid(self.heatmap_scale)
-        feats_guided = list(feats)
-        feats_guided[0] = feats[0] * (1.0 + scale * prior_s8)
-
-        # Branch 2 — DEIMv2 decoder sees spatially-guided encoder features.
-        # Normalize targets: labels from dataset are (N, 2) = [cls_id, track_id],
-        # DEIM denoising expects (N,) class indices only.
+        # ── Branch 2: DETR decoder seeded with heatmap proposals ──────────────
         deim_targets = None
         if targets is not None:
             deim_targets = [
@@ -95,9 +154,12 @@ class HybridDEIM(nn.Module):
                 }
                 for t in targets
             ]
-        deim_out = self.deim.decoder(feats_guided, deim_targets)
+
+        deim_out = self.deim.decoder(feats, deim_targets, heatmap_ref_points=heatmap_ref)
 
         return {'stage1': cn_out, 'stage2': self._wrap_deim(deim_out)}
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _wrap_deim(self, deim_out: Dict[str, Any]) -> DETROutput:
         pred_boxes  = deim_out['pred_boxes']
