@@ -207,7 +207,7 @@ class HybridLoss(nn.Module):
         lambda_ciou:           float = 2.0,
         lambda_reid:           float = 1.0,
         lambda_triplet:        float = 0.5,
-        lambda_consist:        float = 0.02,  # reduced: Gumbel STE now provides direct Stage-2→Stage-1
+        lambda_consist:        float = 0.02,
         consist_warmup_epochs: int   = 5,     # shorter: GT centers don't need long warmup
         lambda_stage1:         float = 2.0,
         lambda_stage2:         float = 1.0,
@@ -526,11 +526,6 @@ class HybridLoss(nn.Module):
             'w_s1':      torch.tensor(eff_s1),   # log effective weights for monitoring
             'w_s2':      torch.tensor(eff_s2),
         }
-
-        # Gumbel temperature τ — passed through from model output for monitoring.
-        # Lets TensorBoard show the annealing curve alongside stage weights.
-        if 'tau_query' in outputs:
-            loss_stats['tau_query'] = outputs['tau_query'].detach()
 
         if self.reid_classifier is not None and 'ids' in targets[0]:
             l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])

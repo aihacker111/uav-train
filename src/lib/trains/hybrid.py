@@ -35,7 +35,6 @@ class HybridTrainer(BaseTrainer):
             'loss_s1', 'loss_hm', 'loss_wh', 'loss_reg',
             'loss_s2', 'loss_cls', 'loss_bbox', 'loss_ciou', 'loss_consist',
             'w_s1', 'w_s2',   # effective stage weights (for monitoring curriculum)
-            'tau_query',       # Gumbel temperature τ annealing curve
         ]
 
         reid_classifier = None

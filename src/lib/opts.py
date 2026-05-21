@@ -316,12 +316,6 @@ class opts(object):
         self.parser.add_argument('--consist_warmup_epochs', type=int, default=10,
                                  help='Epochs over which consistency loss weight ramps '
                                       'from 0 to consist_weight.')
-        self.parser.add_argument('--use_gumbel', action='store_true', default=True,
-                                 help='Use Gumbel-Top-K + STE query selection instead of NMS.')
-        self.parser.add_argument('--tau_start', type=float, default=1.0,
-                                 help='Initial Gumbel temperature (soft distribution, epoch 0).')
-        self.parser.add_argument('--tau_end', type=float, default=0.1,
-                                 help='Final Gumbel temperature (sharp distribution, last epoch).')
         self.parser.add_argument('--grad_accum', type=int, default=1,
                                  help='Gradient accumulation steps. Effective batch = '
                                       'batch_size * grad_accum. Use to simulate larger '

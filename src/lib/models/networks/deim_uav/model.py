@@ -46,7 +46,8 @@ class HybridDEIM(nn.Module):
         feats    = self.deim.backbone(x)
         feats    = self.deim.encoder(feats)
 
-        # Branch 1 — CenterNet (detached: gradients don't flow back to encoder)
+        # Branch 1 — CenterNet (detached: Stage-2 DETR owns the encoder;
+        # Stage-1 head is coupled to Stage-2 via consistency loss, not shared gradients)
         cn_out   = self.cn_head(self.cn_upsample(feats[0].detach()))
 
         # Branch 2 — DEIMv2 decoder (gradients flow to backbone + encoder)

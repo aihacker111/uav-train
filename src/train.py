@@ -351,12 +351,6 @@ def run(opt):
         if hasattr(trainer.loss, 'set_epoch'):
             trainer.loss.set_epoch(epoch)
 
-        # ── Notify model of current epoch (Gumbel τ annealing) ──────────────────
-        _mwl   = trainer.model_with_loss
-        _model = _mwl.module.model if hasattr(_mwl, 'module') else _mwl.model
-        if hasattr(_model, 'set_epoch'):
-            _model.set_epoch(epoch, opt.num_epochs)
-
         # ── Close-mosaic: disable Mosaic/Perspective/MixUp in last N epochs ─────
         _close_mosaic = getattr(opt, 'close_mosaic_epochs', 10)
         if _close_mosaic > 0 and epoch == opt.num_epochs - _close_mosaic + 1:
