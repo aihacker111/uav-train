@@ -504,8 +504,12 @@ class RTDETRTransformerv2(nn.Module):
         if self.training or self.eval_spatial_size is None:
             anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
         else:
-            anchors = self.anchors
-            valid_mask = self.valid_mask
+            cached_mask = getattr(self, 'valid_mask', None)
+            if cached_mask is None or cached_mask.shape[1] != memory.shape[1]:
+                anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
+            else:
+                anchors = self.anchors
+                valid_mask = self.valid_mask
 
         # memory = torch.where(valid_mask, memory, 0)
         memory = valid_mask.to(memory.dtype) * memory  
