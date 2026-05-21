@@ -830,14 +830,14 @@ class HybridMCJDETracker(MCJDETracker):
             output = self.model(im_blob)          # dict: {stage1, stage2, ...}
             stage2 = output['stage2']
 
-            boxes_norm = stage2.boxes[0].cpu().numpy()    # (K, 4) cxcywh [0,1]
-            logits     = stage2.logits[0].cpu().numpy()   # (K, C)
-            reid_raw   = stage2.reid[0].cpu().numpy()     # (K, reid_dim)
+            # Compute sigmoid and keep reid (already L2-normalized in _wrap_deim)
+            # on GPU before transferring — avoids 3 separate GPU→CPU syncs and
+            # redundant numpy sigmoid / norm operations.
+            scores_gpu = stage2.logits[0].sigmoid()   # (K, C)
 
-        # Sigmoid scores and L2-normalize reid
-        scores     = 1.0 / (1.0 + np.exp(-logits))       # (K, C)
-        norms      = np.linalg.norm(reid_raw, axis=-1, keepdims=True)
-        reid_normed = reid_raw / (norms + 1e-8)           # (K, reid_dim)
+        boxes_norm  = stage2.boxes[0].cpu().numpy()   # (K, 4) cxcywh [0,1]
+        scores      = scores_gpu.cpu().numpy()         # (K, C)  already sigmoid
+        reid_normed = stage2.reid[0].cpu().numpy()     # (K, reid_dim)  already L2-norm
 
         # Convert boxes to original image pixel xyxy
         xyxy_orig = _detr_boxes_to_orig_xyxy(

@@ -467,11 +467,13 @@ class HybridEncoder(nn.Module):
                     pos_embed = self.build_2d_sincos_position_embedding(
                         w, h, self.hidden_dim, self.pe_temperature).to(src_flatten.device)
                 else:
-                    pos_embed = getattr(self, f'pos_embed{enc_ind}', None)
-                    if pos_embed is None or pos_embed.shape[1] != h * w:
-                        pos_embed = self.build_2d_sincos_position_embedding(
+                    _pe_cache = getattr(self, '_pos_embed_cache', {})
+                    cache_key = (enc_ind, h, w)
+                    if cache_key not in _pe_cache:
+                        _pe_cache[cache_key] = self.build_2d_sincos_position_embedding(
                             w, h, self.hidden_dim, self.pe_temperature)
-                    pos_embed = pos_embed.to(src_flatten.device)
+                        self._pos_embed_cache = _pe_cache
+                    pos_embed = _pe_cache[cache_key].to(src_flatten.device)
 
                 memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
