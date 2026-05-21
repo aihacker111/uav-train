@@ -781,6 +781,36 @@ class HybridMCJDETracker(MCJDETracker):
     pure IoU + embedding-distance matching.
     """
 
+    def __init__(self, opt, frame_rate=30):
+        self.opt = opt
+        print('Creating model...')
+        self.model = create_model(
+            opt.arch, opt.heads, opt.head_conv,
+            reid_dim=getattr(opt, 'reid_dim', 256),
+            num_classes=getattr(opt, 'num_classes', 7),
+            opt=opt,
+        )
+        self.model = load_model(self.model, opt.load_model)
+        self.model = self.model.to(opt.device)
+        self.model.eval()
+
+        self.tracked_tracks_dict  = defaultdict(list)
+        self.lost_tracks_dict     = defaultdict(list)
+        self.removed_tracks_dict  = defaultdict(list)
+
+        self.frame_id    = 0
+        self.det_thresh  = opt.conf_thres
+        self.buffer_size = int(frame_rate / 30.0 * opt.track_buffer)
+        self.max_time_lost  = self.buffer_size
+        self.max_per_image  = opt.K
+        self.mean = np.array(opt.mean, dtype=np.float32).reshape(1, 1, 3)
+        self.std  = np.array(opt.std,  dtype=np.float32).reshape(1, 1, 3)
+
+        self.kalman_filter = KalmanFilter()
+        self.past_id_feature = deque([], maxlen=2)
+        self.past_reg        = deque([], maxlen=2)
+        self.gmc = GMC(method='sparseOptFlow', verbose=[None, False])
+
     def update_tracking(self, im_blob: torch.Tensor, img_0: np.ndarray) -> defaultdict:
         self.frame_id += 1
         if self.frame_id == 1:

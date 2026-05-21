@@ -9,7 +9,8 @@ import torch.nn as nn
 
 
 def create_model(arch: str, heads: dict, head_conv: int,
-                 reid_dim: int = 256, num_classes: int = 7) -> nn.Module:
+                 reid_dim: int = 256, num_classes: int = 7,
+                 opt=None) -> nn.Module:
     """
     Instantiate a model by architecture string.
 
@@ -19,7 +20,8 @@ def create_model(arch: str, heads: dict, head_conv: int,
       2. Overrides num_classes in the decoder to match the dataset.
       3. Wraps the resulting DEIM model in HybridDEIM.
 
-    train.py passes opt via the sentinel key '__opt__' in the heads dict.
+    opt can be supplied either via heads['__opt__'] (train.py convention) or
+    directly as the opt= keyword argument (tracker / inference callers).
     """
     if 'hybrid' not in arch:
         raise NotImplementedError(
@@ -27,7 +29,7 @@ def create_model(arch: str, heads: dict, head_conv: int,
             "Only 'hybrid*' architectures are supported."
         )
 
-    opt = heads.get('__opt__') if isinstance(heads, dict) else None
+    opt = (heads.get('__opt__') if isinstance(heads, dict) else None) or opt
     deim_config = getattr(opt, 'deim_config', '') if opt else ''
     if not deim_config:
         raise ValueError(
