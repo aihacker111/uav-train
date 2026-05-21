@@ -48,9 +48,9 @@ class HybridDEIM(nn.Module):
             nn.Linear(hidden_dim, reid_dim),
         ) if reid_dim > 0 else None
 
-        # Learnable scale for heatmap spatial prior injected into encoder features.
-        # Initialised small (0.1) so early training is stable before heatmap is reliable.
-        self.heatmap_scale = nn.Parameter(torch.tensor(0.1))
+        # Learnable scale for heatmap spatial prior: stored as raw logit, applied via
+        # sigmoid so the effective scale is always in (0, 1). logit(0.1) ≈ -2.197.
+        self.heatmap_scale = nn.Parameter(torch.tensor(-2.197))
 
     def forward(
         self,
@@ -64,10 +64,11 @@ class HybridDEIM(nn.Module):
         # never the encoder. Gradient from S2 will reach cn_head via the spatial prior below.
         cn_out = self.cn_head(self.cn_upsample(feats[0].detach()))
 
-        # Spatial prior: sum heatmap over classes → (B,1,H_hm,W_hm), normalize to [0,1].
-        # NOT detached so S2 loss backprops through prior → cn_head (cooperative learning).
-        # Gradient stops at feats[0].detach() inside cn_upsample — encoder stays clean.
-        prior = cn_out.hm.sum(dim=1, keepdim=True)
+        # Spatial prior: sum heatmap over classes → (B,1,H_hm,W_hm).
+        # Detached: prior is a fixed spatial signal per forward pass.
+        # Keeping gradient here would let S2 loss train cn_head via a second path,
+        # conflicting with S1 focal loss and causing heatmap oscillation → noisy prior.
+        prior = cn_out.hm.sum(dim=1, keepdim=True).detach()
         prior = prior / prior.amax(dim=(2, 3), keepdim=True).clamp(min=1e-6)
 
         # Resize from stride-4 heatmap → stride-8 encoder feature spatial size
@@ -75,8 +76,9 @@ class HybridDEIM(nn.Module):
                                   mode='bilinear', align_corners=False)
 
         # Amplify encoder features at high-confidence object regions.
-        # heatmap_scale is learnable and clamped ≥ 0 so prior only amplifies, never suppresses.
-        scale = self.heatmap_scale.clamp(min=0.0)
+        # sigmoid(heatmap_scale) ∈ (0,1) — bounded by construction, never explodes.
+        # Starts at sigmoid(-2.197) ≈ 0.1 and grows as heatmap becomes more reliable.
+        scale = torch.sigmoid(self.heatmap_scale)
         feats_guided = list(feats)
         feats_guided[0] = feats[0] * (1.0 + scale * prior_s8)
 
