@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Dict, Any, List, Optional
 
-from .heads import CenterNetHead, CenterNetOutput, DETROutput
+from .heads import CenterNetHead, CenterNetOutput
 from .config import CenterNetHeadConfig
 
 
@@ -45,11 +45,9 @@ class HybridDEIM(nn.Module):
         hidden_dim: int = 192,
         head_conv: int  = 32,
         reid_dim: int   = 0,
-        default_wh: float = 0.05,   # default half-size for heatmap-derived proposals
     ) -> None:
         super().__init__()
         self.deim = deim
-        self.default_wh = default_wh
 
         self.cn_upsample = nn.Sequential(
             nn.ConvTranspose2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False),
@@ -69,54 +67,45 @@ class HybridDEIM(nn.Module):
 
     # ── Heatmap → reference points ─────────────────────────────────────────────
 
-    def _heatmap_to_ref_points(self, hm: Tensor, k: int) -> Tensor:
+    def _heatmap_to_ref_points(self, hm: Tensor, cn_wh: Tensor, k: int) -> Tensor:
         """
         Extract top-K peaks from the CenterNet heatmap and convert to DETR
         reference points in logit (inverse-sigmoid) space.
 
         Args:
-            hm : (B, C, H, W) — sigmoid heatmap, values in (0, 1)
-            k  : number of reference points to produce (= num_queries)
+            hm    : (B, C, H, W) — sigmoid heatmap, values in (0, 1)
+            cn_wh : (B, 2, H, W) — predicted wh in heatmap pixel space (detached)
+            k     : number of reference points (= num_queries)
 
         Returns:
-            (B, k, 4) — cxcywh reference points in logit space, same format
-            as DEIMTransformer's enc_topk_bbox_unact so they can be dropped in
-            as a direct replacement.
-
-        Steps:
-          1. Flatten all classes × spatial locations → score per pixel
-          2. top-K over the flattened space (avoids per-class NMS, fast on GPU)
-          3. Convert flat index → (cx, cy) normalised [0, 1]
-          4. Append a fixed default wh (small prior for UAV objects)
-          5. Apply inverse sigmoid (logit) to match the decoder's expected format
+            (B, k, 4) — cxcywh reference points in logit space.
         """
         B, C, H, W = hm.shape
 
-        # Flatten C×H×W and pick the K highest-scoring pixels globally.
-        # Using max-score across classes per pixel first to avoid class-heavy peaks
-        # dominating all K slots (e.g. one dominant class taking all K positions).
-        score_map = hm.max(dim=1).values          # (B, H, W) — max class score per pixel
+        # Max-score across classes → pick K highest-scoring pixels globally
+        score_map = hm.max(dim=1).values          # (B, H, W)
         flat      = score_map.reshape(B, H * W)   # (B, H*W)
-
         _, topk_idx = flat.topk(k, dim=-1)        # (B, k)
 
-        # Flat index → 2D grid coordinates
-        y_idx = (topk_idx // W).float()           # row index
-        x_idx = (topk_idx  % W).float()           # col index
+        # Flat index → normalised centre coordinates
+        y_idx = (topk_idx // W).float()
+        x_idx = (topk_idx  % W).float()
+        cx = (x_idx + 0.5) / W                   # (B, k)
+        cy = (y_idx + 0.5) / H                   # (B, k)
 
-        # Normalize to [0, 1] (pixel centres: +0.5 / size)
-        cx = (x_idx + 0.5) / W
-        cy = (y_idx + 0.5) / H
+        # Gather cn_wh at peak positions and normalize to [0, 1].
+        # cn_wh is in heatmap pixel space (same grid as hm), so dividing by
+        # W / H gives the fraction of the image — identical to how cx/cy are built.
+        # Clamp keeps values sensible when the wh head is still noisy early in
+        # training: min=0.01 ≈ 13px at 1280px, max=0.5 = half the image.
+        wh_flat  = cn_wh.reshape(B, 2, H * W)                        # (B, 2, H*W)
+        idx_exp  = topk_idx.unsqueeze(1).expand(B, 2, k)             # (B, 2, k)
+        wh_peaks = wh_flat.gather(2, idx_exp)                        # (B, 2, k)
+        w_norm   = (wh_peaks[:, 0, :] / W).clamp(0.01, 0.5)         # (B, k)
+        h_norm   = (wh_peaks[:, 1, :] / H).clamp(0.01, 0.5)         # (B, k)
 
-        # Fixed small wh: UAV objects are tiny; 0.05 ≈ 64px at 1280px width.
-        # Using a constant avoids the chicken-and-egg problem of estimating sizes
-        # from an early, potentially noisy cn_head.wh output.
-        wh = torch.full_like(cx, self.default_wh)
-
-        # cxcywh in [0, 1] — clamp away from boundaries before logit
-        boxes = torch.stack([cx, cy, wh, wh], dim=-1).clamp(1e-4, 1.0 - 1e-4)
-
-        # Inverse sigmoid → logit space, matching enc_topk_bbox_unact format
+        # cxcywh → clamp away from [0,1] boundaries → logit space
+        boxes = torch.stack([cx, cy, w_norm, h_norm], dim=-1).clamp(1e-4, 1.0 - 1e-4)
         return torch.log(boxes / (1.0 - boxes))   # (B, k, 4)
 
     # ── Forward ────────────────────────────────────────────────────────────────
@@ -140,7 +129,7 @@ class HybridDEIM(nn.Module):
         # Detach heatmap so Stage-2 loss does not backprop through peak extraction.
         num_queries = self.deim.decoder.num_queries
         heatmap_ref = self._heatmap_to_ref_points(
-            cn_out.hm.detach(), k=num_queries,
+            cn_out.hm.detach(), cn_out.wh.detach(), k=num_queries,
         )   # (B, num_queries, 4) in logit space
 
         # ── Branch 2: DETR decoder seeded with heatmap proposals ──────────────
@@ -161,28 +150,19 @@ class HybridDEIM(nn.Module):
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
-    def _wrap_deim(self, deim_out: Dict[str, Any]) -> DETROutput:
-        pred_boxes  = deim_out['pred_boxes']
-        pred_logits = deim_out['pred_logits']
-        aux = deim_out.get('aux_outputs') or []
-        if aux:
-            boxes_all  = torch.stack([a['pred_boxes']  for a in aux] + [pred_boxes])
-            logits_all = torch.stack([a['pred_logits'] for a in aux] + [pred_logits])
-        else:
-            boxes_all  = pred_boxes.unsqueeze(0)
-            logits_all = pred_logits.unsqueeze(0)
-
-        reid = None
+    def _wrap_deim(self, deim_out: Dict[str, Any]) -> Dict[str, Any]:
+        out = {
+            'pred_boxes':  deim_out['pred_boxes'],
+            'pred_logits': deim_out['pred_logits'],
+        }
+        for key in ('pred_corners', 'ref_points', 'up', 'reg_scale',
+                    'aux_outputs', 'enc_aux_outputs', 'enc_meta',
+                    'pre_outputs', 'dn_outputs', 'dn_pre_outputs', 'dn_meta'):
+            if key in deim_out:
+                out[key] = deim_out[key]
         if self.reid_mlp is not None and 'hs' in deim_out:
-            reid = F.normalize(self.reid_mlp(deim_out['hs']), dim=-1)
-
-        return DETROutput(
-            boxes      = pred_boxes,
-            logits     = pred_logits,
-            reid       = reid,
-            boxes_all  = boxes_all,
-            logits_all = logits_all,
-        )
+            out['reid'] = F.normalize(self.reid_mlp(deim_out['hs']), dim=-1)
+        return out
 
     def load_pretrained(self, path: str) -> None:
         ckpt  = torch.load(path, map_location='cpu', weights_only=False)

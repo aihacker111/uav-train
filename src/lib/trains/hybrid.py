@@ -186,7 +186,7 @@ import torch
 import torch.nn as nn
 
 from lib.models.losses.hybrid_loss import HybridLoss
-from lib.models.networks.deim_uav.heads import CenterNetOutput, DETROutput
+from lib.models.networks.deim_uav.heads import CenterNetOutput
 from lib.utils.det_eval import COCOEvaluator, VISDRONE_CLASSES
 from .base_trainer import BaseTrainer
 
@@ -199,10 +199,10 @@ def _cxcywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
 
 class HybridTrainer(BaseTrainer):
     """
-    Trainer for HybridCenterNetDETR.
+    Trainer for HybridDEIM.
 
     Expects model outputs as:
-      {'stage1': CenterNetOutput, 'stage2': DETROutput}
+      {'stage1': CenterNetOutput, 'stage2': dict}  (stage2 is now a plain dict)
 
     Batch must contain CenterNet-format stage-1 targets and DETR-format 'targets' list.
     ReID is enabled when opt.id_weight > 0 and opt.nID_dict is available.
@@ -212,7 +212,7 @@ class HybridTrainer(BaseTrainer):
         loss_stats = [
             'loss',
             'loss_s1', 'loss_hm', 'loss_wh', 'loss_reg',
-            'loss_s2', 'loss_cls', 'loss_bbox', 'loss_ciou',
+            'loss_s2', 'loss_vfl', 'loss_bbox', 'loss_giou', 'loss_fgl', 'loss_ddf',
         ]
 
         reid_classifier = None
@@ -224,10 +224,12 @@ class HybridTrainer(BaseTrainer):
 
         loss = HybridLoss(
             num_classes     = opt.num_classes,
-            lambda_wh       = getattr(opt, 'wh_weight',   0.1),
-            lambda_reg      = getattr(opt, 'off_weight',   1.0),
-            lambda_bbox     = getattr(opt, 'bbox_weight',  2.0),
-            lambda_ciou     = getattr(opt, 'giou_weight',  2.0),
+            reg_max         = getattr(opt, 'reg_max',      32),
+            lambda_vfl      = getattr(opt, 'vfl_weight',   1.0),
+            lambda_bbox     = getattr(opt, 'bbox_weight',  5.0),
+            lambda_giou     = getattr(opt, 'giou_weight',  2.0),
+            lambda_fgl      = getattr(opt, 'fgl_weight',   0.5),
+            lambda_ddf      = getattr(opt, 'ddf_weight',   1.0),
             lambda_reid     = getattr(opt, 'id_weight',    1.0),
             lambda_cn       = getattr(opt, 'cn_weight',    0.5),
             aux_loss        = True,
@@ -236,12 +238,12 @@ class HybridTrainer(BaseTrainer):
         return loss_stats, loss
 
     def save_result(self, output: Dict[str, Any], batch: dict, results: dict) -> None:
-        stage2: DETROutput = output['stage2']
+        stage2 = output['stage2']
         img_id = batch['meta']['img_id'].cpu().numpy()[0]
 
-        boxes  = stage2.boxes.detach().cpu()    # (B, K, 4)  cxcywh in [0,1]
-        logits = stage2.logits.detach().cpu()   # (B, K, C)
-        scores = logits.sigmoid().max(dim=-1)   # (values, indices)
+        boxes  = stage2['pred_boxes'].detach().cpu()   # (B, K, 4) cxcywh in [0,1]
+        logits = stage2['pred_logits'].detach().cpu()  # (B, K, C)
+        scores = logits.sigmoid().max(dim=-1)
 
         results[img_id] = {
             'boxes':   boxes[0],
@@ -286,13 +288,13 @@ class HybridTrainer(BaseTrainer):
                     else:
                         batch[k] = batch[k].to(opt.device, non_blocking=True)
 
-                output   = model(batch['input'])
-                stage2: DETROutput = output['stage2']
+                output = model(batch['input'])
+                stage2 = output['stage2']
 
-                prob_t            = stage2.logits.sigmoid()
-                cls_scores_t, cls_labels_t = prob_t.max(dim=-1)
+                prob_t                      = stage2['pred_logits'].sigmoid()
+                cls_scores_t, cls_labels_t  = prob_t.max(dim=-1)
 
-                boxes_cpu  = stage2.boxes.cpu()
+                boxes_cpu  = stage2['pred_boxes'].cpu()
                 scores_cpu = cls_scores_t.cpu()
                 labels_cpu = cls_labels_t.cpu()
 
