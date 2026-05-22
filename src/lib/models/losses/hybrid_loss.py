@@ -5,10 +5,9 @@ Stage-2 losses — ported trực tiếp từ DEIMv2 DEIMCriterion:
   - VFL   : Varifocal Loss (IoU-quality weighted sigmoid focal)
   - L1    : bounding-box L1 regression
   - GIoU  : standard GIoU (không nhân IoU weight — đúng DEIMv2)
-  - FGL   : Fine-Grained Localization (distribution focal trên reg_max bins)
   - DN    : Denoising loss — VFL + L1 + GIoU trên DN queries
 
-Không dùng: aux_outputs, enc_aux, pre_outputs, DDF.
+Không dùng: aux_outputs, enc_aux, pre_outputs.
 """
 from __future__ import annotations
 
@@ -22,7 +21,6 @@ from torch import Tensor
 from .matcher import HungarianMatcher, box_cxcywh_to_xyxy, generalized_box_iou, box_iou
 from ..networks.deim_uav.heads import CenterNetOutput
 from ..base_losses import TripletLoss
-from ..engine.deim.dfine_utils import bbox2distance
 
 
 # ── CenterNet helpers ──────────────────────────────────────────────────────────
@@ -55,27 +53,22 @@ class HybridLoss(nn.Module):
     def __init__(
         self,
         num_classes:     int   = 7,
-        reg_max:         int   = 32,
         lambda_vfl:      float = 1.0,
         lambda_bbox:     float = 5.0,
         lambda_giou:     float = 2.0,
-        lambda_fgl:      float = 0.5,
         lambda_reid:     float = 1.0,
         lambda_triplet:  float = 0.5,
         lambda_cn:       float = 0.5,
         vfl_alpha:       float = 0.2,
         vfl_gamma:       float = 2.0,
-        lambda_ddf:      float = 1.0,   # kept for API compat, not used (no aux outputs)
         aux_loss:        bool  = True,  # kept for API compat, not used
         reid_classifier: Optional[nn.Linear] = None,
     ) -> None:
         super().__init__()
         self.num_classes    = num_classes
-        self.reg_max        = reg_max
         self.lambda_vfl     = lambda_vfl
         self.lambda_bbox    = lambda_bbox
         self.lambda_giou    = lambda_giou
-        self.lambda_fgl     = lambda_fgl
         self.lambda_reid    = lambda_reid
         self.lambda_triplet = lambda_triplet
         self.lambda_cn      = lambda_cn
@@ -85,14 +78,6 @@ class HybridLoss(nn.Module):
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
         self.matcher         = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
-
-        # FGL cache — cleared mỗi forward()
-        self._fgl_targets    = None
-        self._fgl_targets_dn = None
-
-    def _clear_cache(self):
-        self._fgl_targets    = None
-        self._fgl_targets_dn = None
 
     # ── Index helper ───────────────────────────────────────────────────────────
 
@@ -165,52 +150,6 @@ class HybridLoss(nn.Module):
         loss_giou = loss_giou.sum() / num_boxes
 
         return {'loss_bbox': loss_bbox, 'loss_giou': loss_giou}
-
-    # ── FGL — port trực tiếp từ DEIMv2 loss_local (phần FGL) ─────────────────
-    # Ref: DEIMv2/engine/deim/deim_criterion.py :: loss_local()
-    # Bỏ phần DDF (teacher_corners) vì không dùng aux outputs
-
-    def _loss_fgl(self, outputs, targets, indices, num_boxes, is_dn=False):
-        if 'pred_corners' not in outputs:
-            return {}
-
-        idx = self._src_idx(indices)
-        if idx[0].numel() == 0:
-            return {}
-
-        tgt_boxes    = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
-        pred_corners = outputs['pred_corners'][idx].reshape(-1, self.reg_max + 1)
-        ref_points   = outputs['ref_points'][idx].detach()
-
-        with torch.no_grad():
-            if is_dn:
-                if self._fgl_targets_dn is None:
-                    self._fgl_targets_dn = bbox2distance(
-                        ref_points, box_cxcywh_to_xyxy(tgt_boxes),
-                        self.reg_max, outputs['reg_scale'], outputs['up'],
-                    )
-                target_corners, weight_right, weight_left = self._fgl_targets_dn
-            else:
-                if self._fgl_targets is None:
-                    self._fgl_targets = bbox2distance(
-                        ref_points, box_cxcywh_to_xyxy(tgt_boxes),
-                        self.reg_max, outputs['reg_scale'], outputs['up'],
-                    )
-                target_corners, weight_right, weight_left = self._fgl_targets
-
-        ious = torch.diag(box_iou(
-            box_cxcywh_to_xyxy(outputs['pred_boxes'][idx]),
-            box_cxcywh_to_xyxy(tgt_boxes),
-        )[0]).detach()
-        iou_weights = ious.unsqueeze(-1).repeat(1, 1, 4).reshape(-1)
-
-        dis_left  = target_corners.long()
-        dis_right = dis_left + 1
-        loss = (F.cross_entropy(pred_corners, dis_left,  reduction='none') * weight_left.reshape(-1)
-              + F.cross_entropy(pred_corners, dis_right, reduction='none') * weight_right.reshape(-1))
-        loss = (loss * iou_weights.float()).sum() / num_boxes
-
-        return {'loss_fgl': loss}
 
     # ── DN indices — port từ DEIMv2 get_cdn_matched_indices ───────────────────
     # Ref: DEIMv2/engine/deim/deim_criterion.py :: get_cdn_matched_indices()
@@ -308,8 +247,6 @@ class HybridLoss(nn.Module):
         s1 = self._stage1_loss(outputs['stage1'], batch)
 
         # ── Stage 2 ────────────────────────────────────────────────────────────
-        self._clear_cache()
-
         num_boxes = float(max(1, sum(len(t['labels']) for t in targets)))
 
         # Hungarian matching trên main output (last decoder layer)
@@ -320,14 +257,13 @@ class HybridLoss(nn.Module):
 
         losses: Dict[str, Tensor] = {}
 
-        # Main output: VFL + L1 + GIoU + FGL
+        # Main output: VFL + L1 + GIoU
         losses.update(self._loss_vfl(stage2, targets, indices, num_boxes))
         losses.update(self._loss_boxes(stage2, targets, indices, num_boxes))
-        losses.update(self._loss_fgl(stage2, targets, indices, num_boxes))
 
         # ── DN loss — port từ DEIMv2 ────────────────────────────────────────────
         # Ref: DEIMv2/engine/deim/deim_criterion.py :: forward() phần 'dn_outputs'
-        # DN queries dùng fixed matching (không cần Hungarian), loss = VFL + L1 + GIoU + FGL
+        # DN queries dùng fixed matching (không cần Hungarian), loss = VFL + L1 + GIoU
         if 'dn_outputs' in stage2 and 'dn_meta' in stage2:
             dn_meta      = stage2['dn_meta']
             indices_dn   = self._cdn_indices(dn_meta, targets)
@@ -335,16 +271,11 @@ class HybridLoss(nn.Module):
 
             for i, dn_out in enumerate(stage2['dn_outputs']):
                 dn_out = dict(dn_out)
-                dn_out['is_dn']     = True
-                dn_out['up']        = stage2['up']
-                dn_out['reg_scale'] = stage2['reg_scale']
                 sfx = f'_dn_{i}'
                 losses.update({k + sfx: v for k, v in
                     self._loss_vfl(dn_out, targets, indices_dn, dn_num_boxes).items()})
                 losses.update({k + sfx: v for k, v in
                     self._loss_boxes(dn_out, targets, indices_dn, dn_num_boxes).items()})
-                losses.update({k + sfx: v for k, v in
-                    self._loss_fgl(dn_out, targets, indices_dn, dn_num_boxes, is_dn=True).items()})
 
             # dn_pre_outputs (first decoder layer, trước FDR) — chỉ VFL + L1 + GIoU
             if 'dn_pre_outputs' in stage2:
@@ -365,7 +296,6 @@ class HybridLoss(nn.Module):
             'loss_vfl':  self.lambda_vfl,
             'loss_bbox': self.lambda_bbox,
             'loss_giou': self.lambda_giou,
-            'loss_fgl':  self.lambda_fgl,
         }
         loss_s2 = sum(v * w.get(_base_key(k), 0.0)
                       for k, v in losses.items() if _base_key(k) in w)
@@ -391,8 +321,6 @@ class HybridLoss(nn.Module):
             'loss_vfl':  losses.get('loss_vfl',  total.new_tensor(0.0)).detach(),
             'loss_bbox': losses.get('loss_bbox', total.new_tensor(0.0)).detach(),
             'loss_giou': losses.get('loss_giou', total.new_tensor(0.0)).detach(),
-            'loss_fgl':  losses.get('loss_fgl',  total.new_tensor(0.0)).detach(),
-            'loss_ddf':  total.new_tensor(0.0),  # not computed (no aux), kept for compat
         }
         if 'loss_reid' in losses:
             loss_stats['loss_reid'] = losses['loss_reid'].detach()
