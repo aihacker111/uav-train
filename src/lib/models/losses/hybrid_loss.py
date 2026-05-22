@@ -392,6 +392,7 @@ class HybridLoss(nn.Module):
             'loss_bbox': losses.get('loss_bbox', total.new_tensor(0.0)).detach(),
             'loss_giou': losses.get('loss_giou', total.new_tensor(0.0)).detach(),
             'loss_fgl':  losses.get('loss_fgl',  total.new_tensor(0.0)).detach(),
+            'loss_ddf':  total.new_tensor(0.0),  # not computed (no aux), kept for compat
         }
         if 'loss_reid' in losses:
             loss_stats['loss_reid'] = losses['loss_reid'].detach()
