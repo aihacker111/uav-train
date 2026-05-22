@@ -47,12 +47,12 @@ def create_model(arch: str, heads: dict, head_conv: int,
 
     cfg = YAMLConfig(deim_config)
 
-    # Override decoder num_classes to match the dataset (COCO=80, VisDrone=7).
-    # Must modify yaml_cfg (the persistent source), not global_cfg which is a
-    # fresh deep-copy each time its property getter is called.
-    for cls_name in ('DEIMTransformer', 'DFINETransformer', 'RTDETRTransformerv2'):
-        if cls_name in cfg.yaml_cfg:
-            cfg.yaml_cfg[cls_name]['num_classes'] = num_classes
+    # Override num_classes so the decoder uses the dataset's class count, not COCO's 80.
+    # DEIMTransformer uses __share__ = ['num_classes'], meaning it reads num_classes from
+    # the top-level global_cfg key (populated by coco_detection.yml as 80), NOT from
+    # global_cfg['DEIMTransformer']['num_classes'].  Must patch the top-level key in
+    # yaml_cfg (the persistent source) so it survives the fresh deep-copy in global_cfg.
+    cfg.yaml_cfg['num_classes'] = num_classes
 
     deim_model = cfg.model   # DEIM(backbone, encoder, decoder) fully built
 
