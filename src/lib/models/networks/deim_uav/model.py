@@ -164,7 +164,47 @@ class HybridDEIM(nn.Module):
             out['reid'] = F.normalize(self.reid_mlp(deim_out['hs']), dim=-1)
         return out
 
-    def load_pretrained(self, path: str) -> None:
+    def _reinit_class_heads(self, prior_prob: float = 0.01) -> None:
+        """Re-initialize all classification heads after loading mismatched weights.
+
+        Uses focal-loss prior bias so training is stable from the first step:
+          bias = -log((1 - p) / p),  p = prior_prob (≈ -4.6 for p=0.01)
+        Weight is reset with kaiming_normal_ (same as nn.Linear default).
+        """
+        import math
+        bias_val = -math.log((1.0 - prior_prob) / prior_prob)
+
+        decoder = self.deim.decoder
+        heads: list[nn.Module] = []
+
+        # enc_score_head  (single Linear)
+        if hasattr(decoder, 'enc_score_head'):
+            heads.append(decoder.enc_score_head)
+
+        # dec_score_head  (ModuleList of Linears)
+        if hasattr(decoder, 'dec_score_head'):
+            dscore = decoder.dec_score_head
+            heads.extend(dscore if isinstance(dscore, nn.ModuleList) else [dscore])
+
+        # denoising_class_embed  (Linear or Embedding)
+        if hasattr(decoder, 'denoising_class_embed'):
+            heads.append(decoder.denoising_class_embed)
+
+        reinited = 0
+        for m in heads:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, bias_val)
+                reinited += 1
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, std=0.02)
+                reinited += 1
+
+        print(f'[HybridDEIM] reinit_class_heads: {reinited} module(s) reset '
+              f'(prior_prob={prior_prob}, bias≈{bias_val:.3f})')
+
+    def load_pretrained(self, path: str, reinit_heads: bool = True) -> None:
         ckpt  = torch.load(path, map_location='cpu', weights_only=False)
         state = ckpt.get('ema', ckpt.get('model', ckpt)) if isinstance(ckpt, dict) else ckpt
         if any(k.startswith('module.') for k in state):
@@ -187,6 +227,9 @@ class HybridDEIM(nn.Module):
             print(f'  missing    ({len(missing)}): {missing[:4]}{"…" if len(missing) > 4 else ""}')
         if unexpected:
             print(f'  unexpected ({len(unexpected)}): {unexpected[:4]}{"…" if len(unexpected) > 4 else ""}')
+
+        if reinit_heads and skipped:
+            self._reinit_class_heads()
 
     def deploy(self) -> 'HybridDEIM':
         self.eval()
