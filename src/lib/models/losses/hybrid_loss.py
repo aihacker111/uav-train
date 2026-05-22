@@ -65,6 +65,8 @@ class HybridLoss(nn.Module):
         lambda_cn:       float = 0.5,
         vfl_alpha:       float = 0.2,
         vfl_gamma:       float = 2.0,
+        lambda_ddf:      float = 1.0,   # kept for API compat, not used (no aux outputs)
+        aux_loss:        bool  = True,  # kept for API compat, not used
         reid_classifier: Optional[nn.Linear] = None,
     ) -> None:
         super().__init__()
