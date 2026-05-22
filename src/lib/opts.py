@@ -774,6 +774,12 @@ class opts(object):
                                  help='batch size on the master gpu.')
         self.parser.add_argument('--num_iters', type=int, default=-1,
                                  help='default: #samples / batch_size.')
+        self.parser.add_argument('--use_imagenet_norm',
+                                 action='store_true',
+                                 default=False,
+                                 help='Apply ImageNet mean/std normalization (mean=[0.485,0.456,0.406], '
+                                      'std=[0.229,0.224,0.225]). Enable for ViT/DEIM backbones pretrained '
+                                      'with ImageNet norm. Leave off for backbones trained on [0,1] only.')
         self.parser.add_argument('--use_amp',
                                  action='store_true',
                                  default=False,

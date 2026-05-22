@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.utils.data
-from torchvision.transforms import transforms as T
 
 from lib.opts import opts
 from lib.models.model import create_model, load_model, save_model
@@ -20,15 +19,6 @@ from lib.logger import Logger
 from lib.datasets.dataset_factory import get_dataset
 from lib.trains.train_factory import train_factory
 from lib.datasets.transforms import build_aerial_mot_transforms
-
-
-def build_transforms(use_imagenet_norm, augment):
-    ops = [T.ToTensor()]
-    if use_imagenet_norm:
-        ops.append(T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
-    if augment:
-        ops.append(T.RandomErasing(p=0.3, scale=(0.05, 0.20), ratio=(0.3, 3.3), value=0))
-    return T.Compose(ops)
 
 
 def build_cosine_scheduler(optimizer, warmup_iters: int, total_iters: int,
@@ -116,7 +106,6 @@ def run(opt):
     trainset_paths = data_config['train']
     print('Dataset root:', dataset_root)
 
-    use_imagenet_norm = 'hybrid' in opt.arch
     pil_transform = build_aerial_mot_transforms()
 
     # ── Collate function (hybrid task needs variable-length DETR targets) ────────
@@ -132,7 +121,6 @@ def run(opt):
         paths=trainset_paths,
         img_size=opt.input_wh,
         augment=True,
-        transforms=build_transforms(use_imagenet_norm, augment=True),
         pil_transform=pil_transform,
     )
 
@@ -183,7 +171,6 @@ def run(opt):
             paths=data_config['val'],
             img_size=opt.input_wh,
             augment=False,
-            transforms=build_transforms(use_imagenet_norm, augment=False),
             pil_transform=None,
         )
         val_loader = torch.utils.data.DataLoader(

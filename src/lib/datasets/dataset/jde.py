@@ -11,6 +11,7 @@ import cv2
 # import json
 import numpy as np
 import torch
+from torchvision.transforms import RandomErasing as _RandomErasing
 
 from collections import OrderedDict, defaultdict
 # from torch.utils.data import Dataset
@@ -179,7 +180,7 @@ class LoadImagesAndLabels:  # for training
                  path,
                  img_size=(1088, 608),
                  augment=False,
-                 transforms=None,
+                 use_imagenet_norm=False,
                  pil_transform=None):
         with open(path, 'r') as file:
             self.img_files = file.readlines()
@@ -197,8 +198,9 @@ class LoadImagesAndLabels:  # for training
         self.height = img_size[1]
 
         self.augment = augment
-        self.transforms = transforms
+        self.use_imagenet_norm = use_imagenet_norm
         self.pil_transform = pil_transform  # PIL-based pre-letterbox transforms
+        self._erasing = _RandomErasing(p=0.3, scale=(0.05, 0.20), ratio=(0.3, 3.3), value=0) if augment else None
 
     def __getitem__(self, files_index):
         img_path = self.img_files[files_index]
@@ -321,10 +323,12 @@ class LoadImagesAndLabels:  # for training
                 if num_labels > 0:
                     labels[:, 2] = 1 - labels[:, 2]
 
-        img = np.ascontiguousarray(img[:, :, ::-1])  # BGR → RGB
-
-        if self.transforms is not None:
-            img = self.transforms(img)
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR→RGB, HWC→CHW
+        img = np.ascontiguousarray(img, dtype=np.float32)
+        img = _normalize(img, self.use_imagenet_norm)
+        img = torch.from_numpy(img)
+        if self._erasing is not None:
+            img = self._erasing(img)
 
         return img, labels, img_path, (h, w)
 
@@ -483,8 +487,8 @@ class JointDataset(LoadImagesAndLabels):  # for training
     joint detection and embedding dataset
     """
     # set per-instance in __init__ based on arch; class-level fallback kept for safety
-    mean = [0.408, 0.447, 0.470]
-    std  = [0.289, 0.274, 0.278]
+    mean = None
+    std  = None
 
     def __init__(self,
                  opt,
@@ -492,7 +496,6 @@ class JointDataset(LoadImagesAndLabels):  # for training
                  paths,
                  img_size=(1088, 608),
                  augment=False,
-                 transforms=None,
                  pil_transform=None):
         self.opt = opt
         # dataset_names = paths.keys()
@@ -571,12 +574,11 @@ class JointDataset(LoadImagesAndLabels):  # for training
         self.nF = sum(self.nds)
         self.max_objs = opt.K
         self.augment = augment
-        self.transforms = transforms
         self.pil_transform = pil_transform
-
-        use_imagenet = 'hybrid' in opt.arch
-        self.mean = [0.485, 0.456, 0.406] if use_imagenet else [0.408, 0.447, 0.470]
-        self.std  = [0.229, 0.224, 0.225] if use_imagenet else [0.289, 0.274, 0.278]
+        self.use_imagenet_norm = getattr(opt, 'use_imagenet_norm', False)
+        self._erasing = _RandomErasing(p=0.3, scale=(0.05, 0.20), ratio=(0.3, 3.3), value=0) if augment else None
+        self.mean = [0.485, 0.456, 0.406] if self.use_imagenet_norm else [0.0, 0.0, 0.0]
+        self.std  = [0.229, 0.224, 0.225] if self.use_imagenet_norm else [1.0, 1.0, 1.0]
 
         print('dataset summary')
         print(self.tid_num)
