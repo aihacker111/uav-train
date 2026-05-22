@@ -169,6 +169,17 @@ class HybridDEIM(nn.Module):
         state = ckpt.get('ema', ckpt.get('model', ckpt)) if isinstance(ckpt, dict) else ckpt
         if any(k.startswith('module.') for k in state):
             state = {k[len('module.'):]: v for k, v in state.items()}
+
+        # Drop tensors whose shape doesn't match current model (e.g. class heads
+        # when fine-tuning from COCO-80 onto a different number of classes).
+        model_state = self.deim.state_dict()
+        skipped = [k for k, v in state.items()
+                   if k in model_state and v.shape != model_state[k].shape]
+        if skipped:
+            print(f'[HybridDEIM] skipping {len(skipped)} shape-mismatched tensors '
+                  f'(class heads): {skipped[:6]}{"…" if len(skipped) > 6 else ""}')
+            state = {k: v for k, v in state.items() if k not in skipped}
+
         missing, unexpected = self.deim.load_state_dict(state, strict=False)
         n_loaded = len(state) - len(missing)
         print(f'[HybridDEIM] pretrained: {n_loaded}/{len(state)} tensors loaded from {path}')
