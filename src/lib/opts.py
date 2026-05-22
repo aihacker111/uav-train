@@ -792,7 +792,7 @@ class opts(object):
                                  help='Max gradient norm for gradient clipping. '
                                       '0.1 protects ViT backbone from gradient explosion. '
                                       'Set to 0.0 to disable.')
-        self.parser.add_argument('--val_intervals', type=int, default=5,
+        self.parser.add_argument('--val_intervals', type=int, default=1,
                                  help='number of epochs to run validation.')
         self.parser.add_argument('--trainval',
                                  action='store_true',
