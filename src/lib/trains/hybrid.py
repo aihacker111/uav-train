@@ -212,7 +212,7 @@ class HybridTrainer(BaseTrainer):
         loss_stats = [
             'loss',
             'loss_s1', 'loss_hm', 'loss_wh', 'loss_reg',
-            'loss_s2', 'loss_vfl', 'loss_bbox', 'loss_giou', 'loss_fgl', 'loss_ddf',
+            'loss_s2', 'loss_vfl', 'loss_bbox', 'loss_giou',
         ]
 
         reid_classifier = None
@@ -228,8 +228,6 @@ class HybridTrainer(BaseTrainer):
             lambda_vfl      = getattr(opt, 'vfl_weight',   1.0),
             lambda_bbox     = getattr(opt, 'bbox_weight',  5.0),
             lambda_giou     = getattr(opt, 'giou_weight',  2.0),
-            lambda_fgl      = getattr(opt, 'fgl_weight',   0.5),
-            lambda_ddf      = getattr(opt, 'ddf_weight',   1.0),
             lambda_reid     = getattr(opt, 'id_weight',    1.0),
             lambda_cn       = getattr(opt, 'cn_weight',    0.5),
             aux_loss        = True,
