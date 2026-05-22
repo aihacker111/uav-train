@@ -890,6 +890,12 @@ class opts(object):
                                  help='DETR SmoothL1 box loss weight (hybrid task).')
         self.parser.add_argument('--giou_weight', type=float, default=2.0,
                                  help='DETR CIoU loss weight (hybrid task).')
+        self.parser.add_argument('--vfl_weight', type=float, default=1.0,
+                                 help='Varifocal loss weight (hybrid task).')
+        self.parser.add_argument('--fgl_weight', type=float, default=0.5,
+                                 help='Fine-Grained Localization (DFL) loss weight (hybrid task).')
+        self.parser.add_argument('--ddf_weight', type=float, default=1.0,
+                                 help='Decoupled Distillation Focal loss weight (hybrid task).')
         self.parser.add_argument('--cn_weight', type=float, default=0.5,
                                  help='Weight for CenterNet stage-1 loss (hybrid task). '
                                       'Combined loss = L_s2 + cn_weight * L_s1.')
