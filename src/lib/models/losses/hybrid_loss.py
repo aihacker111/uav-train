@@ -1,17 +1,14 @@
 """
-HybridLoss: Stage-1 (CenterNet) + Stage-2 (DEIMv2 criterion) loss.
+HybridLoss: Stage-1 (CenterNet) + Stage-2 (DEIMv2 main losses only).
 
-Stage-2 losses follow DEIMv2 exactly:
-  - VFL  (Varifocal Loss): IoU-quality-weighted sigmoid focal
-  - L1 + GIoU: bounding box regression
-  - FGL  (Fine-Grained Localization): distribution focal loss over reg_max bins
-  - DDF  (Decoupled Distillation Focal): KL distillation between decoder layers
-  - DN   (Denoising): fixed-matching loss on denoising queries
-  - Encoder auxiliary: VFL + box on top-K encoder queries
-  - Pre-output: VFL + box on first decoder layer (before FDR refinement)
+Stage-2 losses — ported trực tiếp từ DEIMv2 DEIMCriterion:
+  - VFL   : Varifocal Loss (IoU-quality weighted sigmoid focal)
+  - L1    : bounding-box L1 regression
+  - GIoU  : standard GIoU (không nhân IoU weight — đúng DEIMv2)
+  - FGL   : Fine-Grained Localization (distribution focal trên reg_max bins)
+  - DN    : Denoising loss — VFL + L1 + GIoU trên DN queries
 
-Stage-1 (CenterNet heatmap) loss is combined as:
-  L = L_s2 + lambda_cn * L_s1
+Không dùng: aux_outputs, enc_aux, pre_outputs, DDF.
 """
 from __future__ import annotations
 
@@ -51,16 +48,8 @@ def _gather_at_ind(feat: Tensor, ind: Tensor) -> Tensor:
 
 class HybridLoss(nn.Module):
     """
-    Combined CenterNet + DEIMv2 DETR loss.
-
-    stage2 output dict must contain (training mode):
-      'pred_logits', 'pred_boxes'             — last decoder layer
-      'pred_corners', 'ref_points'            — for FGL/DDF
-      'up', 'reg_scale'                       — decoder distribution params
-      'aux_outputs'                           — intermediate decoder layers
-      'enc_aux_outputs', 'enc_meta'           — encoder top-K auxiliary
-      'pre_outputs'                           — first decoder layer (pre-FDR)
-      'dn_outputs', 'dn_pre_outputs', 'dn_meta' — denoising queries
+    Stage-1: CenterNet heatmap loss.
+    Stage-2: DEIMv2 losses trên main decoder output + DN queries.
     """
 
     def __init__(
@@ -71,13 +60,11 @@ class HybridLoss(nn.Module):
         lambda_bbox:     float = 5.0,
         lambda_giou:     float = 2.0,
         lambda_fgl:      float = 0.5,
-        lambda_ddf:      float = 1.0,
         lambda_reid:     float = 1.0,
         lambda_triplet:  float = 0.5,
         lambda_cn:       float = 0.5,
         vfl_alpha:       float = 0.2,
         vfl_gamma:       float = 2.0,
-        aux_loss:        bool  = True,
         reid_classifier: Optional[nn.Linear] = None,
     ) -> None:
         super().__init__()
@@ -87,104 +74,74 @@ class HybridLoss(nn.Module):
         self.lambda_bbox    = lambda_bbox
         self.lambda_giou    = lambda_giou
         self.lambda_fgl     = lambda_fgl
-        self.lambda_ddf     = lambda_ddf
         self.lambda_reid    = lambda_reid
         self.lambda_triplet = lambda_triplet
         self.lambda_cn      = lambda_cn
         self.vfl_alpha      = vfl_alpha
         self.vfl_gamma      = vfl_gamma
-        self.aux_loss       = aux_loss
 
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
         self.matcher         = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
 
-        # FGL/DDF cross-call cache — cleared at the start of each forward()
+        # FGL cache — cleared mỗi forward()
         self._fgl_targets    = None
         self._fgl_targets_dn = None
-        self._ddf_num_pos    = None
-        self._ddf_num_neg    = None
 
     def _clear_cache(self):
         self._fgl_targets    = None
         self._fgl_targets_dn = None
-        self._ddf_num_pos    = None
-        self._ddf_num_neg    = None
 
-    # ── Index helpers ──────────────────────────────────────────────────────────
+    # ── Index helper ───────────────────────────────────────────────────────────
 
     def _src_idx(self, indices):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx   = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
-    def _get_go_indices(self, indices, indices_aux_list):
-        """Union-set matching across all decoder layers (DEIMv2 _get_go_indices)."""
-        for indices_aux in indices_aux_list:
-            indices = [
-                (torch.cat([idx1[0], idx2[0]]), torch.cat([idx1[1], idx2[1]]))
-                for idx1, idx2 in zip(indices, indices_aux)
-            ]
-        results = []
-        for ind in [torch.cat([idx[0][:, None], idx[1][:, None]], 1) for idx in indices]:
-            if ind.numel() == 0:
-                results.append((ind.new_empty(0, dtype=torch.long),
-                                ind.new_empty(0, dtype=torch.long)))
-                continue
-            unique, counts = torch.unique(ind, return_counts=True, dim=0)
-            sort_order     = torch.argsort(counts, descending=True)
-            unique_sorted  = unique[sort_order]
-            col_to_row: dict = {}
-            for pair in unique_sorted:
-                r, c = pair[0].item(), pair[1].item()
-                if r not in col_to_row:
-                    col_to_row[r] = c
-            rows = torch.tensor(list(col_to_row.keys()), device=ind.device, dtype=torch.long)
-            cols = torch.tensor(list(col_to_row.values()), device=ind.device, dtype=torch.long)
-            results.append((rows, cols))
-        return results
-
-    # ── Paired IoU for matched pairs ──────────────────────────────────────────
-
-    def _paired_iou(self, outputs, targets, indices) -> Tensor:
-        idx = self._src_idx(indices)
-        if idx[0].numel() == 0:
-            return outputs['pred_boxes'].new_empty(0)
-        src_boxes = outputs['pred_boxes'][idx]
-        tgt_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
-        ious = torch.diag(box_iou(
-            box_cxcywh_to_xyxy(src_boxes),
-            box_cxcywh_to_xyxy(tgt_boxes),
-        )[0]).detach()
-        return ious
-
-    # ── VFL loss ──────────────────────────────────────────────────────────────
+    # ── VFL — port trực tiếp từ DEIMv2 loss_labels_vfl ───────────────────────
+    # Ref: DEIMv2/engine/deim/deim_criterion.py :: loss_labels_vfl()
 
     def _loss_vfl(self, outputs, targets, indices, num_boxes, ious=None):
-        idx = self._src_idx(indices)
-        if ious is None:
-            ious = self._paired_iou(outputs, targets, indices)
-
+        idx        = self._src_idx(indices)
         src_logits = outputs['pred_logits']
-        tgt_cls_o  = torch.cat([t['labels'][j] for t, (_, j) in zip(targets, indices)])
-        tgt_cls    = torch.full(src_logits.shape[:2], self.num_classes,
-                                dtype=torch.int64, device=src_logits.device)
+
+        # Tính IoU nếu chưa có
+        if ious is None:
+            if idx[0].numel() > 0:
+                src_boxes = outputs['pred_boxes'][idx]
+                tgt_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
+                ious_mat, _ = box_iou(box_cxcywh_to_xyxy(src_boxes),
+                                      box_cxcywh_to_xyxy(tgt_boxes))
+                ious = torch.diag(ious_mat).detach()
+            else:
+                ious = src_logits.new_empty(0)
+
+        tgt_cls_o = torch.cat([t['labels'][j] for t, (_, j) in zip(targets, indices)])
+        tgt_cls   = torch.full(src_logits.shape[:2], self.num_classes,
+                               dtype=torch.int64, device=src_logits.device)
         if idx[0].numel() > 0:
             tgt_cls[idx] = tgt_cls_o
 
-        target      = F.one_hot(tgt_cls, num_classes=self.num_classes + 1)[..., :-1].float()
-        tgt_score_o = torch.zeros(src_logits.shape[:2], dtype=src_logits.dtype, device=src_logits.device)
+        target = F.one_hot(tgt_cls, num_classes=self.num_classes + 1)[..., :-1].float()
+
+        tgt_score_o = torch.zeros(src_logits.shape[:2],
+                                  dtype=src_logits.dtype, device=src_logits.device)
         if idx[0].numel() > 0:
             tgt_score_o[idx] = ious.to(tgt_score_o.dtype)
-        tgt_score   = tgt_score_o.unsqueeze(-1) * target
+        tgt_score = tgt_score_o.unsqueeze(-1) * target
 
         pred_score = src_logits.sigmoid().detach()
         weight     = self.vfl_alpha * pred_score.pow(self.vfl_gamma) * (1 - target) + tgt_score
 
-        loss = F.binary_cross_entropy_with_logits(src_logits, tgt_score, weight=weight, reduction='none')
-        return {'loss_vfl': loss.mean(1).sum() * src_logits.shape[1] / num_boxes}
+        loss = F.binary_cross_entropy_with_logits(
+            src_logits, tgt_score, weight=weight, reduction='none')
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        return {'loss_vfl': loss}
 
-    # ── Box loss (L1 + GIoU) ──────────────────────────────────────────────────
+    # ── L1 + GIoU — port trực tiếp từ DEIMv2 loss_boxes ─────────────────────
+    # Ref: DEIMv2/engine/deim/deim_criterion.py :: loss_boxes()
+    # Khác biệt so với code cũ: GIoU KHÔNG nhân IoU weight (boxes_weight=None)
 
     def _loss_boxes(self, outputs, targets, indices, num_boxes):
         idx = self._src_idx(indices)
@@ -195,33 +152,31 @@ class HybridLoss(nn.Module):
         src_boxes = outputs['pred_boxes'][idx]
         tgt_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
 
+        # L1
         loss_bbox = F.l1_loss(src_boxes, tgt_boxes, reduction='none').sum() / num_boxes
 
-        # GIoU weighted by per-pair IoU from THIS layer's boxes (matching DEIMv2 boxes_weight_format='iou')
-        ious = torch.diag(box_iou(
-            box_cxcywh_to_xyxy(src_boxes.detach()),
-            box_cxcywh_to_xyxy(tgt_boxes),
-        )[0])
-        loss_giou_vals = (1 - torch.diag(generalized_box_iou(
+        # Standard GIoU — không nhân thêm IoU weight (đúng DEIMv2 mặc định)
+        loss_giou = 1 - torch.diag(generalized_box_iou(
             box_cxcywh_to_xyxy(src_boxes),
             box_cxcywh_to_xyxy(tgt_boxes),
-        ))) * ious
-        loss_giou = loss_giou_vals.sum() / num_boxes
+        ))
+        loss_giou = loss_giou.sum() / num_boxes
 
         return {'loss_bbox': loss_bbox, 'loss_giou': loss_giou}
 
-    # ── FGL + DDF loss ────────────────────────────────────────────────────────
+    # ── FGL — port trực tiếp từ DEIMv2 loss_local (phần FGL) ─────────────────
+    # Ref: DEIMv2/engine/deim/deim_criterion.py :: loss_local()
+    # Bỏ phần DDF (teacher_corners) vì không dùng aux outputs
 
-    def _loss_local(self, outputs, targets, indices, num_boxes, is_dn=False, T=5.0):
-        losses = {}
+    def _loss_fgl(self, outputs, targets, indices, num_boxes, is_dn=False):
         if 'pred_corners' not in outputs:
-            return losses
+            return {}
 
-        idx       = self._src_idx(indices)
+        idx = self._src_idx(indices)
         if idx[0].numel() == 0:
-            return losses
+            return {}
 
-        tgt_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
+        tgt_boxes    = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
         pred_corners = outputs['pred_corners'][idx].reshape(-1, self.reg_max + 1)
         ref_points   = outputs['ref_points'][idx].detach()
 
@@ -245,68 +200,30 @@ class HybridLoss(nn.Module):
             box_cxcywh_to_xyxy(outputs['pred_boxes'][idx]),
             box_cxcywh_to_xyxy(tgt_boxes),
         )[0]).detach()
-        iou_weights = ious.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
+        iou_weights = ious.unsqueeze(-1).repeat(1, 1, 4).reshape(-1)
 
-        losses['loss_fgl'] = self._unimodal_dfocal(
-            pred_corners, target_corners, weight_right, weight_left, iou_weights, avg_factor=num_boxes,
-        )
-
-        if 'teacher_corners' in outputs:
-            pred_all    = outputs['pred_corners'].reshape(-1, self.reg_max + 1)
-            teacher_all = outputs['teacher_corners'].reshape(-1, self.reg_max + 1)
-            if not torch.equal(pred_all, teacher_all):
-                B, K = outputs['pred_logits'].shape[:2]
-                w_local = outputs['teacher_logits'].sigmoid().max(dim=-1)[0]   # (B, K)
-
-                mask = torch.zeros(B, K, dtype=torch.bool, device=w_local.device)
-                mask[idx] = True
-                mask_flat = mask.unsqueeze(-1).repeat(1, 1, 4).reshape(-1)
-
-                w_local[idx] = ious.reshape_as(w_local[idx]).to(w_local.dtype)
-                w_flat = w_local.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
-
-                kl = (T ** 2) * (nn.KLDivLoss(reduction='none')(
-                    F.log_softmax(pred_all / T, dim=1),
-                    F.softmax(teacher_all.detach() / T, dim=1),
-                )).sum(-1)
-                loss_all = w_flat * kl
-
-                if not is_dn:
-                    batch_scale = 8.0 / B
-                    self._ddf_num_pos = (mask_flat.sum().float()  * batch_scale) ** 0.5
-                    self._ddf_num_neg = ((~mask_flat).sum().float() * batch_scale) ** 0.5
-
-                if self._ddf_num_pos is not None and (self._ddf_num_pos + self._ddf_num_neg) > 0:
-                    l_pos = loss_all[mask_flat].mean()  if mask_flat.any()  else loss_all.new_tensor(0.0)
-                    l_neg = loss_all[~mask_flat].mean() if (~mask_flat).any() else loss_all.new_tensor(0.0)
-                    losses['loss_ddf'] = (l_pos * self._ddf_num_pos + l_neg * self._ddf_num_neg) / (
-                        self._ddf_num_pos + self._ddf_num_neg)
-
-        return losses
-
-    @staticmethod
-    def _unimodal_dfocal(pred, label, weight_right, weight_left, iou_weight=None, avg_factor=None):
-        dis_left  = label.long()
+        dis_left  = target_corners.long()
         dis_right = dis_left + 1
-        loss = (F.cross_entropy(pred, dis_left,  reduction='none') * weight_left.reshape(-1)
-              + F.cross_entropy(pred, dis_right, reduction='none') * weight_right.reshape(-1))
-        if iou_weight is not None:
-            loss = loss * iou_weight.float()
-        return loss.sum() / avg_factor if avg_factor is not None else loss.sum()
+        loss = (F.cross_entropy(pred_corners, dis_left,  reduction='none') * weight_left.reshape(-1)
+              + F.cross_entropy(pred_corners, dis_right, reduction='none') * weight_right.reshape(-1))
+        loss = (loss * iou_weights.float()).sum() / num_boxes
 
-    # ── DN matching ───────────────────────────────────────────────────────────
+        return {'loss_fgl': loss}
+
+    # ── DN indices — port từ DEIMv2 get_cdn_matched_indices ───────────────────
+    # Ref: DEIMv2/engine/deim/deim_criterion.py :: get_cdn_matched_indices()
 
     @staticmethod
     def _cdn_indices(dn_meta, targets):
-        pos_idx    = dn_meta['dn_positive_idx']
-        num_group  = dn_meta['dn_num_group']
-        device     = targets[0]['labels'].device
+        dn_positive_idx = dn_meta['dn_positive_idx']
+        dn_num_group    = dn_meta['dn_num_group']
+        device          = targets[0]['labels'].device
         result = []
         for i, t in enumerate(targets):
             n = len(t['labels'])
             if n > 0:
-                gt_idx = torch.arange(n, dtype=torch.int64, device=device).tile(num_group)
-                result.append((pos_idx[i], gt_idx))
+                gt_idx = torch.arange(n, dtype=torch.int64, device=device).tile(dn_num_group)
+                result.append((dn_positive_idx[i], gt_idx))
             else:
                 result.append((torch.zeros(0, dtype=torch.int64, device=device),
                                 torch.zeros(0, dtype=torch.int64, device=device)))
@@ -346,10 +263,10 @@ class HybridLoss(nn.Module):
         for b, (src_i, tgt_i) in enumerate(indices):
             if len(src_i) == 0 or 'ids' not in targets[b]:
                 continue
-            src_i = src_i.to(dev)
-            tgt_i = tgt_i.to(dev)
+            src_i     = src_i.to(dev)
+            tgt_i     = tgt_i.to(dev)
             track_ids = targets[b]['ids'][tgt_i]
-            keep = track_ids >= 0
+            keep      = track_ids >= 0
             if not keep.any():
                 continue
             valid_emb.append(reid[b][src_i[keep]])
@@ -358,9 +275,9 @@ class HybridLoss(nn.Module):
         if not valid_emb:
             return reid.sum() * 0.0
 
-        emb    = torch.cat(valid_emb)
-        ids_t  = torch.cat(valid_ids).to(dev)
-        logits = self.reid_classifier(emb)
+        emb     = torch.cat(valid_emb)
+        ids_t   = torch.cat(valid_ids).to(dev)
+        logits  = self.reid_classifier(emb)
         loss_ce = F.cross_entropy(logits, ids_t)
 
         if ids_t.unique().numel() >= 2 and emb.shape[0] >= 2:
@@ -391,82 +308,27 @@ class HybridLoss(nn.Module):
         # ── Stage 2 ────────────────────────────────────────────────────────────
         self._clear_cache()
 
-        # Main matching (last decoder layer)
+        num_boxes = float(max(1, sum(len(t['labels']) for t in targets)))
+
+        # Hungarian matching trên main output (last decoder layer)
         main_out = {k: v for k, v in stage2.items()
                     if k not in ('aux_outputs', 'enc_aux_outputs', 'dn_outputs',
                                  'dn_pre_outputs', 'dn_meta', 'enc_meta', 'pre_outputs')}
         indices = self.matcher(main_out, targets)['indices']
 
-        # Gather all per-aux-layer indices for union-set computation
-        all_aux_indices: List = []
-        aux_outputs   = stage2.get('aux_outputs', [])
-        enc_aux_outputs = stage2.get('enc_aux_outputs', [])
-
-        if self.aux_loss:
-            for aux in aux_outputs:
-                all_aux_indices.append(self.matcher(aux, targets)['indices'])
-            if 'pre_outputs' in stage2:
-                all_aux_indices.append(self.matcher(stage2['pre_outputs'], targets)['indices'])
-            for enc_aux in enc_aux_outputs:
-                all_aux_indices.append(self.matcher(enc_aux, targets)['indices'])
-
-        # Union-set indices (used for boxes + local losses across all layers)
-        indices_go = (self._get_go_indices(list(indices), list(all_aux_indices))
-                      if all_aux_indices else list(indices))
-
-        num_boxes    = float(max(1, sum(len(t['labels']) for t in targets)))
-        num_boxes_go = float(max(1, sum(len(x[0]) for x in indices_go)))
-
         losses: Dict[str, Tensor] = {}
 
-        # Main output losses
-        ious_main = self._paired_iou(stage2, targets, indices)
-        losses.update(self._loss_vfl(stage2, targets, indices, num_boxes, ious=ious_main))
-        losses.update(self._loss_boxes(stage2, targets, indices_go, num_boxes_go))
-        losses.update(self._loss_local(stage2, targets, indices_go, num_boxes_go))  # caches fgl_targets
+        # Main output: VFL + L1 + GIoU + FGL
+        losses.update(self._loss_vfl(stage2, targets, indices, num_boxes))
+        losses.update(self._loss_boxes(stage2, targets, indices, num_boxes))
+        losses.update(self._loss_fgl(stage2, targets, indices, num_boxes))
 
-        if self.aux_loss:
-            # Intermediate decoder layer losses
-            n_aux = len(aux_outputs)
-            for i, aux in enumerate(aux_outputs):
-                aux_w_up  = dict(aux)
-                aux_w_up['up']        = stage2['up']
-                aux_w_up['reg_scale'] = stage2['reg_scale']
-                aux_idx   = all_aux_indices[i]
-                ious_aux  = self._paired_iou(aux_w_up, targets, aux_idx)
-                sfx       = f'_aux_{i}'
-                losses.update({k + sfx: v for k, v in
-                    self._loss_vfl(aux_w_up, targets, aux_idx, num_boxes, ious=ious_aux).items()})
-                losses.update({k + sfx: v for k, v in
-                    self._loss_boxes(aux_w_up, targets, indices_go, num_boxes_go).items()})
-                losses.update({k + sfx: v for k, v in
-                    self._loss_local(aux_w_up, targets, indices_go, num_boxes_go).items()})
-
-            # Pre-output losses (first decoder layer, before FDR)
-            if 'pre_outputs' in stage2:
-                pre_idx = all_aux_indices[n_aux]
-                pre_out = stage2['pre_outputs']
-                ious_pre = self._paired_iou(pre_out, targets, pre_idx)
-                losses.update({k + '_pre': v for k, v in
-                    self._loss_vfl(pre_out, targets, pre_idx, num_boxes, ious=ious_pre).items()})
-                losses.update({k + '_pre': v for k, v in
-                    self._loss_boxes(pre_out, targets, indices_go, num_boxes_go).items()})
-
-            # Encoder auxiliary losses
-            pre_offset = n_aux + (1 if 'pre_outputs' in stage2 else 0)
-            for i, enc_aux in enumerate(enc_aux_outputs):
-                enc_idx  = all_aux_indices[pre_offset + i]
-                ious_enc = self._paired_iou(enc_aux, targets, enc_idx)
-                sfx      = f'_enc_{i}'
-                losses.update({k + sfx: v for k, v in
-                    self._loss_vfl(enc_aux, targets, enc_idx, num_boxes, ious=ious_enc).items()})
-                losses.update({k + sfx: v for k, v in
-                    self._loss_boxes(enc_aux, targets, indices_go, num_boxes_go).items()})
-
-        # Denoising losses
+        # ── DN loss — port từ DEIMv2 ────────────────────────────────────────────
+        # Ref: DEIMv2/engine/deim/deim_criterion.py :: forward() phần 'dn_outputs'
+        # DN queries dùng fixed matching (không cần Hungarian), loss = VFL + L1 + GIoU + FGL
         if 'dn_outputs' in stage2 and 'dn_meta' in stage2:
-            dn_meta    = stage2['dn_meta']
-            indices_dn = self._cdn_indices(dn_meta, targets)
+            dn_meta      = stage2['dn_meta']
+            indices_dn   = self._cdn_indices(dn_meta, targets)
             dn_num_boxes = float(max(1, num_boxes * dn_meta['dn_num_group']))
 
             for i, dn_out in enumerate(stage2['dn_outputs']):
@@ -475,37 +337,39 @@ class HybridLoss(nn.Module):
                 dn_out['up']        = stage2['up']
                 dn_out['reg_scale'] = stage2['reg_scale']
                 sfx = f'_dn_{i}'
-                ious_dn = self._paired_iou(dn_out, targets, indices_dn)
                 losses.update({k + sfx: v for k, v in
-                    self._loss_vfl(dn_out, targets, indices_dn, dn_num_boxes, ious=ious_dn).items()})
+                    self._loss_vfl(dn_out, targets, indices_dn, dn_num_boxes).items()})
                 losses.update({k + sfx: v for k, v in
                     self._loss_boxes(dn_out, targets, indices_dn, dn_num_boxes).items()})
                 losses.update({k + sfx: v for k, v in
-                    self._loss_local(dn_out, targets, indices_dn, dn_num_boxes, is_dn=True).items()})
+                    self._loss_fgl(dn_out, targets, indices_dn, dn_num_boxes, is_dn=True).items()})
 
+            # dn_pre_outputs (first decoder layer, trước FDR) — chỉ VFL + L1 + GIoU
             if 'dn_pre_outputs' in stage2:
                 dn_pre = stage2['dn_pre_outputs']
-                ious_dn_pre = self._paired_iou(dn_pre, targets, indices_dn)
                 losses.update({k + '_dn_pre': v for k, v in
-                    self._loss_vfl(dn_pre, targets, indices_dn, dn_num_boxes, ious=ious_dn_pre).items()})
+                    self._loss_vfl(dn_pre, targets, indices_dn, dn_num_boxes).items()})
                 losses.update({k + '_dn_pre': v for k, v in
                     self._loss_boxes(dn_pre, targets, indices_dn, dn_num_boxes).items()})
 
-        # Weighted sum for stage-2
+        # Weighted sum cho stage-2
         def _base_key(k):
-            for sep in ('_aux_', '_dn_', '_enc_'):
+            for sep in ('_dn_',):
                 if sep in k:
                     return k[:k.index(sep)]
-            return k[:-4] if k.endswith('_pre') else k
+            return k[:-7] if k.endswith('_dn_pre') else k
 
-        w = {'loss_vfl': self.lambda_vfl, 'loss_bbox': self.lambda_bbox,
-             'loss_giou': self.lambda_giou, 'loss_fgl': self.lambda_fgl,
-             'loss_ddf': self.lambda_ddf}
-        loss_s2 = sum(v * w.get(_base_key(k), 0.0) for k, v in losses.items()
-                      if _base_key(k) in w)
+        w = {
+            'loss_vfl':  self.lambda_vfl,
+            'loss_bbox': self.lambda_bbox,
+            'loss_giou': self.lambda_giou,
+            'loss_fgl':  self.lambda_fgl,
+        }
+        loss_s2 = sum(v * w.get(_base_key(k), 0.0)
+                      for k, v in losses.items() if _base_key(k) in w)
 
-        loss_s1  = s1['total']
-        total    = loss_s2 + self.lambda_cn * loss_s1
+        loss_s1 = s1['total']
+        total   = loss_s2 + self.lambda_cn * loss_s1
 
         # Optional ReID
         if self.reid_classifier is not None and 'ids' in targets[0]:
@@ -513,7 +377,6 @@ class HybridLoss(nn.Module):
             total  = total + self.lambda_reid * l_reid
             losses['loss_reid'] = l_reid
 
-        # Clean nan (matching DEIMv2)
         losses = {k: torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}
 
         loss_stats = {
@@ -523,11 +386,10 @@ class HybridLoss(nn.Module):
             'loss_wh':   s1['wh'].detach(),
             'loss_reg':  s1['reg'].detach(),
             'loss_s2':   loss_s2.detach(),
-            'loss_vfl':  losses.get('loss_vfl', total.new_tensor(0.0)).detach(),
+            'loss_vfl':  losses.get('loss_vfl',  total.new_tensor(0.0)).detach(),
             'loss_bbox': losses.get('loss_bbox', total.new_tensor(0.0)).detach(),
             'loss_giou': losses.get('loss_giou', total.new_tensor(0.0)).detach(),
             'loss_fgl':  losses.get('loss_fgl',  total.new_tensor(0.0)).detach(),
-            'loss_ddf':  losses.get('loss_ddf',  total.new_tensor(0.0)).detach(),
         }
         if 'loss_reid' in losses:
             loss_stats['loss_reid'] = losses['loss_reid'].detach()
