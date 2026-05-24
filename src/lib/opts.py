@@ -594,7 +594,7 @@ class opts(object):
         self.parser.add_argument('--dataset', default='jde', help='jde')
         self.parser.add_argument('--exp_id', default='default')
         self.parser.add_argument('--test', action='store_true')
-        self.parser.add_argument('--test_visdrone', action='store_true',
+        self.parser.add_argument('--test_visdrone', action='store_true', default=True,
                                  help='run tracking eval on VisDrone test-dev sequences')
         self.parser.add_argument('--test_uavdt', action='store_true',
                                  help='run tracking eval on UAVDT sequences')
@@ -653,8 +653,9 @@ class opts(object):
                                       'Required for hybrid architectures.')
         self.parser.add_argument('--head_conv',
                                  type=int,
-                                 default=256,
-                                 help='conv layer channels for output head. 0 for no conv layer.')
+                                 default=32,
+                                 help='intermediate conv channels for CenterNet auxiliary head. '
+                                      '0 disables the intermediate conv (1×1 only).')
         self.parser.add_argument('--backbone_lr_scale',
                                  type=float,
                                  default=0.2,
@@ -819,6 +820,15 @@ class opts(object):
                                  default=0.4,
                                  help='iou thresh for nms')
 
+        self.parser.add_argument('--track_buffer',
+                                 type=int,
+                                 default=30,
+                                 help='tracking buffer length in frames (lost tracks kept for this many frames)')
+        self.parser.add_argument('--cat_spec_wh', action='store_true',
+                                 help='category-specific wh prediction')
+        self.parser.add_argument('--not_reg_offset', action='store_true',
+                                 help='disable regression offset head')
+
         # mot: 选择数据集的配置文件
         self.parser.add_argument('--data_cfg', type=str,
                                  default='../src/lib/cfg/visdrone.json',  # 'mcmot_det.json', 'visdrone.json'
@@ -959,6 +969,8 @@ class opts(object):
         # ECViT backbone always requires ImageNet normalization.
         if 'hybrid' in opt.arch:
             opt.use_imagenet_norm = True
+
+        opt.reg_offset = not opt.not_reg_offset
 
         opt.pad = 31
         opt.num_stacks = 1
