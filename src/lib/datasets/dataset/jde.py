@@ -757,7 +757,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
             cls_id_map = np.full((1, output_h, output_w), -1, dtype=np.int64)  # 1×H×W
 
         # Gauss function definition
-        draw_gaussian = draw_msra_gaussian if self.opt.mse_loss else draw_umich_gaussian
+        draw_gaussian = draw_msra_gaussian if getattr(self.opt, 'mse_loss', False) else draw_umich_gaussian
 
         # 遍历每一个ground truth检测目标
         # Cap at max_objs to avoid unbounded memory usage.
@@ -784,7 +784,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
                 # heat-map radius
                 radius = gaussian_radius((math.ceil(h), math.ceil(w)))
                 radius = max(0, int(radius))  # radius >= 0
-                radius = self.opt.hm_gauss if self.opt.mse_loss else radius
+                radius = getattr(self.opt, 'hm_gauss', radius) if getattr(self.opt, 'mse_loss', False) else radius
 
                 # bbox center coordinate
                 ct = np.array([bbox[0], bbox[1]], dtype=np.float32)
