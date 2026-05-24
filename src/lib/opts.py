@@ -594,6 +594,12 @@ class opts(object):
         self.parser.add_argument('--dataset', default='jde', help='jde')
         self.parser.add_argument('--exp_id', default='default')
         self.parser.add_argument('--test', action='store_true')
+        self.parser.add_argument('--test_visdrone', action='store_true',
+                                 help='run tracking eval on VisDrone test-dev sequences')
+        self.parser.add_argument('--test_uavdt', action='store_true',
+                                 help='run tracking eval on UAVDT sequences')
+        self.parser.add_argument('--min_box_area', type=float, default=100,
+                                 help='filter out tiny boxes below this pixel area')
         self.parser.add_argument('--load_model',
                                  default='',
                                  help='path to pretrained model')
