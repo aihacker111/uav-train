@@ -614,6 +614,9 @@ class opts(object):
         self.parser.add_argument('--gpus',
                                  default='0',  # 0, 5, 6
                                  help='-1 for CPU, use comma for multiple gpus')
+        self.parser.add_argument('--device',
+                                 default='cuda:0',
+                                 help='device string passed to torch (e.g. cuda:0, cpu)')
         self.parser.add_argument('--num_workers',
                                  type=int,
                                  default=8,  # 8, 6, 4
