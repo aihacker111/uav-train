@@ -81,7 +81,11 @@ class HybridECDet(nn.Module):
             CenterNetHeadConfig(head_conv=head_conv, num_classes=num_classes),
         )
 
-        self.reid_mlp = nn.Linear(hidden_dim, reid_dim) if reid_dim > 0 else None
+        self.reid_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, reid_dim),
+        ) if reid_dim > 0 else None
 
     # ── Heatmap → reference points ──────────────────────────────────────────────
 
