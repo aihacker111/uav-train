@@ -67,28 +67,25 @@ def centernet_focal_loss(pred_hm: Tensor, gt_hm: Tensor) -> Tensor:
     return (pos_l + neg_l).sum() / n_pos
 
 
-def varifocal_loss(
-    pred:    Tensor,   # (*, C) raw logits
-    q:       Tensor,   # (*, C) quality targets — IoU score for positives, 0 for negatives
-    alpha:   float = 0.75,
-    gamma:   float = 2.0,
+def mal_loss(
+    pred:      Tensor,   # (B, Q, C) raw logits
+    target_q:  Tensor,   # (B, Q, C) iou^gamma at matched positions, 0 elsewhere
+    gamma:     float = 1.5,
+    num_boxes: int   = 1,
 ) -> Tensor:
     """
-    Varifocal Loss (VarifocalNet, Zhang et al. 2021).
-    Uses IoU-quality score q as positive weight instead of fixed alpha.
-      q > 0: -q * (q*log(p) + (1-q)*log(1-p))
-      q = 0: -alpha * p^gamma * log(1-p)
-    Normalised by number of positives.
+    Modulation Augmented Loss — EdgeCrafter / D-FINE.
+    target_q: iou^gamma for positives (no alpha dampening), 0 for negatives.
+    weight  = pred_score^gamma * (1 - is_pos) + is_pos
+    Normalised by num_boxes (total GT count). Same convention as EdgeCrafter.
+    Replaces VFL: MAL omits alpha dampening on negatives → cleaner gradient for
+    small objects where focal downweighting hurts.
     """
-    p    = pred.sigmoid()
-    ce   = F.binary_cross_entropy_with_logits(pred, q.clamp(0, 1), reduction='none')
-
-    pos_mask = (q > 0).float()
-    neg_mask = 1.0 - pos_mask
-
-    loss = (pos_mask * q + neg_mask * alpha * p.pow(gamma)) * ce
-    n_pos = pos_mask.sum().clamp(min=1)
-    return loss.sum() / n_pos
+    p      = pred.sigmoid().detach()
+    is_pos = (target_q > 0).float()
+    weight = p.pow(gamma) * (1.0 - is_pos) + is_pos
+    loss   = F.binary_cross_entropy_with_logits(pred, target_q, weight=weight, reduction='none')
+    return loss.mean(1).sum() * pred.shape[1] / max(num_boxes, 1)
 
 
 def _paired_iou(b1: Tensor, b2: Tensor) -> Tensor:
@@ -169,17 +166,19 @@ class HybridLoss(nn.Module):
         num_classes:           int   = 7,
         lambda_wh:             float = 0.1,
         lambda_reg:            float = 1.0,
-        lambda_bbox:           float = 2.0,
-        lambda_ciou:           float = 2.0,
+        lambda_bbox:           float = 5.0,   # EdgeCrafter default (was 2.0)
+        lambda_ciou:           float = 2.0,   # GIoU weight (name kept for compat)
         lambda_reid:           float = 1.0,
         lambda_triplet:        float = 0.5,
         lambda_consist:        float = 0.05,
         consist_warmup_epochs: int   = 5,
         lambda_stage1:         float = 2.0,
-        lambda_stage2:         float = 0.3,   # starts low — Stage-2 learns after Stage-1
+        lambda_stage2:         float = 0.3,
+        lambda_dn:             float = 1.0,   # weight for DN auxiliary loss
+        mal_gamma:             float = 1.5,   # MAL/EdgeCrafter exponent
         aux_loss:              bool  = True,
         reid_classifier:       Optional[nn.Linear] = None,
-        total_epochs:          int   = 0,      # 0 = disable curriculum (static weights)
+        total_epochs:          int   = 0,
     ) -> None:
         super().__init__()
         self.num_classes           = num_classes
@@ -193,6 +192,8 @@ class HybridLoss(nn.Module):
         self.consist_warmup_epochs = consist_warmup_epochs
         self.lambda_stage1         = lambda_stage1
         self.lambda_stage2         = lambda_stage2
+        self.lambda_dn             = lambda_dn
+        self.mal_gamma             = mal_gamma
         self.aux_loss              = aux_loss
         self.total_epochs          = total_epochs
         self._epoch                = 0
@@ -259,72 +260,127 @@ class HybridLoss(nn.Module):
 
     def _detr_layer_loss(
         self,
-        logits:  Tensor,
-        boxes:   Tensor,
-        targets: List[dict],
-        indices: list,
+        logits:    Tensor,
+        boxes:     Tensor,
+        targets:   List[dict],
+        indices:   list,
+        num_boxes: int = 0,
     ) -> Dict[str, Tensor]:
-        dev   = logits.device
-        Q_MIN = 0.1
-        tgt_cls = torch.zeros_like(logits)
-        src_b_list, tgt_b_list, iou_list = [], [], []
+        dev = logits.device
+        B, Q, C = logits.shape
+
+        if num_boxes == 0:
+            num_boxes = max(sum(len(t['labels']) for t in targets), 1)
+
+        # Build MAL quality target: iou^gamma at matched (query, class) positions
+        target_q   = torch.zeros(B, Q, C, device=dev)
+        src_b_list, tgt_b_list = [], []
 
         for b, m in enumerate(indices):
-            src_i, tgt_i, iou_cached = m['src_i'], m['tgt_i'], m['iou']
+            src_i, tgt_i = m['src_i'], m['tgt_i']
             if not len(src_i):
                 continue
             si  = src_i.to(dev)
             ti  = tgt_i.to(dev)
-            iou = iou_cached.to(dev)
 
-            tgt_cls[b, si, targets[b]['labels'][ti]] = iou.clamp(min=Q_MIN)
+            # Reuse cached IoU from matcher when present (avoids redundant compute).
+            # Fall back to computing fresh (e.g. for DN indices).
+            if 'iou' in m and len(m['iou']):
+                iou = m['iou'].to(dev)
+            else:
+                sb  = boxes[b][si].detach()
+                tb  = targets[b]['boxes'][ti].to(dev)
+                iou = _paired_iou(box_cxcywh_to_xyxy(sb), box_cxcywh_to_xyxy(tb))
+
+            cls_idx = targets[b]['labels'][ti].to(dev)
+            target_q[b, si, cls_idx] = iou.pow(self.mal_gamma).clamp(min=1e-4)
+
             src_b_list.append(boxes[b][si])
-            tgt_b_list.append(targets[b]['boxes'][ti])
-            iou_list.append(iou)
+            tgt_b_list.append(targets[b]['boxes'][ti].to(dev))
 
-        loss_cls = varifocal_loss(logits, tgt_cls)
+        loss_cls = mal_loss(logits, target_q, gamma=self.mal_gamma, num_boxes=num_boxes)
 
         if src_b_list:
-            src_b    = torch.cat(src_b_list)
-            tgt_b    = torch.cat(tgt_b_list)
-            iou_all  = torch.cat(iou_list)
-            n_m      = src_b.shape[0]
-            loss_bbox = F.smooth_l1_loss(src_b, tgt_b, beta=0.05, reduction='sum') / n_m
-            loss_giou = giou_loss(
-                box_cxcywh_to_xyxy(src_b),
-                box_cxcywh_to_xyxy(tgt_b),
-                iou=iou_all,
-            )
+            src_b     = torch.cat(src_b_list)
+            tgt_b     = torch.cat(tgt_b_list)
+            n_m       = src_b.shape[0]
+            loss_bbox = F.l1_loss(src_b, tgt_b, reduction='sum') / n_m
+            loss_giou = giou_loss(box_cxcywh_to_xyxy(src_b), box_cxcywh_to_xyxy(tgt_b))
         else:
             loss_bbox = loss_giou = logits.sum() * 0.0
 
         total = loss_cls + self.lambda_bbox * loss_bbox + self.lambda_ciou * loss_giou
-        return {'total': total, 'cls': loss_cls, 'bbox': loss_bbox, 'ciou': loss_giou}
+        return {'total': total, 'cls': loss_cls, 'bbox': loss_bbox, 'giou': loss_giou}
 
     def _stage2_loss(
         self,
         detr_out: DETROutput,
         targets:  List[dict],
     ) -> Dict[str, Tensor]:
-        indices = self.matcher(detr_out.logits, detr_out.boxes, targets)
-        d       = self._detr_layer_loss(detr_out.logits, detr_out.boxes, targets, indices)
-        total   = d['total']
+        num_boxes = max(sum(len(t['labels']) for t in targets), 1)
+        indices   = self.matcher(detr_out.logits, detr_out.boxes, targets)
+        d         = self._detr_layer_loss(detr_out.logits, detr_out.boxes, targets, indices,
+                                          num_boxes=num_boxes)
+        total = d['total']
 
         if self.aux_loss:
             L     = detr_out.boxes_all.shape[0]
             n_aux = L - 1
             for layer in range(n_aux):
-                aux = self._detr_layer_loss(
-                    detr_out.logits_all[layer], detr_out.boxes_all[layer], targets, indices,
+                aux   = self._detr_layer_loss(
+                    detr_out.logits_all[layer], detr_out.boxes_all[layer],
+                    targets, indices, num_boxes=num_boxes,
                 )
-                # Progressive aux weights: [0.4, 1.0] over layers.
-                # Wider range than before (was [0.25, 0.5]) so intermediate layers
-                # receive stronger supervision while still below the final layer.
                 aux_w = 0.4 + 0.6 * (layer / max(n_aux - 1, 1))
                 total = total + aux_w * aux['total']
 
-        return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'], 'ciou': d['ciou'],
+        # DN (denoising) loss — key for fast DETR convergence.
+        # The decoder generates supervised DN outputs but they are wasted without
+        # this loss. Adds ~2-3x convergence speedup (same as DINO / RT-DETR).
+        if detr_out.dn_outputs is not None and detr_out.dn_meta is not None:
+            l_dn  = self._dn_loss(detr_out.dn_outputs, targets, detr_out.dn_meta,
+                                   num_boxes=num_boxes)
+            total = total + self.lambda_dn * l_dn
+
+        return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'], 'giou': d['giou'],
                 'indices': indices}
+
+    def _dn_loss(
+        self,
+        dn_outputs: list,
+        targets:    List[dict],
+        dn_meta:    dict,
+        num_boxes:  int = 1,
+    ) -> Tensor:
+        """Compute denoising auxiliary loss across all DN decoder layers."""
+        dn_positive_idx = dn_meta['dn_positive_idx']   # list[Tensor] one per batch
+        dn_num_group    = dn_meta['dn_num_group']
+
+        # Build DN match indices (no Hungarian needed — DN construction fixes the mapping)
+        dn_indices = []
+        for b, pos_idx in enumerate(dn_positive_idx):
+            num_gt = len(targets[b]['labels'])
+            if num_gt > 0 and len(pos_idx) > 0:
+                gt_idx = torch.arange(num_gt, device=pos_idx.device).tile(dn_num_group)
+                dn_indices.append({'src_i': pos_idx, 'tgt_i': gt_idx})
+            else:
+                dev = targets[b]['labels'].device
+                dn_indices.append({
+                    'src_i': torch.zeros(0, dtype=torch.long, device=dev),
+                    'tgt_i': torch.zeros(0, dtype=torch.long, device=dev),
+                })
+
+        dn_num_boxes = max(num_boxes * dn_num_group, 1)
+        total_dn     = None
+        for layer_out in dn_outputs:
+            d = self._detr_layer_loss(
+                layer_out['pred_logits'], layer_out['pred_boxes'],
+                targets, dn_indices, num_boxes=dn_num_boxes,
+            )
+            total_dn = d['total'] if total_dn is None else total_dn + d['total']
+
+        return (total_dn / len(dn_outputs)) if total_dn is not None else \
+               dn_outputs[0]['pred_logits'].sum() * 0.0
 
     # ── Consistency loss ───────────────────────────────────────────────────────
 
@@ -459,7 +515,7 @@ class HybridLoss(nn.Module):
             'loss_s2':   s2['total'],
             'loss_cls':  s2['cls'],
             'loss_bbox': s2['bbox'],
-            'loss_ciou': s2['ciou'],
+            'loss_giou': s2['giou'],
             'w_s1':      torch.tensor(eff_s1, device=dev),
             'w_s2':      torch.tensor(eff_s2, device=dev),
         }

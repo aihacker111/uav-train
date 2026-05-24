@@ -33,7 +33,7 @@ class HybridTrainer(BaseTrainer):
         loss_stats = [
             'loss',
             'loss_s1', 'loss_hm', 'loss_wh', 'loss_reg',
-            'loss_s2', 'loss_cls', 'loss_bbox', 'loss_ciou',
+            'loss_s2', 'loss_cls', 'loss_bbox', 'loss_giou',
             'loss_consist',
             'w_s1', 'w_s2',    # effective stage weights — monitor curriculum progress
         ]
@@ -49,8 +49,10 @@ class HybridTrainer(BaseTrainer):
             num_classes           = opt.num_classes,
             lambda_wh             = getattr(opt, 'wh_weight',             0.1),
             lambda_reg            = getattr(opt, 'off_weight',             1.0),
-            lambda_bbox           = getattr(opt, 'bbox_weight',            2.0),
+            lambda_bbox           = getattr(opt, 'bbox_weight',            5.0),
             lambda_ciou           = getattr(opt, 'giou_weight',            2.0),
+            lambda_dn             = getattr(opt, 'dn_weight',              1.0),
+            mal_gamma             = getattr(opt, 'mal_gamma',              1.5),
             lambda_reid           = getattr(opt, 'id_weight',              1.0),
             lambda_triplet        = getattr(opt, 'triplet_weight',         0.5),
             lambda_consist        = getattr(opt, 'consist_weight',         0.05),

@@ -240,6 +240,8 @@ class HybridECDet(nn.Module):
             reid       = reid,
             boxes_all  = boxes_all,
             logits_all = logits_all,
+            dn_outputs = ec_out.get('dn_outputs', None),
+            dn_meta    = ec_out.get('dn_meta',    None),
         )
 
     def load_pretrained(self, path: str) -> None:
