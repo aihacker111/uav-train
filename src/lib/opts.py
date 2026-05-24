@@ -975,6 +975,11 @@ class opts(object):
 
         opt.reg_offset = not opt.not_reg_offset
 
+        import torch
+        if not torch.cuda.is_available() and 'cuda' in opt.device:
+            print(f'[opts] CUDA not available, falling back device {opt.device!r} → cpu')
+            opt.device = 'cpu'
+
         opt.pad = 31
         opt.num_stacks = 1
 
