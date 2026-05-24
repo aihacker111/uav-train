@@ -3,23 +3,20 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+from typing import Any, Dict, List, Optional
+
+import PIL
+import PIL.Image
 import torch
 import torch.nn as nn
-
 import torchvision
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as F
 
-import PIL
-import PIL.Image
-
-from typing import Any, Dict, List, Optional
-
-from .._misc import convert_to_tv_tensor, _boxes_keys
-from .._misc import Image, Video, Mask, BoundingBoxes
-from .._misc import SanitizeBoundingBoxes
-
 from ...core import register
+from .._misc import (BoundingBoxes, Image, Mask, SanitizeBoundingBoxes, Video,
+                     _boxes_keys, convert_to_tv_tensor)
+
 torchvision.disable_beta_transforms_warning()
 
 
@@ -66,7 +63,7 @@ class PadToSize(T.Pad):
         self.size = size
         super().__init__(0, fill, padding_mode)
 
-    def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+    def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         fill = self._fill[type(inpt)]
         padding = params['padding']
         return F.pad(inpt, padding=padding, fill=fill, padding_mode=self.padding_mode)  # type: ignore[arg-type]
@@ -101,7 +98,7 @@ class ConvertBoxes(T.Transform):
         self.fmt = fmt
         self.normalize = normalize
 
-    def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+    def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         spatial_size = getattr(inpt, _boxes_keys[1])
         if self.fmt:
             in_fmt = inpt.format.value.lower()
@@ -124,7 +121,7 @@ class ConvertPILImage(T.Transform):
         self.dtype = dtype
         self.scale = scale
 
-    def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+    def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         inpt = F.pil_to_tensor(inpt)
         if self.dtype == 'float32':
             inpt = inpt.float()

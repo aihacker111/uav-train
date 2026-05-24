@@ -3,23 +3,24 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
-from sympy import im
+import os
+from typing import Callable, Optional
+
 import torch
 import torchvision
 import torchvision.transforms.functional as TVF
-
-import os
 from PIL import Image
-from typing import Optional, Callable
+from sympy import im
 
 try:
     from defusedxml.ElementTree import parse as ET_parse
 except ImportError:
     from xml.etree.ElementTree import parse as ET_parse
 
-from ._dataset import DetDataset
-from .._misc import convert_to_tv_tensor
 from ...core import register
+from .._misc import convert_to_tv_tensor
+from ._dataset import DetDataset
+
 
 @register()
 class VOCDetection(torchvision.datasets.VOCDetection, DetDataset):

@@ -3,12 +3,11 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
-import inspect
-import importlib
 import functools
+import importlib
+import inspect
 from collections import defaultdict
-from typing import Any, Dict, Optional, List
-
+from typing import Any, Dict, List, Optional
 
 GLOBAL_CONFIG = defaultdict(dict)
 
@@ -173,5 +172,7 @@ def create(type_or_name, global_cfg=GLOBAL_CONFIG, **kwargs):
     # extra_args = set(module_kwargs.keys()) - set(arg_names)
     # if len(extra_args) > 0:
     #     raise RuntimeError(f'Error: unknown args {extra_args} for {module}')
+    # print(module)
+    # print(module_kwargs.keys())
 
     return module(**module_kwargs)

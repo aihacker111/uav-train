@@ -3,10 +3,11 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+from typing import List, Tuple
+
 import torch
 import torchvision
 from torch import Tensor
-from typing import List, Tuple
 
 
 def generalized_box_iou(boxes1: Tensor, boxes2: Tensor) -> Tensor:

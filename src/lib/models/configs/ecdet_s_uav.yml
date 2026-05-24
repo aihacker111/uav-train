@@ -1,0 +1,61 @@
+# ECDet-S config for HybridECDet UAV training.
+# Self-contained (no __include__): merges ecdet.yml base + ecdet_s.yml overrides.
+# Dataset / optimizer / dataloader sections are omitted — handled by uav-train's
+# own pipeline (train.py / hybrid.py).
+#
+# weights_path is set to null so the backbone starts from random init;
+# load pretrained weights at runtime via --backbone_weights or model.load_pretrained().
+# num_classes is overridden by create_model() to match the dataset.
+
+task: detection
+model: ECDet
+
+ECDet:
+  backbone: ViTAdapter
+  encoder: HybridEncoder
+  decoder: ECTransformer
+
+ViTAdapter:
+  name: ecvitt
+  embed_dim: 192
+  num_heads: 3
+  interaction_indexes: [10, 11]
+  weights_path: pretrained_model/ecvitt.pth
+
+HybridEncoder:
+  in_channels: [192, 192, 192]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 192
+  use_encoder_idx: [2]
+  num_encoder_layers: 1
+  nhead: 8
+  dim_feedforward: 512
+  dropout: 0.
+  expansion: 0.34
+  depth_mult: 0.67
+  act: silu
+  csp_type: csp2
+  fuse_op: sum
+
+ECTransformer:
+  feat_channels: [192, 192, 192]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 192
+  num_levels: 3
+  num_layers: 4
+  eval_idx: -1
+  num_queries: 300
+  num_classes: 10
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  reg_max: 32
+  reg_scale: 4
+  layer_scale: 1
+  num_points: [3, 6, 3]
+  cross_attn_method: default
+  query_select_method: default
+  activation: silu
+  dim_feedforward: 512
+
+eval_spatial_size: [512, 832]

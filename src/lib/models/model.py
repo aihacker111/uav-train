@@ -14,14 +14,11 @@ def create_model(arch: str, heads: dict, head_conv: int,
     """
     Instantiate a model by architecture string.
 
-    For hybrid architectures, pass --deim_config pointing to a DEIM-UAV YAML
-    (e.g. configs/deim-uav/deimv2_hgnetv2_s_coco.yml).  The factory:
-      1. Loads the YAML via DEIMv2's YAMLConfig / registry system.
-      2. Overrides num_classes in the decoder to match the dataset.
-      3. Wraps the resulting DEIM model in HybridDEIM.
-
-    opt can be supplied either via heads['__opt__'] (train.py convention) or
-    directly as the opt= keyword argument (tracker / inference callers).
+    For hybrid architectures, pass --ecdet_config pointing to an ECDet YAML
+    (e.g. lib/models/configs/ecdet_s_uav.yml).  The factory:
+      1. Loads the YAML via EdgeCrafter's YAMLConfig / registry system.
+      2. Overrides num_classes in ECTransformer to match the dataset.
+      3. Wraps the resulting ECDet model in HybridECDet.
     """
     if 'hybrid' not in arch:
         raise NotImplementedError(
@@ -30,47 +27,51 @@ def create_model(arch: str, heads: dict, head_conv: int,
         )
 
     opt = (heads.get('__opt__') if isinstance(heads, dict) else None) or opt
-    deim_config = getattr(opt, 'deim_config', '') if opt else ''
-    if not deim_config:
+    ecdet_config = getattr(opt, 'ecdet_config', '') if opt else ''
+    if not ecdet_config:
         raise ValueError(
-            "--deim_config is required for hybrid architectures. "
-            "Example: --deim_config configs/deim-uav/deimv2_hgnetv2_s_coco.yml"
+            "--ecdet_config is required for hybrid architectures. "
+            "Example: --ecdet_config lib/models/configs/ecdet_s_uav.yml"
         )
 
-    # Ensure src/lib/models/ is on sys.path so `import engine` resolves correctly
-    _models = os.path.dirname(os.path.abspath(__file__))
-    if _models not in sys.path:
-        sys.path.insert(0, _models)
+    # Add src/lib/models/ to sys.path so `engine` package (copied from EdgeCrafter)
+    # is importable and its @register() decorators fire.
+    _models_dir = os.path.dirname(os.path.abspath(__file__))
+    if _models_dir not in sys.path:
+        sys.path.insert(0, _models_dir)
 
-    import engine  # triggers all @register() decorators
     from engine.core import YAMLConfig
 
-    cfg = YAMLConfig(deim_config)
+    cfg = YAMLConfig(ecdet_config)
 
-    # Override decoder num_classes to match the dataset (COCO=80, VisDrone=7)
-    for cls_name in ('DEIMTransformer', 'DFINETransformer', 'RTDETRTransformerv2'):
-        if cls_name in cfg.global_cfg:
-            cfg.global_cfg[cls_name]['num_classes'] = num_classes
+    # Override ECTransformer num_classes to match the dataset (COCO=80, VisDrone=10)
+    if 'ECTransformer' in cfg.yaml_cfg:
+        cfg.yaml_cfg['ECTransformer']['num_classes'] = num_classes
 
-    deim_model = cfg.model   # DEIM(backbone, encoder, decoder) fully built
+    ecdet_model = cfg.model   # ECDet(backbone=ECViT, encoder=HybridEncoder, decoder=ECTransformer)
 
-    # Extract encoder hidden_dim for the CenterNet upsample head
-    enc_key = next(
-        (k for k in ('HybridEncoder', 'LiteEncoder') if k in cfg.yaml_cfg), None
-    )
-    hidden_dim = cfg.yaml_cfg[enc_key].get('hidden_dim', 256) if enc_key else 256
+    encoder_cfg = cfg.yaml_cfg.get('HybridEncoder', {})
 
-    from lib.models.networks.deim_uav.model import HybridDEIM
-    return HybridDEIM(
-        deim=deim_model,
+    # hidden_dim: encoder output channels (default 256)
+    hidden_dim = encoder_cfg.get('hidden_dim', 256)
+
+    # backbone_s8_channels: ECViT output channels at S8 — equals HybridEncoder
+    # in_channels[0] since the encoder directly consumes backbone S8 output.
+    # Falls back to 192 (ECViT embed_dim default) when in_channels is absent.
+    backbone_s8_channels = encoder_cfg.get('in_channels', [192])[0]
+
+    from lib.models.networks.ecdet_uav.ec_model import HybridECDet
+    return HybridECDet(
+        ecdet=ecdet_model,
         num_classes=num_classes,
         hidden_dim=hidden_dim,
+        backbone_s8_channels=backbone_s8_channels,
         head_conv=head_conv,
         reid_dim=reid_dim,
     )
 
 
-# ── Weight loading ─────────────────────────────────────────────────────────────
+# ── Weight loading ──────────────────────────────────────────────────────────────
 
 def load_model(
     model:      nn.Module,
@@ -101,7 +102,7 @@ def load_model(
     model_state = model.state_dict()
     for k, v in state_dict.items():
         if k in model_state and v.shape != model_state[k].shape:
-            print(f'  [skip] {k}: ckpt {v.shape} ≠ model {model_state[k].shape}')
+            print(f'  [skip] {k}: ckpt {v.shape} != model {model_state[k].shape}')
             state_dict[k] = model_state[k]
 
     for k in model_state:
@@ -121,7 +122,7 @@ def load_model(
             n_ckpt = len(ckpt_opt.get('param_groups', []))
             if n_cur != n_ckpt:
                 print(f'  [warn] checkpoint has {n_ckpt} param groups, '
-                      f'current optimizer has {n_cur} — keeping first {n_cur}')
+                      f'current optimizer has {n_cur} -- keeping first {n_cur}')
                 kept_groups    = ckpt_opt['param_groups'][:n_cur]
                 kept_param_ids = {pid for g in kept_groups for pid in g['params']}
                 ckpt_opt = {
@@ -133,10 +134,8 @@ def load_model(
             optimizer.load_state_dict(ckpt_opt)
             start_epoch = checkpoint['epoch']
 
-            if use_cosine:
-                target_ref_lr = lr
-            else:
-                target_ref_lr = lr
+            target_ref_lr = lr
+            if not use_cosine:
                 for step in lr_step or []:
                     if start_epoch >= step:
                         target_ref_lr *= 0.1
@@ -148,13 +147,13 @@ def load_model(
             print(f'  resumed optimizer  epoch={start_epoch}  lrs=[{lrs_str}]'
                   f'  (cosine={use_cosine})')
         else:
-            print('  [warn] no optimizer state in checkpoint — starting optimizer fresh')
+            print('  [warn] no optimizer state in checkpoint -- starting optimizer fresh')
 
     if loss is not None and 'loss_state' in checkpoint:
         loss.load_state_dict(checkpoint['loss_state'])
         print('  restored loss state')
     elif loss is not None and resume:
-        print('  [warn] no loss_state in checkpoint — loss starts fresh')
+        print('  [warn] no loss_state in checkpoint -- loss starts fresh')
 
     if optimizer is not None:
         return model, optimizer, checkpoint.get('epoch', 0)

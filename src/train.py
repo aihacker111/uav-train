@@ -192,35 +192,43 @@ def run(opt):
 
     if rank == 0:
         print('Creating model...')
-    # Pass opt via sentinel key so hybrid create_model can wire grad_checkpoint
-    # and top_down_fusion without changing the public create_model signature.
+    # Pass opt via sentinel key so hybrid create_model can read grad_checkpoint
+    # and ecdet_config without changing the public create_model signature.
     _heads = dict(opt.heads, **{'__opt__': opt}) if opt.task == 'hybrid' else opt.heads
     model = create_model(opt.arch, _heads, opt.head_conv,
                          reid_dim=getattr(opt, 'reid_dim', 256),
                          num_classes=opt.num_classes)
 
-    # Build optimizer: 3-way split for HybridDEIM (backbone / norm / rest)
-    if 'hybrid' in opt.arch and hasattr(model, 'deim'):
-        backbone_params, norm_params, rest_params = [], [], []
+    # Build optimizer: 4-way split for HybridECDet (backbone / norm / encoder / rest)
+    if 'hybrid' in opt.arch and hasattr(model, 'ecdet'):
+        backbone_params, norm_params, encoder_params, rest_params = [], [], [], []
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
             in_norm     = any(x in name for x in ('.bn.', '.norm.', 'bn.weight', 'bn.bias',
                                                    'norm.weight', 'norm.bias'))
-            in_backbone = name.startswith('deim.backbone')
+            in_backbone = name.startswith('ecdet.backbone')
+            in_encoder  = name.startswith('ecdet.encoder')
             if in_norm:
                 norm_params.append(p)
             elif in_backbone:
                 backbone_params.append(p)
+            elif in_encoder:
+                encoder_params.append(p)
             else:
                 rest_params.append(p)
-        _blr = opt.lr * getattr(opt, 'backbone_lr_scale', 0.1)
+        _blr = opt.lr * getattr(opt, 'backbone_lr_scale', 0.2)
+        _elr = opt.lr * getattr(opt, 'encoder_lr_scale',  0.5)
+        _bwd = getattr(opt, 'backbone_wd',   0.01)
+        _wd  = getattr(opt, 'weight_decay',  1e-4)
         optimizer = torch.optim.AdamW([
-            {'params': backbone_params, 'lr': _blr,   'weight_decay': 0.01},
+            {'params': backbone_params, 'lr': _blr,   'weight_decay': _bwd},
             {'params': norm_params,     'lr': opt.lr, 'weight_decay': 0.0},
-            {'params': rest_params,     'lr': opt.lr, 'weight_decay': 0.0001},
+            {'params': encoder_params,  'lr': _elr,   'weight_decay': _wd},
+            {'params': rest_params,     'lr': opt.lr, 'weight_decay': _wd},
         ], betas=(0.9, 0.999))
-        print(f'AdamW 3-group: backbone lr={_blr:.2e}, norm wd=0, rest lr={opt.lr:.2e}')
+        print(f'AdamW 4-group: backbone lr={_blr:.2e} wd={_bwd}, norm wd=0, '
+              f'encoder lr={_elr:.2e} wd={_wd}, rest lr={opt.lr:.2e} wd={_wd}')
     else:
         optimizer = torch.optim.Adam(model.parameters(), opt.lr)
 
@@ -295,10 +303,10 @@ def run(opt):
     _freeze_epochs     = getattr(opt, 'freeze_backbone_epochs', 0)
     _backbone_frozen   = False
 
-    # HybridDEIM: backbone lives at model.deim.backbone; fallback to model.backbone
+    # HybridECDet: backbone lives at model.ecdet.backbone; fallback to model.backbone
     def _get_backbone(m):
-        if hasattr(m, 'deim') and hasattr(m.deim, 'backbone'):
-            return m.deim.backbone
+        if hasattr(m, 'ecdet') and hasattr(m.ecdet, 'backbone'):
+            return m.ecdet.backbone
         return getattr(m, 'backbone', None)
 
     # Apply backbone freeze if we are resuming mid-freeze

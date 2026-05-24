@@ -1,5 +1,5 @@
 """
-CenterNetAuxLoss: lightweight auxiliary loss for the CenterNet head in HybridDEIM.
+CenterNetAuxLoss: lightweight auxiliary loss for the CenterNet head in HybridECDet.
 
 Expected target keys in the batch dict (CenterNet format — identical to Stage-1
 targets used by HybridLoss, so the same dataloader produces both):
@@ -23,22 +23,22 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .hybrid_loss import centernet_focal_loss, _gather_at_ind
-from ..networks.deim_uav.heads import CenterNetOutput
+from ..networks.ecdet_uav.heads import CenterNetOutput
 
 
 class CenterNetAuxLoss(nn.Module):
     """
-    Auxiliary CenterNet loss used alongside DEIMCriterion in HybridDEIM training.
+    Auxiliary CenterNet loss for the Stage-1 head in HybridECDet training.
 
     Args:
         wh_weight  : Weight for the width/height SmoothL1 term (default 0.1,
-                     kept small because DEIM's box head already handles size).
+                     kept small because ECDet's FDR head handles precise size).
         reg_weight : Weight for the sub-pixel offset SmoothL1 term (default 1.0).
     """
 
     def __init__(
         self,
-        wh_weight:  float = 0.1,
+        wh_weight:  float = 0.5,
         reg_weight: float = 1.0,
     ) -> None:
         super().__init__()
@@ -52,7 +52,7 @@ class CenterNetAuxLoss(nn.Module):
     ) -> Dict[str, Tensor]:
         """
         Args:
-            cn_out  : CenterNetOutput from HybridDEIM.cn_head.
+            cn_out  : CenterNetOutput from HybridECDet.cn_head.
             targets : Batch dict with keys 'hm', 'wh', 'reg', 'ind', 'reg_mask'.
         Returns:
             Dict with per-term losses and 'cn_total'.

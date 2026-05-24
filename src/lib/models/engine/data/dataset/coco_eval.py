@@ -1,34 +1,44 @@
 """
+EdgeCrafter: Compact ViTs for Edge Dense Prediction via Task-Specialized Distillation
+Copyright (c) 2026 The EdgeCrafter Authors. All Rights Reserved.
+---------------------------------------------------------------------------------
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 COCO evaluator that works in distributed mode.
 Mostly copy-paste from https://github.com/pytorch/vision/blob/edfd5a7/references/detection/coco_eval.py
 The difference is that there is less copy-pasting from pycocotools
 in the end of the file, as python3 can suppress prints with contextlib
 """
-import os
 import contextlib
 import copy
-import numpy as np
-import torch
+import os
+import pickle
 
-from faster_coco_eval import COCO, COCOeval_faster
-import faster_coco_eval.core.mask as mask_util
+import numpy as np
+import pycocotools.mask as mask_util
+import torch
+import torch.distributed as dist
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
 from ...core import register
 from ...misc import dist_utils
+
 __all__ = ['CocoEvaluator',]
 
 
 @register()
 class CocoEvaluator(object):
-    def __init__(self, coco_gt, iou_types):
+    def __init__(self, coco_gt, iou_types, verbose=True):
         assert isinstance(iou_types, (list, tuple))
         coco_gt = copy.deepcopy(coco_gt)
         self.coco_gt : COCO = coco_gt
+        self.coco_gt.dataset.setdefault('info', {})
         self.iou_types = iou_types
+        self.labels = [cat['name'] for cat in coco_gt.loadCats(coco_gt.getCatIds())] if verbose else None
 
         self.coco_eval = {}
         for iou_type in iou_types:
-            self.coco_eval[iou_type] = COCOeval_faster(coco_gt, iouType=iou_type, print_function=print, separate_eval=True)
+            self.coco_eval[iou_type] = COCOeval(coco_gt, iouType=iou_type)
 
         self.img_ids = []
         self.eval_imgs = {k: [] for k in iou_types}
@@ -36,7 +46,7 @@ class CocoEvaluator(object):
     def cleanup(self):
         self.coco_eval = {}
         for iou_type in self.iou_types:
-            self.coco_eval[iou_type] = COCOeval_faster(self.coco_gt, iouType=iou_type, print_function=print, separate_eval=True)
+            self.coco_eval[iou_type] = COCOeval(self.coco_gt, iouType=iou_type)
         self.img_ids = []
         self.eval_imgs = {k: [] for k in self.iou_types}
 
@@ -52,21 +62,19 @@ class CocoEvaluator(object):
             # suppress pycocotools prints
             with open(os.devnull, 'w') as devnull:
                 with contextlib.redirect_stdout(devnull):
-                    coco_dt = self.coco_gt.loadRes(results) if results else COCO()
+                    coco_dt = COCO.loadRes(self.coco_gt, results) if results else COCO()
                     coco_eval.cocoDt = coco_dt
                     coco_eval.params.imgIds = list(img_ids)
-                    coco_eval.evaluate()
 
-            self.eval_imgs[iou_type].append(np.array(coco_eval._evalImgs_cpp).reshape(len(coco_eval.params.catIds), len(coco_eval.params.areaRng), len(coco_eval.params.imgIds)))
+                    img_ids, eval_imgs = evaluate(coco_eval)
+
+                    self.eval_imgs[iou_type].append(eval_imgs)
+
 
     def synchronize_between_processes(self):
         for iou_type in self.iou_types:
-            img_ids, eval_imgs = merge(self.img_ids, self.eval_imgs[iou_type])
-
-            coco_eval = self.coco_eval[iou_type]
-            coco_eval.params.imgIds = img_ids
-            coco_eval._paramsEval = copy.deepcopy(coco_eval.params)
-            coco_eval._evalImgs_cpp = eval_imgs
+            self.eval_imgs[iou_type] = np.concatenate(self.eval_imgs[iou_type], 2)
+            create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
 
     def accumulate(self):
         for coco_eval in self.coco_eval.values():
@@ -127,11 +135,12 @@ class CocoEvaluator(object):
             labels = prediction["labels"].tolist()
 
             rles = [
-                mask_util.encode(np.array(mask[0, :, :, np.newaxis], dtype=np.uint8, order="F"))[0]
+                mask_util.encode(np.array(mask.cpu()[0, :, :, np.newaxis], dtype=np.uint8, order="F"))[0]
                 for mask in masks
             ]
             for rle in rles:
                 rle["counts"] = rle["counts"].decode("utf-8")
+
 
             coco_results.extend(
                 [
@@ -173,28 +182,153 @@ class CocoEvaluator(object):
         return coco_results
 
 
+
+def create_common_coco_eval(coco_eval, img_ids, eval_imgs):
+    img_ids, eval_imgs = merge(img_ids, eval_imgs)
+    img_ids = list(img_ids)
+    eval_imgs = list(eval_imgs.flatten())
+
+    coco_eval.evalImgs = eval_imgs
+    coco_eval.params.imgIds = img_ids
+    coco_eval._paramsEval = copy.deepcopy(coco_eval.params)
+    
 def convert_to_xywh(boxes):
     xmin, ymin, xmax, ymax = boxes.unbind(1)
     return torch.stack((xmin, ymin, xmax - xmin, ymax - ymin), dim=1)
 
+
+def is_dist_avail_and_initialized():
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True
+
+
+def get_world_size():
+    if not is_dist_avail_and_initialized():
+        return 1
+    return dist.get_world_size()
+
+def all_gather(data):
+    """
+    Run all_gather on arbitrary picklable data (not necessarily tensors)
+    Args:
+        data: any picklable object
+    Returns:
+        list[data]: list of data gathered from each rank
+    """
+    world_size = get_world_size()
+    if world_size == 1:
+        return [data]
+
+    # serialized to a Tensor
+    buffer = pickle.dumps(data)
+    storage = torch.ByteStorage.from_buffer(buffer)
+    tensor = torch.ByteTensor(storage).to("cuda")
+
+    # obtain Tensor size of each rank
+    local_size = torch.tensor([tensor.numel()], device="cuda")
+    size_list = [torch.tensor([0], device="cuda") for _ in range(world_size)]
+    dist.all_gather(size_list, local_size)
+    size_list = [int(size.item()) for size in size_list]
+    max_size = max(size_list)
+
+    # receiving Tensor from all ranks
+    # we pad the tensor because torch all_gather does not support
+    # gathering tensors of different shapes
+    tensor_list = []
+    for _ in size_list:
+        tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device="cuda"))
+    if local_size != max_size:
+        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device="cuda")
+        tensor = torch.cat((tensor, padding), dim=0)
+    dist.all_gather(tensor_list, tensor)
+
+    data_list = []
+    for size, tensor in zip(size_list, tensor_list):
+        buffer = tensor.cpu().numpy().tobytes()[:size]
+        data_list.append(pickle.loads(buffer))
+
+    return data_list
+
 def merge(img_ids, eval_imgs):
-    all_img_ids = dist_utils.all_gather(img_ids)
-    all_eval_imgs = dist_utils.all_gather(eval_imgs)
+    """
+    img_ids: list[int]
+    eval_imgs: list[np.ndarray], each shape [numCats, numAreaRng, numImgs_rank]
+    """
+    all_img_ids = all_gather(img_ids)
+    all_eval_imgs = all_gather(eval_imgs)
 
-    merged_img_ids = []
-    for p in all_img_ids:
-        merged_img_ids.extend(p)
+    merged = {}
 
-    merged_eval_imgs = []
-    for p in all_eval_imgs:
-        merged_eval_imgs.extend(p)
+    for ids_rank, evals_rank in zip(all_img_ids, all_eval_imgs):
+        for i, img_id in enumerate(ids_rank):
+            # evals_rank[..., i] is shape [numCats, numAreaRng]
+            if img_id not in merged:
+                merged[img_id] = evals_rank[..., i]
+
+    merged_img_ids = np.array(list(merged.keys()))
+    merged_eval_imgs = np.stack(list(merged.values()), axis=2)
+
+    return merged_img_ids, merged_eval_imgs
 
 
-    merged_img_ids = np.array(merged_img_ids)
-    merged_eval_imgs = np.concatenate(merged_eval_imgs, axis=2).ravel()
-    # merged_eval_imgs = np.array(merged_eval_imgs).T.ravel()
 
-    # keep only unique (and in sorted order) images
-    merged_img_ids, idx = np.unique(merged_img_ids, return_index=True)
 
-    return merged_img_ids.tolist(), merged_eval_imgs.tolist()
+#################################################################
+# From pycocotools, just removed the prints and fixed
+# a Python3 bug about unicode not defined
+#################################################################
+
+
+def evaluate(self):
+    '''
+    Run per image evaluation on given images and store results (a list of dict) in self.evalImgs
+    :return: None
+    '''
+    # tic = time.time()
+    # print('Running per image evaluation...')
+    p = self.params
+    # add backward compatibility if useSegm is specified in params
+    if p.useSegm is not None:
+        p.iouType = 'segm' if p.useSegm == 1 else 'bbox'
+        print('useSegm (deprecated) is not None. Running {} evaluation'.format(p.iouType))
+    # print('Evaluate annotation type *{}*'.format(p.iouType))
+    p.imgIds = list(np.unique(p.imgIds))
+    if p.useCats:
+        p.catIds = list(np.unique(p.catIds))
+    p.maxDets = sorted(p.maxDets)
+    self.params = p
+
+    self._prepare()
+    # loop through images, area range, max detection number
+    catIds = p.catIds if p.useCats else [-1]
+
+    if p.iouType == 'segm' or p.iouType == 'bbox':
+        computeIoU = self.computeIoU
+    elif p.iouType == 'keypoints':
+        computeIoU = self.computeOks
+    self.ious = {
+        (imgId, catId): computeIoU(imgId, catId)
+        for imgId in p.imgIds
+        for catId in catIds}
+
+    evaluateImg = self.evaluateImg
+    maxDet = p.maxDets[-1]
+    evalImgs = [
+        evaluateImg(imgId, catId, areaRng, maxDet)
+        for catId in catIds
+        for areaRng in p.areaRng
+        for imgId in p.imgIds
+    ]
+    # this is NOT in the pycocotools code, but could be done outside
+    evalImgs = np.asarray(evalImgs).reshape(len(catIds), len(p.areaRng), len(p.imgIds))
+    self._paramsEval = copy.deepcopy(self.params)
+    # toc = time.time()
+    # print('DONE (t={:0.2f}s).'.format(toc-tic))
+    return p.imgIds, evalImgs
+
+#################################################################
+# end of straight copy from pycocotools, just removing the prints
+#################################################################

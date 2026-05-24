@@ -590,7 +590,7 @@ class opts(object):
         self.parser = argparse.ArgumentParser()
 
         # basic experiment setting
-        self.parser.add_argument('--task', default='mot', help='mot | hybrid')
+        self.parser.add_argument('--task', default='hybrid', help='hybrid')
         self.parser.add_argument('--dataset', default='jde', help='jde')
         self.parser.add_argument('--exp_id', default='default')
         self.parser.add_argument('--test', action='store_true')
@@ -633,30 +633,22 @@ class opts(object):
                                  help='disable progress bar and print to screen.')
         self.parser.add_argument('--hide_data_time', action='store_true',
                                  help='not display time during training.')
-        self.parser.add_argument('--save_all', action='store_true',
-                                 help='save model to disk every 5 epochs.')
-        self.parser.add_argument('--metric', default='loss',
-                                 help='main metric to save best model')
-        self.parser.add_argument('--vis_thresh', type=float, default=0.5,
-                                 help='visualization threshold.')
 
         # model: backbone and so on...
         self.parser.add_argument('--arch',
-                                 default='hybrid_deim',
+                                 default='hybrid_ecdet',
                                  help='model architecture string; any value containing '
-                                      '"hybrid" activates the HybridDEIM path.')
-        self.parser.add_argument('--deim_config',
+                                      '"hybrid" activates the HybridECDet path.')
+        self.parser.add_argument('--ecdet_config',
                                  type=str,
                                  default='',
-                                 help='Path to DEIM-UAV YAML config '
-                                      '(e.g. configs/deim-uav/deimv2_hgnetv2_s_coco.yml). '
+                                 help='Path to ECDet YAML config '
+                                      '(e.g. EdgeCrafter/ecdetseg/configs/ecdet_s_uav.yml). '
                                       'Required for hybrid architectures.')
         self.parser.add_argument('--head_conv',
                                  type=int,
-                                 default=-1,
-                                 help='conv layer channels for output head'
-                                      '0 for no conv layer'
-                                      '-1 for default setting: 256.')
+                                 default=256,
+                                 help='conv layer channels for output head. 0 for no conv layer.')
         self.parser.add_argument('--backbone_lr_scale',
                                  type=float,
                                  default=0.2,
@@ -678,26 +670,11 @@ class opts(object):
                                  help='Enable gradient checkpointing on the ViT backbone. '
                                       'Reduces backbone VRAM by ~50%% to allow larger batch '
                                       'sizes on memory-constrained GPUs. Cost: ~20%% slower backward.')
-        self.parser.add_argument('--num_output_levels',
-                                 type=int,
-                                 default=1,
-                                 help='Number of feature pyramid levels emitted by MultiScaleNeck '
-                                      'to the DETR decoder (1=single-scale P4, 2=P4+P5, 3=P4+P5+P6). '
-                                      'Level 1 is pretrained-compatible. Level >1 changes decoder '
-                                      'attention shape so cross-attention restarts from scratch.')
-        self.parser.add_argument('--top_down_fusion',
-                                 action='store_true',
-                                 default=False,
-                                 help='Enable FPN top-down fusion in MultiScaleNeck. '
-                                      'REQUIRES --num_output_levels > 1 to have any effect. '
-                                      'Adds a lateral 1x1 conv from each coarser level back to '
-                                      'the finer level, giving finer features global context.')
         self.parser.add_argument('--down_ratio',
                                  type=int,
-                                 default=4,  # 输出特征图的下采样率 H=H_image/4 and W=W_image/4
-                                 help='output stride. Currently only supports 4.')
-        
-        self.parser.add_argument('--seg_feat_channel', default=8, type=int, help='.')
+                                 default=4,
+                                 help='CenterNet output stride (always 4 for HybridECDet). '
+                                      'Used to compute output_h/w from input_h/w.')
         
 
         # input
@@ -731,10 +708,10 @@ class opts(object):
                                       'none:   no scaling (manual tuning).')
         self.parser.add_argument('--base_batch_size',
                                  type=int,
-                                 default=16,
+                                 default=4,
                                  help='Reference batch size the base --lr was tuned for '
-                                      '(single GPU). Match this to your single-GPU --batch_size. '
-                                      'Used by --lr_scale for multi-GPU LR adjustment.')
+                                      '(single GPU). Must match --batch_size default to avoid '
+                                      'unintended LR scaling on single-GPU runs.')
         self.parser.add_argument('--lr_step',
                                  type=str,
                                  default='10, 20',
@@ -758,11 +735,6 @@ class opts(object):
                                  type=int,
                                  default=30,  # 30, 10, 3, 1
                                  help='total training epochs.')
-        self.parser.add_argument('--close_mosaic_epochs',
-                                 type=int,
-                                 default=10,
-                                 help='Disable Mosaic/MixUp/Perspective in the last N epochs '
-                                      '(YOLOv5/v8 close-mosaic trick). 0 = never disable.')
         self.parser.add_argument('--batch_size',
                                  type=int,
                                  default=4,  # 1920×1088: 4 per GPU (24GB); 1088×640: 8-12 per GPU
@@ -770,34 +742,40 @@ class opts(object):
                                       'ZR10 1920×1088: use 4 (24GB GPU) or 2 (16GB GPU). '
                                       'ZR10 1088×640 tracking: use 8-12.')
 
-        self.parser.add_argument('--master_batch_size', type=int, default=-1,
-                                 help='batch size on the master gpu.')
         self.parser.add_argument('--num_iters', type=int, default=-1,
                                  help='default: #samples / batch_size.')
         self.parser.add_argument('--use_imagenet_norm',
                                  action='store_true',
-                                 default=False,
+                                 default=True,
                                  help='Apply ImageNet mean/std normalization (mean=[0.485,0.456,0.406], '
-                                      'std=[0.229,0.224,0.225]). Enable for ViT/DEIM backbones pretrained '
-                                      'with ImageNet norm. Leave off for backbones trained on [0,1] only.')
+                                      'std=[0.229,0.224,0.225]). Always True for ECDet/ECViT backbone. '
+                                      'Use --no-use_imagenet_norm only for [0,1]-only backbones.')
         self.parser.add_argument('--use_amp',
                                  action='store_true',
                                  default=False,
                                  help='Enable Automatic Mixed Precision (fp16 forward + fp32 '
                                       'weights). Gives ~1.5-2x training speedup and ~50%% VRAM '
                                       'reduction with negligible accuracy loss. Requires CUDA.')
-        self.parser.add_argument('--compile_model',
-                                 action='store_true',
-                                 default=False,
-                                 help='Apply torch.compile(mode=reduce-overhead) to the model '
-                                      'at inference. First frame is slow (compilation), subsequent '
-                                      'frames are 1.5-3x faster. Requires PyTorch >= 2.0.')
         self.parser.add_argument('--grad_clip',
                                  type=float,
                                  default=0.1,
                                  help='Max gradient norm for gradient clipping. '
                                       '0.1 protects ViT backbone from gradient explosion. '
                                       'Set to 0.0 to disable.')
+        self.parser.add_argument('--weight_decay',
+                                 type=float,
+                                 default=1e-4,
+                                 help='AdamW weight decay for encoder and head param groups.')
+        self.parser.add_argument('--backbone_wd',
+                                 type=float,
+                                 default=0.01,
+                                 help='AdamW weight decay for backbone param group. '
+                                      'Higher than head WD as backbone has stronger regularization.')
+        self.parser.add_argument('--encoder_lr_scale',
+                                 type=float,
+                                 default=0.5,
+                                 help='LR multiplier for encoder param group relative to head LR. '
+                                      '0.5 lets encoder adapt slower than heads but faster than backbone.')
         self.parser.add_argument('--val_intervals', type=int, default=5,
                                  help='number of epochs to run validation.')
         self.parser.add_argument('--trainval',
@@ -805,29 +783,20 @@ class opts(object):
                                  help='include validation in training and '
                                       'test on test set')
 
-        # test
+        # test / evaluation
+        self.parser.add_argument('--score_thr',
+                                 type=float,
+                                 default=0.3,
+                                 help='Detection score threshold used during val evaluation '
+                                      '(HybridTrainer.evaluate). Predictions below this are ignored.')
         self.parser.add_argument('--K',
                                  type=int,
                                  default=200,  # 128
                                  help='max number of output objects.')  # 一张图输出检测目标最大数量
-        self.parser.add_argument('--not_prefetch_test',
-                                 action='store_true',
-                                 help='not use parallal data pre-processing.')
-        self.parser.add_argument('--fix_res',
-                                 action='store_true',
-                                 help='fix testing resolution or keep '
-                                      'the original resolution')
         self.parser.add_argument('--keep_res',
                                  action='store_true',
                                  help='keep the original resolution'
                                       ' during validation.')
-        # tracking
-        # tracking
-        self.parser.add_argument(
-            '--test_uavdt', default=False, help='test_visdrone')
-        self.parser.add_argument(
-            '--test_visdrone', default=True, help='test_visdrone')
-
         self.parser.add_argument(
             '--conf_thres',
             type=float,
@@ -844,42 +813,6 @@ class opts(object):
                                  default=0.4,
                                  help='iou thresh for nms')
 
-        self.parser.add_argument('--track_buffer',
-                                 type=int,
-                                 default=30,  # 30
-                                 help='tracking buffer')
-        self.parser.add_argument('--min-box-area',
-                                 type=float,
-                                 default=100,
-                                 help='filter out tiny boxes')
-
-        # 测试阶段的输入数据模式: video or image dir
-        self.parser.add_argument('--input-mode',
-                                 type=str,
-                                 default='video',  # video or image_dir or img_path_list_txt
-                                 help='input data type(video or image dir)')
-
-        # 输入的video文件路径
-        self.parser.add_argument('--input-video',
-                                 type=str,
-                                 default='../videos/uav_339.mp4',
-                                 help='path to the input video')
-
-        # 输入的image目录
-        self.parser.add_argument('--input-img',
-                                 type=str,
-                                 default='/users/duanyou/c5/all_pretrain/test.txt',  # ../images/
-                                 help='path to the input image directory or image file list(.txt)')
-
-        self.parser.add_argument('--output-format',
-                                 type=str,
-                                 default='video',
-                                 help='video or text')
-        self.parser.add_argument('--output-root',
-                                 type=str,
-                                 default='../results',
-                                 help='expected output root path')
-
         # mot: 选择数据集的配置文件
         self.parser.add_argument('--data_cfg', type=str,
                                  default='../src/lib/cfg/visdrone.json',  # 'mcmot_det.json', 'visdrone.json'
@@ -891,43 +824,50 @@ class opts(object):
                                  type=str,
                                  default='/media/jianbo/ioe/UAVdata')
 
-        # hybrid model loss weights
-        self.parser.add_argument('--bbox_weight', type=float, default=5.0,
-                                 help='DETR SmoothL1 box loss weight (hybrid task).')
+        # ── HybridLoss weights ────────────────────────────────────────────────────
+        self.parser.add_argument('--stage1_weight', type=float, default=2.0,
+                                 help='Initial curriculum weight for Stage-1 (CenterNet) loss. '
+                                      'Decays to 1.0 over training via cosine schedule. '
+                                      'High initial value lets heatmap converge before Stage-2 relies on it.')
+        self.parser.add_argument('--stage2_weight', type=float, default=0.3,
+                                 help='Initial curriculum weight for Stage-2 (DETR) loss. '
+                                      'Rises to stage1_weight over training. '
+                                      'Low initial value prevents noisy decoder from destabilising early training.')
+        self.parser.add_argument('--bbox_weight', type=float, default=2.0,
+                                 help='Stage-2 SmoothL1 bounding-box loss weight (lambda_bbox).')
         self.parser.add_argument('--giou_weight', type=float, default=2.0,
-                                 help='DETR CIoU loss weight (hybrid task).')
-        self.parser.add_argument('--cn_weight', type=float, default=0.5,
-                                 help='Weight for CenterNet stage-1 loss (hybrid task). '
-                                      'Combined loss = L_s2 + cn_weight * L_s1.')
+                                 help='Stage-2 CIoU loss weight (lambda_ciou).')
+        self.parser.add_argument('--consist_weight', type=float, default=0.05,
+                                 help='Stage-1/Stage-2 consistency loss weight. '
+                                      'Ramped from 0 → consist_weight over consist_warmup_epochs.')
+        self.parser.add_argument('--consist_warmup_epochs', type=int, default=5,
+                                 help='Epochs over which consistency loss ramps from 0 → consist_weight. '
+                                      'Prevents noisy epoch-0 Stage-2 matches from corrupting Stage-1 peaks.')
+        self.parser.add_argument('--triplet_weight', type=float, default=0.5,
+                                 help='Triplet loss weight within ReID loss. '
+                                      'L_reid = L_ce + triplet_weight * L_triplet.')
         self.parser.add_argument('--grad_accum', type=int, default=1,
                                  help='Gradient accumulation steps. Effective batch = '
                                       'batch_size * grad_accum. Use to simulate larger '
                                       'batches on memory-constrained hardware.')
+        self.parser.add_argument('--aux_loss',
+                                 default=True,
+                                 action=argparse.BooleanOptionalAction,
+                                 help='Compute auxiliary losses from intermediate DETR decoder layers. '
+                                      'Adds progressive-weight supervision to shallower layers. '
+                                      'Use --no-aux_loss to disable for faster but less stable training.')
 
-        # loss
-        self.parser.add_argument('--mse_loss',  # default: false
-                                 action='store_true',
-                                 help='use mse loss or focal loss to train '
-                                      'keypoint heatmaps.')
-        self.parser.add_argument('--reg_loss',
-                                 default='l1',
-                                 help='regression loss: sl1 | l1 | l2')  # sl1: smooth L1 loss
-        self.parser.add_argument('--hm_weight',
-                                 type=float,
-                                 default=1,
-                                 help='loss weight for keypoint heatmaps.')
-        self.parser.add_argument('--off_weight',
-                                 type=float,
-                                 default=1,
-                                 help='loss weight for keypoint local offsets.')
-
+        # ── Stage-1 (CenterNet) loss weights ─────────────────────────────────────
         self.parser.add_argument('--wh_weight',
                                  type=float,
                                  default=0.1,
-                                 help='loss weight for bounding box size.')
-        self.parser.add_argument('--id_loss',
-                                 default='ce',
-                                 help='reid loss: ce | triplet')
+                                 help='Stage-1 width/height regression loss weight (lambda_wh).')
+        self.parser.add_argument('--off_weight',
+                                 type=float,
+                                 default=1.0,
+                                 help='Stage-1 sub-pixel offset regression loss weight (lambda_reg).')
+
+        # ── ReID ──────────────────────────────────────────────────────────────────
         self.parser.add_argument('--id_weight',
                                  type=float,
                                  default=1,  # 0 for detection only and 1 for detection and re-id
@@ -976,18 +916,6 @@ class opts(object):
                                  default='0,1,2,3,4,5,6,7,8,9',  # '0,1,2,3,4' or '0,1,2,3,4,5,6,7,8,9'
                                  help='')  # the object classes need to do reid
 
-        self.parser.add_argument('--norm_wh', action='store_true',
-                                 help='L1(\hat(y) / y, 1) or L1(\hat(y), y)')
-        self.parser.add_argument('--dense_wh', action='store_true',
-                                 help='apply weighted regression near center or '
-                                      'just apply regression on center point.')
-        self.parser.add_argument('--cat_spec_wh',
-                                 action='store_true',
-                                 help='category specific bounding box size.')
-        self.parser.add_argument('--not_reg_offset',
-                                 action='store_true',
-                                 help='not regress local offset.')
-
         self.parser.add_argument("--local-rank",
                                  type=int,
                                  default=-1,
@@ -996,9 +924,6 @@ class opts(object):
         self.parser.add_argument('--save_dir_result',
                                  default='Lun_6_test_track_try',
                                  type=str)
-
-        self.parser.add_argument('--tri',
-                                 action='store_true')
 
         self.parser.add_argument('--use_repeat_sampling',
                                  action='store_true',
@@ -1025,29 +950,20 @@ class opts(object):
         opt.fix_res = not opt.keep_res
         print('Fix size testing.' if opt.fix_res else 'Keep resolution testing.')
 
-        opt.reg_offset = not opt.not_reg_offset
+        # ECViT backbone always requires ImageNet normalization.
+        if 'hybrid' in opt.arch:
+            opt.use_imagenet_norm = True
 
-        # Hybrid CenterNet head uses upsampled stride-4 feature → same down_ratio as MOT
-        # (CenterNetUpsampleNeck in model.py handles the stride-16 → stride-4 upsampling)
-
-        if opt.head_conv == -1:  # init default head_conv
-            opt.head_conv = 256 if 'dla' in opt.arch else 256
         opt.pad = 31
         opt.num_stacks = 1
 
         if opt.trainval:
             opt.val_intervals = 100000000
 
-        if opt.master_batch_size == -1:
-            opt.master_batch_size = opt.batch_size // len(opt.gpus)
-        rest_batch_size = (opt.batch_size - opt.master_batch_size)
-        opt.chunk_sizes = [opt.master_batch_size]
-        for i in range(len(opt.gpus) - 1):
-            slave_chunk_size = rest_batch_size // (len(opt.gpus) - 1)
-            if i < rest_batch_size % (len(opt.gpus) - 1):
-                slave_chunk_size += 1
-            opt.chunk_sizes.append(slave_chunk_size)
-        print('training chunk_sizes:', opt.chunk_sizes)
+        n = len(opt.gpus)
+        q, r = divmod(opt.batch_size, max(n, 1))
+        opt.chunk_sizes = [q + (1 if i < r else 0) for i in range(max(n, 1))]
+        print('chunk_sizes:', opt.chunk_sizes)
 
         opt.root_dir = os.path.join(os.path.dirname(__file__), '..', '..')
         opt.exp_dir = os.path.join(opt.root_dir, 'exp', opt.task)
@@ -1091,24 +1007,12 @@ class opts(object):
         opt.input_res = max(opt.input_h, opt.input_w)
         opt.output_res = max(opt.output_h, opt.output_w)
 
-        if opt.task == 'mot':
-            opt.heads = {'hm': opt.num_classes,
-                         'wh': 2 if not opt.cat_spec_wh else 2 * opt.num_classes,
-                         'id': opt.reid_dim}
-            if opt.reg_offset:
-                opt.heads.update({'reg': 2})
-            if opt.id_weight > 0:
-                opt.nID_dict = dataset.nID_dict
-
-        elif opt.task == 'hybrid':
-            # HybridCenterNetDETR builds its own heads from HybridModelConfig;
-            # heads dict is unused but populated to keep the pipeline uniform.
+        if opt.task == 'hybrid':
             opt.heads = {}
             if opt.id_weight > 0:
                 opt.nID_dict = dataset.nID_dict
-
         else:
-            raise ValueError(f'Unknown task: {opt.task!r}. Supported: mot | hybrid')
+            raise ValueError(f'Unknown task: {opt.task!r}. Only "hybrid" is supported.')
 
         print('heads: ', opt.heads)
         return opt

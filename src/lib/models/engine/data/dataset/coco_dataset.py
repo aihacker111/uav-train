@@ -1,24 +1,26 @@
 """
+EdgeCrafter: Compact ViTs for Edge Dense Prediction via Task-Specialized Distillation
+Copyright (c) 2026 The EdgeCrafter Authors. All Rights Reserved.
+---------------------------------------------------------------------------------
 Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
 
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+# import faster_coco_eval
+import pycocotools.mask as coco_mask
 import torch
 import torch.utils.data
-
 import torchvision
-
 from PIL import Image
-import faster_coco_eval
-import faster_coco_eval.core.mask as coco_mask
-from ._dataset import DetDataset
-from .._misc import convert_to_tv_tensor
+
 from ...core import register
+from .._misc import convert_to_tv_tensor
+from ._dataset import DetDataset
 
 torchvision.disable_beta_transforms_warning()
-faster_coco_eval.init_as_pycocotools()
+# faster_coco_eval.init_as_pycocotools()
 Image.MAX_IMAGE_PIXELS = None
 
 __all__ = ['CocoDetection']
@@ -41,7 +43,8 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
     def __getitem__(self, idx):
         img, target = self.load_item(idx)
         if self._transforms is not None:
-            img, target, _ = self._transforms(img, target, self)
+            self._transforms.set_epoch(self.epoch)
+            img, target = self._transforms(img, target)
         return img, target
 
     def load_item(self, idx):
@@ -160,7 +163,7 @@ class ConvertCocoPolysToMask(object):
         target["boxes"] = boxes
         target["labels"] = labels
         if self.return_masks:
-            target["masks"] = masks
+            target["masks"] = masks.bool()
         target["image_id"] = image_id
         if keypoints is not None:
             target["keypoints"] = keypoints
@@ -262,3 +265,4 @@ mscoco_category2name = {
 
 mscoco_category2label = {k: i for i, k in enumerate(mscoco_category2name.keys())}
 mscoco_label2category = {v: k for k, v in mscoco_category2label.items()}
+mscoco_label2name_remap80 = {i: k for i, k in enumerate(mscoco_category2name.values())}

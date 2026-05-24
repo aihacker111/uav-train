@@ -6,22 +6,21 @@ reference
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
-import os
-import time
-import random
-import numpy as np
 import atexit
+import os
+import random
+import time
 
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.distributed
 import torch.backends.cudnn
-
+import torch.distributed
+import torch.nn as nn
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
 from torch.utils.data import DistributedSampler
+
 # from torch.utils.data.dataloader import DataLoader
 from ..data import DataLoader
 
@@ -40,12 +39,12 @@ def setup_distributed(print_rank: int=0, print_method: str='builtin', seed: int=
         LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))
         WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
+        torch.cuda.set_device(LOCAL_RANK)
         # torch.distributed.init_process_group(backend=backend, init_method='env://')
         torch.distributed.init_process_group(init_method='env://')
-        torch.distributed.barrier()
-
-        rank = torch.distributed.get_rank()
-        torch.cuda.set_device(rank)
+        # torch.distributed.barrier()
+        
+        # rank = torch.distributed.get_rank()
         torch.cuda.empty_cache()
         enabled_dist = True
         if get_rank() == print_rank:
@@ -246,8 +245,9 @@ def setup_seed(seed: int, deterministic=False):
 
 # for torch.compile
 def check_compile():
-    import torch
     import warnings
+
+    import torch
     gpu_ok = False
     if torch.cuda.is_available():
         device_cap = torch.cuda.get_device_capability()

@@ -3,17 +3,19 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
-from torch.cuda.amp.grad_scaler import GradScaler
-from torch.utils.tensorboard import SummaryWriter
 
 from pathlib import Path
-from typing import Callable, List, Dict
+from typing import Callable, Dict, List
 
+import torch
+import torch.nn as nn
+from torch.cuda.amp.grad_scaler import GradScaler
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
+
+from ..misc.dist_utils import is_main_process
 
 __all__ = ['BaseConfig', ]
 
@@ -54,7 +56,7 @@ class BaseConfig(object):
         self.resume :str = None
         self.tuning :str = None
 
-        self.epoches :int = None
+        self.epochs :int = None
         self.last_epoch :int = -1
 
         self.lrsheduler: str = None
@@ -66,7 +68,7 @@ class BaseConfig(object):
         self.use_amp :bool = False
         self.use_ema :bool = False
         self.ema_decay :float = 0.9999
-        self.ema_warmups: int = 2000
+        self.default_ema_warmups: int = 2000
         self.sync_bn :bool = False
         self.clip_max_norm : float = 0.
         self.find_unused_parameters :bool = None
@@ -77,6 +79,7 @@ class BaseConfig(object):
         self.output_dir :str = None
         self.summary_dir :str = None
         self.device : str = ''
+        
 
     @property
     def model(self, ) -> nn.Module:
@@ -171,7 +174,7 @@ class BaseConfig(object):
     def ema(self, ) -> nn.Module:
         if self._ema is None and self.use_ema and self.model is not None:
             from ..optim import ModelEMA
-            self._ema = ModelEMA(self.model, self.ema_decay, self.ema_warmups)
+            self._ema = ModelEMA(self.model, self.ema_decay, self.default_ema_warmups)
         return self._ema
 
     @ema.setter
@@ -277,7 +280,7 @@ class BaseConfig(object):
 
     @property
     def writer(self) -> SummaryWriter:
-        if self._writer is None:
+        if self._writer is None and is_main_process():
             if self.summary_dir:
                 self._writer = SummaryWriter(self.summary_dir)
             elif self.output_dir:

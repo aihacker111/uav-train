@@ -1,6 +1,6 @@
 """
-DEIM: DETR with Improved Matching for Fast Convergence
-Copyright (c) 2024 The DEIM Authors. All Rights Reserved.
+EdgeCrafter: Compact ViTs for Edge Dense Prediction via Task-Specialized Distillation
+Copyright (c) 2026 The EdgeCrafter Authors. All Rights Reserved.
 """
 
 import math
@@ -24,7 +24,7 @@ def flat_cosine_schedule(total_iter, warmup_iter, flat_iter, no_aug_iter, curren
         float: Calculated learning rate.
     """
     if current_iter <= warmup_iter:
-        return init_lr * (current_iter / float(warmup_iter)) ** 2
+        return init_lr * (current_iter / float(warmup_iter)) ** 2 if warmup_iter > 0 else init_lr
     elif warmup_iter < current_iter <= flat_iter:
         return init_lr
     elif current_iter >= total_iter - no_aug_iter:
@@ -49,15 +49,15 @@ class FlatCosineLRScheduler:
         no_aug_epochs (int): Number of no-augmentation epochs.
     """
     def __init__(self, optimizer, lr_gamma, iter_per_epoch, total_epochs, 
-                 warmup_iter, flat_epochs, no_aug_epochs, scheduler_type="cosine"):
-        self.base_lrs = [group["initial_lr"] for group in optimizer.param_groups]
+                 warmup_iter, flat_epochs, no_aug_epochs):
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
         self.min_lrs = [base_lr * lr_gamma for base_lr in self.base_lrs]
 
         total_iter = int(iter_per_epoch * total_epochs)
         no_aug_iter = int(iter_per_epoch * no_aug_epochs)
         flat_iter = int(iter_per_epoch * flat_epochs)
 
-        print(self.base_lrs, self.min_lrs, total_iter, warmup_iter, flat_iter, no_aug_iter)
+        
         self.lr_func = partial(flat_cosine_schedule, total_iter, warmup_iter, flat_iter, no_aug_iter)
 
     def step(self, current_iter, optimizer):

@@ -1,13 +1,13 @@
-import torch
-import torch.nn as nn
-
+import atexit
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
-import atexit
 
-from ..misc import dist_utils
+import torch
+import torch.nn as nn
+
 from ..core import BaseConfig
+from ..misc import dist_utils
 
 
 def to(m: nn.Module, device: str):
@@ -29,6 +29,8 @@ def remove_module_prefix(state_dict):
 class BaseSolver(object):
     def __init__(self, cfg: BaseConfig) -> None:
         self.cfg = cfg
+        self.iou_type = "bbox" if self.cfg.task == "detection" else "segm"
+        
         self.obj365_ids = [
             0, 46, 5, 58, 114, 55, 116, 65, 21, 40, 176, 127, 249, 24, 56, 139, 92, 78, 99, 96,
             144, 295, 178, 180, 38, 39, 13, 43, 120, 219, 148, 173, 165, 154, 137, 113, 145, 146,
@@ -132,7 +134,7 @@ class BaseSolver(object):
         """Load state dict, train/eval"""
         if 'last_epoch' in state:
             self.last_epoch = state['last_epoch']
-            print('Load last_epoch')
+            print(f'Load last_epoch {self.last_epoch}')
 
         for k, v in self.__dict__.items():
             if hasattr(v, 'load_state_dict') and k in state:
@@ -156,7 +158,7 @@ class BaseSolver(object):
         if path.startswith('http'):
             state = torch.hub.load_state_dict_from_url(path, map_location='cpu')
         else:
-            state = torch.load(path, map_location='cpu')
+            state = torch.load(path, map_location='cpu', weights_only=True)
 
         # state['model'] = remove_module_prefix(state['model'])
         self.load_state_dict(state)
@@ -164,9 +166,9 @@ class BaseSolver(object):
     def load_tuning_state(self, path: str):
         """Load model for tuning and adjust mismatched head parameters"""
         if path.startswith('http'):
-            state = torch.hub.load_state_dict_from_url(path, map_location='cpu')
+            state = torch.hub.load_state_dict_from_url(path, map_location='cpu', weights_only=True)
         else:
-            state = torch.load(path, map_location='cpu')
+            state = torch.load(path, map_location='cpu', weights_only=True)
 
         module = dist_utils.de_parallel(self.model)
 

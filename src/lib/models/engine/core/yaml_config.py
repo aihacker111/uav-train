@@ -1,19 +1,23 @@
 """
-Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
+EdgeCrafter: Compact ViTs for Edge Dense Prediction via Task-Specialized Distillation
+Copyright (c) 2026 The EdgeCrafter Authors. All Rights Reserved.
+---------------------------------------------------------------------------------
+Modified from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
+
+import copy
+import re
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-import re
-import copy
-
 from ._config import BaseConfig
 from .workspace import create
 from .yaml_utils import load_config, merge_config, merge_dict
+
 
 class YAMLConfig(BaseConfig):
     def __init__(self, cfg_path: str, **kwargs) -> None:
@@ -23,6 +27,7 @@ class YAMLConfig(BaseConfig):
         cfg = merge_dict(cfg, kwargs)
 
         self.yaml_cfg = copy.deepcopy(cfg)
+        self.reset_cfg()
 
         for k in super().__dict__:
             if not k.startswith('_') and k in cfg:
@@ -61,7 +66,6 @@ class YAMLConfig(BaseConfig):
     def lr_scheduler(self, ) -> optim.lr_scheduler.LRScheduler:
         if self._lr_scheduler is None and 'lr_scheduler' in self.yaml_cfg:
             self._lr_scheduler = create('lr_scheduler', self.global_cfg, optimizer=self.optimizer)
-            print(f'Initial lr: {self._lr_scheduler.get_last_lr()}')
         return super().lr_scheduler
 
     @property
@@ -168,7 +172,43 @@ class YAMLConfig(BaseConfig):
         if 'total_batch_size' in global_cfg[name]:
             # pop unexpected key for dataloader init
             _ = global_cfg[name].pop('total_batch_size')
-        print(f'building {name} with batch_size={bs}...')
         loader = create(name, global_cfg, batch_size=bs)
         loader.shuffle = self.yaml_cfg[name].get('shuffle', False)
         return loader
+
+    def reset_cfg(self):
+        """reset tranforms size according to input size, and check stop_epoch for training transforms.
+        """
+        if 'train_dataloader' not in self.yaml_cfg or 'val_dataloader' not in self.yaml_cfg:
+            return
+
+        input_size = self.yaml_cfg['eval_spatial_size'][0]
+
+        def simple_glom(data, path):
+            for key in path.split("."):
+                data = data[key]
+            return data
+
+        train_ops = simple_glom(self.yaml_cfg, 'train_dataloader.dataset.transforms.ops')
+        val_ops = simple_glom(self.yaml_cfg, 'val_dataloader.dataset.transforms.ops')
+        
+        for ops in [train_ops, val_ops]:
+            for op in ops:
+                t = op.get("type")
+                if t == "Mosaic":
+                    op["output_size"] = input_size // 2
+                elif t == "Resize":
+                    op["size"] = (input_size, input_size)
+        
+        stop_aug_epoch = simple_glom(self.yaml_cfg, 'train_dataloader.dataset.transforms.stop_epoch')
+        epochs = self.yaml_cfg['epochs']
+        no_aug_epoch = epochs - stop_aug_epoch
+        if not 0 <= no_aug_epoch <= 5:
+            self.yaml_cfg['train_dataloader']['dataset']['transforms']['stop_epoch'] = epochs - 2
+            
+            import warnings
+            warnings.warn(
+                "'stop_epoch' was not correctly set for training transforms. "
+                "Automatically adjusted to: epochs - 2.",
+                UserWarning)
+        
