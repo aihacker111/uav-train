@@ -105,9 +105,9 @@ def _paired_iou(b1: Tensor, b2: Tensor) -> Tensor:
     return inter / (union + 1e-7)
 
 
-def ciou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor,
+def giou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor,
               iou: Tensor | None = None) -> Tensor:
-    """CIoU loss for N matched pairs. pred_xyxy, tgt_xyxy: (N, 4) xyxy."""
+    """GIoU loss for N matched pairs. pred_xyxy, tgt_xyxy: (N, 4) xyxy."""
     if iou is None:
         iou = _paired_iou(pred_xyxy, tgt_xyxy)
 
@@ -115,24 +115,19 @@ def ciou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor,
     enc_y1 = torch.min(pred_xyxy[:, 1], tgt_xyxy[:, 1])
     enc_x2 = torch.max(pred_xyxy[:, 2], tgt_xyxy[:, 2])
     enc_y2 = torch.max(pred_xyxy[:, 3], tgt_xyxy[:, 3])
-    c2 = (enc_x2 - enc_x1).pow(2) + (enc_y2 - enc_y1).pow(2) + 1e-7
+    enc    = (enc_x2 - enc_x1).clamp(0) * (enc_y2 - enc_y1).clamp(0)
 
-    pred_cx = (pred_xyxy[:, 0] + pred_xyxy[:, 2]) / 2
-    pred_cy = (pred_xyxy[:, 1] + pred_xyxy[:, 3]) / 2
-    tgt_cx  = (tgt_xyxy[:, 0]  + tgt_xyxy[:, 2])  / 2
-    tgt_cy  = (tgt_xyxy[:, 1]  + tgt_xyxy[:, 3])  / 2
-    rho2    = (pred_cx - tgt_cx).pow(2) + (pred_cy - tgt_cy).pow(2)
+    inter_x1 = torch.max(pred_xyxy[:, 0], tgt_xyxy[:, 0])
+    inter_y1 = torch.max(pred_xyxy[:, 1], tgt_xyxy[:, 1])
+    inter_x2 = torch.min(pred_xyxy[:, 2], tgt_xyxy[:, 2])
+    inter_y2 = torch.min(pred_xyxy[:, 3], tgt_xyxy[:, 3])
+    inter  = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
 
-    pred_w = (pred_xyxy[:, 2] - pred_xyxy[:, 0]).clamp(1e-7)
-    pred_h = (pred_xyxy[:, 3] - pred_xyxy[:, 1]).clamp(1e-7)
-    tgt_w  = (tgt_xyxy[:, 2]  - tgt_xyxy[:, 0]).clamp(1e-7)
-    tgt_h  = (tgt_xyxy[:, 3]  - tgt_xyxy[:, 1]).clamp(1e-7)
-    v      = (2 / math.pi) ** 2 * (torch.atan(tgt_w / tgt_h) - torch.atan(pred_w / pred_h)).pow(2)
+    pred_area = (pred_xyxy[:, 2] - pred_xyxy[:, 0]).clamp(0) * (pred_xyxy[:, 3] - pred_xyxy[:, 1]).clamp(0)
+    tgt_area  = (tgt_xyxy[:, 2]  - tgt_xyxy[:, 0]).clamp(0)  * (tgt_xyxy[:, 3]  - tgt_xyxy[:, 1]).clamp(0)
+    union  = pred_area + tgt_area - inter
 
-    with torch.no_grad():
-        alpha_c = v / (1 - iou + v + 1e-7)
-
-    return (1 - iou + rho2 / c2 + alpha_c * v).mean()
+    return (1 - iou + (enc - union) / (enc + 1e-7)).mean()
 
 
 def _gather_at_ind(feat: Tensor, ind: Tensor) -> Tensor:
@@ -295,16 +290,16 @@ class HybridLoss(nn.Module):
             iou_all  = torch.cat(iou_list)
             n_m      = src_b.shape[0]
             loss_bbox = F.smooth_l1_loss(src_b, tgt_b, beta=0.05, reduction='sum') / n_m
-            loss_ciou = ciou_loss(
+            loss_giou = giou_loss(
                 box_cxcywh_to_xyxy(src_b),
                 box_cxcywh_to_xyxy(tgt_b),
                 iou=iou_all,
             )
         else:
-            loss_bbox = loss_ciou = logits.sum() * 0.0
+            loss_bbox = loss_giou = logits.sum() * 0.0
 
-        total = loss_cls + self.lambda_bbox * loss_bbox + self.lambda_ciou * loss_ciou
-        return {'total': total, 'cls': loss_cls, 'bbox': loss_bbox, 'ciou': loss_ciou}
+        total = loss_cls + self.lambda_bbox * loss_bbox + self.lambda_ciou * loss_giou
+        return {'total': total, 'cls': loss_cls, 'bbox': loss_bbox, 'ciou': loss_giou}
 
     def _stage2_loss(
         self,
