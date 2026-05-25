@@ -36,7 +36,7 @@ class HybridTrainer(BaseTrainer):
         reid_classifier = None
         if opt.id_weight > 0 and hasattr(opt, 'nID_dict') and opt.nID_dict:
             total_ids = sum(opt.nID_dict.values())
-            reid_classifier = nn.Linear(opt.reid_dim, 256)
+            reid_classifier = nn.Linear(opt.reid_dim, total_ids)
             loss_stats.append('loss_reid')
 
         loss = HybridLoss(
