@@ -251,14 +251,16 @@ class HybridLoss(nn.Module):
         gt_reg   = batch['reg'].to(dev,      non_blocking=True)
 
         loss_hm = centernet_focal_loss(cn_out.hm, hm)
-        n       = reg_mask.sum().clamp(min=1).float()
 
         pred_wh  = _gather_at_ind(cn_out.wh,  ind)
         pred_reg = _gather_at_ind(cn_out.reg, ind)
 
-        mask     = reg_mask.unsqueeze(-1).float()
-        loss_wh  = (F.smooth_l1_loss(pred_wh,  gt_wh,  beta=1.0, reduction='none') * mask).sum() / n
-        loss_reg = (F.smooth_l1_loss(pred_reg, gt_reg, beta=0.5, reduction='none') * mask).sum() / n
+        # Expand mask to (B, max_obj, 2) so denom = n_valid × 2 coords,
+        # giving mean-per-coordinate loss — identical to AMOT RegL1Loss.
+        mask_exp = reg_mask.unsqueeze(-1).expand_as(pred_wh).float()
+        denom    = mask_exp.sum() + 1e-4
+        loss_wh  = F.l1_loss(pred_wh  * mask_exp, gt_wh  * mask_exp, reduction='sum') / denom
+        loss_reg = F.l1_loss(pred_reg * mask_exp, gt_reg * mask_exp, reduction='sum') / denom
 
         total = loss_hm + self.lambda_wh * loss_wh + self.lambda_reg * loss_reg
         return {'total': total, 'hm': loss_hm, 'wh': loss_wh, 'reg': loss_reg}
