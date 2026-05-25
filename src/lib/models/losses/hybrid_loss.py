@@ -32,6 +32,11 @@ Consistency loss — improved vs v1:
 Auxiliary losses from intermediate decoder layers use progressive weights:
   layer i weight = 0.4 + 0.6 * i / (num_aux_layers - 1)   range [0.4, 1.0]
   (shallower layers get smaller weight since their predictions are less refined)
+
+  The combined detection loss (final + aux) is then normalised by the sum of all
+  layer weights (≈ 4.5 for 6 decoder layers), so L_s2 represents the average
+  per-decoder-layer loss.  Without this, adding aux layers multiplies the raw
+  loss value by ~4.5×, inflating init loss and making lambda_stage2 hard to tune.
 """
 from __future__ import annotations
 
@@ -323,6 +328,7 @@ class HybridLoss(nn.Module):
         indices   = self.matcher(detr_out.logits, detr_out.boxes, targets)
         d         = self._detr_layer_loss(detr_out.logits, detr_out.boxes, targets, indices,
                                           num_boxes=num_boxes)
+        layer_weight_sum = 1.0   # weight of the final layer (implicit 1.0)
         total = d['total']
 
         if self.aux_loss:
@@ -335,6 +341,14 @@ class HybridLoss(nn.Module):
                 )
                 aux_w = 0.4 + 0.6 * (layer / max(n_aux - 1, 1))
                 total = total + aux_w * aux['total']
+                layer_weight_sum += aux_w
+
+        # Normalize detection loss by the sum of layer weights so that s2 loss
+        # represents the average per-decoder-layer loss, not the raw accumulation.
+        # Without this, each additional aux layer multiplies the loss magnitude
+        # (e.g. 6 layers × avg_weight ≈ 4.5× per-layer), inflating init loss ~4.5×
+        # and making lambda_stage2 hard to tune independently of n_decoder_layers.
+        total = total / layer_weight_sum
 
         # DN (denoising) loss — key for fast DETR convergence.
         # The decoder generates supervised DN outputs but they are wasted without

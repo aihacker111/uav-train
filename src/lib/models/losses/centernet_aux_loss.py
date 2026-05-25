@@ -71,14 +71,10 @@ class CenterNetAuxLoss(nn.Module):
         pred_wh  = _gather_at_ind(cn_out.wh,  ind)   # (B, max_obj, 2)
         pred_reg = _gather_at_ind(cn_out.reg, ind)   # (B, max_obj, 2)
 
-        n_pos = mask.sum()
-        if n_pos > 0:
-            l_wh  = F.smooth_l1_loss(pred_wh[mask],  gt_wh[mask],  beta=1.0)
-            l_reg = F.smooth_l1_loss(pred_reg[mask], gt_reg[mask], beta=0.5)
-        else:
-            # No valid objects in this batch — return zero but keep the graph alive
-            l_wh  = (pred_wh  * 0).sum()
-            l_reg = (pred_reg * 0).sum()
+        # Pure L1 matching AMOT RegL1Loss: multiply by expanded mask, sum/normalize
+        mask_exp = mask.unsqueeze(2).expand_as(pred_wh).float()  # (B, max_obj, 2)
+        l_wh  = F.l1_loss(pred_wh  * mask_exp, gt_wh  * mask_exp, reduction='sum') / (mask_exp.sum() + 1e-4)
+        l_reg = F.l1_loss(pred_reg * mask_exp, gt_reg * mask_exp, reduction='sum') / (mask_exp.sum() + 1e-4)
 
         total = l_hm + self.wh_weight * l_wh + self.reg_weight * l_reg
 
