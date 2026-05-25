@@ -179,6 +179,7 @@ class HybridLoss(nn.Module):
 
         for b, m in enumerate(indices):
             src_i, tgt_i = m['src_i'], m['tgt_i']
+            print(src_i.shape)
             if not len(src_i):
                 continue
             si  = src_i.to(dev)
