@@ -863,6 +863,10 @@ class opts(object):
         self.parser.add_argument('--consist_warmup_epochs', type=int, default=5,
                                  help='Epochs over which consistency loss ramps from 0 → consist_weight. '
                                       'Prevents noisy epoch-0 Stage-2 matches from corrupting Stage-1 peaks.')
+        self.parser.add_argument('--dn_warmup_epochs', type=int, default=10,
+                                 help='Epochs over which DN loss weight ramps from 0.5×λ_dn → λ_dn. '
+                                      'Prevents denoising queries from dominating decoder gradient '
+                                      'before Stage-1 proposals have stabilised.')
         self.parser.add_argument('--triplet_weight', type=float, default=0.5,
                                  help='Triplet loss weight within ReID loss. '
                                       'L_reid = L_ce + triplet_weight * L_triplet.')

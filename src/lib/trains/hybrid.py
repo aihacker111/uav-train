@@ -52,6 +52,7 @@ class HybridTrainer(BaseTrainer):
             lambda_bbox           = getattr(opt, 'bbox_weight',            5.0),
             lambda_ciou           = getattr(opt, 'giou_weight',            2.0),
             lambda_dn             = getattr(opt, 'dn_weight',              1.0),
+            dn_warmup_epochs      = getattr(opt, 'dn_warmup_epochs',       10),
             mal_gamma             = getattr(opt, 'mal_gamma',              1.5),
             lambda_reid           = getattr(opt, 'id_weight',              1.0),
             lambda_triplet        = getattr(opt, 'triplet_weight',         0.5),
