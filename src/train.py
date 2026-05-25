@@ -234,11 +234,15 @@ def run(opt):
 
     # Load pretrained weights (before any LR scaling or checkpoint resume)
     if opt.backbone_weights:
+        print(f'[backbone_weights] loading pretrained from: {opt.backbone_weights}')
         if 'hybrid' in opt.arch and hasattr(model, 'load_pretrained'):
             model.load_pretrained(opt.backbone_weights)
         elif hasattr(model, 'backbone'):
             from lib.models.model import load_pretrained_backbone
             model = load_pretrained_backbone(model, opt.backbone_weights)
+        print('[backbone_weights] done')
+    else:
+        print('[backbone_weights] not set — training from scratch (ECViT uses weights_path in yml)')
 
     # ── Trainer (created BEFORE load_model so loss params are in optimizer) ──────
     # Creating the Trainer first ensures the loss param group (e.g. ReID classifier)
