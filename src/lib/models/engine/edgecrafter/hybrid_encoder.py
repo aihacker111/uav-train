@@ -343,8 +343,8 @@ class HybridEncoder(nn.Module):
         self.num_encoder_layers = num_encoder_layers
         self.pe_temperature = pe_temperature
         self.eval_spatial_size = eval_spatial_size
-        self.out_channels = [hidden_dim for _ in range(len(in_channels))]
-        self.out_strides = feat_strides
+        self.out_channels = [hidden_dim for _ in range(len(in_channels) + 1)]
+        self.out_strides = [feat_strides[0] // 2] + list(feat_strides)
         self.fuse_op = fuse_op
 
         # encoder transformer
@@ -381,6 +381,15 @@ class HybridEncoder(nn.Module):
         for _ in range(len(in_channels) - 1):
             self.downsample_convs.append(copy.deepcopy(SCDown_Conv))
             self.pan_blocks.append(copy.deepcopy(Fuse_Block))
+
+        # S4 upsample: applied to S8 encoder output (after FPN+PAN) to generate
+        # S4 features. Using post-PAN S8 (not raw backbone S8) means S4 carries
+        # multi-scale context fused from S16/S32 via the top-down FPN pass.
+        self.s4_upsample = nn.Sequential(
+            nn.ConvTranspose2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            get_activation(act),
+        )
 
         self._reset_parameters()
 
@@ -453,4 +462,5 @@ class HybridEncoder(nn.Module):
             out = self.pan_blocks[idx](fused_feat)
             outs.append(out)
 
-        return outs
+        feat_s4 = self.s4_upsample(outs[0])   # S8 (post-PAN) → S4
+        return [feat_s4] + outs                # [S4, S8, S16, S32]

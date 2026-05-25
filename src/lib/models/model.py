@@ -18,7 +18,7 @@ def create_model(arch: str, heads: dict, head_conv: int,
     (e.g. lib/models/configs/ecdet_s_uav.yml).  The factory:
       1. Loads the YAML via EdgeCrafter's YAMLConfig / registry system.
       2. Overrides num_classes in ECTransformer to match the dataset.
-      3. Wraps the resulting ECDet model in HybridECDet.
+      3. Wraps the ECDet model in HybridECDet (pure DETR flow with 4-level encoder).
     """
     if 'hybrid' not in arch:
         raise NotImplementedError(
@@ -51,22 +51,13 @@ def create_model(arch: str, heads: dict, head_conv: int,
     ecdet_model = cfg.model   # ECDet(backbone=ECViT, encoder=HybridEncoder, decoder=ECTransformer)
 
     encoder_cfg = cfg.yaml_cfg.get('HybridEncoder', {})
-
-    # hidden_dim: encoder output channels (default 256)
-    hidden_dim = encoder_cfg.get('hidden_dim', 256)
-
-    # backbone_s8_channels: ECViT output channels at S8 — equals HybridEncoder
-    # in_channels[0] since the encoder directly consumes backbone S8 output.
-    # Falls back to 192 (ECViT embed_dim default) when in_channels is absent.
-    backbone_s8_channels = encoder_cfg.get('in_channels', [192])[0]
+    hidden_dim  = encoder_cfg.get('hidden_dim', 256)
 
     from lib.models.networks.ecdet_uav.ec_model import HybridECDet
     return HybridECDet(
         ecdet=ecdet_model,
         num_classes=num_classes,
         hidden_dim=hidden_dim,
-        backbone_s8_channels=backbone_s8_channels,
-        head_conv=head_conv,
         reid_dim=reid_dim,
     )
 

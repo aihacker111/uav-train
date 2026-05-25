@@ -38,7 +38,7 @@ class CenterNetAuxLoss(nn.Module):
 
     def __init__(
         self,
-        wh_weight:  float = 0.5,
+        wh_weight:  float = 0.1,
         reg_weight: float = 1.0,
     ) -> None:
         super().__init__()

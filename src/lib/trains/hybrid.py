@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from lib.models.losses.hybrid_loss import HybridLoss
-from lib.models.networks.ecdet_uav.heads import CenterNetOutput, DETROutput
+from lib.models.networks.ecdet_uav.heads import DETROutput
 from lib.utils.det_eval import COCOEvaluator, VISDRONE_CLASSES
 from .base_trainer import BaseTrainer
 
@@ -20,54 +20,41 @@ def _cxcywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
 
 class HybridTrainer(BaseTrainer):
     """
-    Trainer for HybridECDet.
+    Trainer for HybridECDet (pure DETR, 4-level encoder with S4 memory).
 
-    Expects model outputs as: {'stage1': CenterNetOutput, 'stage2': DETROutput}
-    Batch must contain CenterNet-format stage-1 targets and DETR-format 'targets' list.
+    Expects model output: {'stage2': DETROutput}
+    Batch must contain 'targets': List[dict] with 'labels' and 'boxes'.
     ReID is enabled when opt.id_weight > 0 and opt.nID_dict is available.
-
-    Loss curriculum is epoch-aware: call set_epoch at the start of each train epoch.
     """
 
     def _get_losses(self, opt):
         loss_stats = [
             'loss',
-            'loss_s1', 'loss_hm', 'loss_wh', 'loss_reg',
-            'loss_s2', 'loss_cls', 'loss_bbox', 'loss_giou',
-            'loss_consist',
-            'w_s1', 'w_s2',    # effective stage weights — monitor curriculum progress
+            'loss_cls', 'loss_bbox', 'loss_giou',
         ]
 
         reid_classifier = None
-        if getattr(opt, 'id_weight', 0) > 0 and hasattr(opt, 'nID_dict') and opt.nID_dict:
+        if opt.id_weight > 0 and hasattr(opt, 'nID_dict') and opt.nID_dict:
             total_ids = sum(opt.nID_dict.values())
-            reid_dim  = getattr(opt, 'reid_dim', 256)
-            reid_classifier = nn.Linear(reid_dim, total_ids)
+            reid_classifier = nn.Linear(opt.reid_dim, total_ids)
             loss_stats.append('loss_reid')
 
         loss = HybridLoss(
-            num_classes           = opt.num_classes,
-            lambda_wh             = getattr(opt, 'wh_weight',             0.1),
-            lambda_reg            = getattr(opt, 'off_weight',             1.0),
-            lambda_bbox           = getattr(opt, 'bbox_weight',            5.0),
-            lambda_ciou           = getattr(opt, 'giou_weight',            2.0),
-            lambda_dn             = getattr(opt, 'dn_weight',              1.0),
-            dn_warmup_epochs      = getattr(opt, 'dn_warmup_epochs',       10),
-            mal_gamma             = getattr(opt, 'mal_gamma',              1.5),
-            lambda_reid           = getattr(opt, 'id_weight',              1.0),
-            lambda_triplet        = getattr(opt, 'triplet_weight',         0.5),
-            lambda_consist        = getattr(opt, 'consist_weight',         0.05),
-            consist_warmup_epochs = getattr(opt, 'consist_warmup_epochs',  5),
-            lambda_stage1         = getattr(opt, 'stage1_weight',          2.0),
-            lambda_stage2         = getattr(opt, 'stage2_weight',          0.3),
-            aux_loss              = getattr(opt, 'aux_loss',               True),
-            reid_classifier       = reid_classifier,
-            total_epochs          = getattr(opt, 'num_epochs',             0),
+            num_classes      = opt.num_classes,
+            lambda_bbox      = opt.bbox_weight,
+            lambda_ciou      = opt.giou_weight,
+            lambda_dn        = opt.dn_weight,
+            dn_warmup_epochs = opt.dn_warmup_epochs,
+            lambda_enc_aux   = opt.enc_aux_weight,
+            mal_gamma        = opt.mal_gamma,
+            lambda_reid      = opt.id_weight,
+            lambda_triplet   = opt.triplet_weight,
+            aux_loss         = opt.aux_loss,
+            reid_classifier  = reid_classifier,
         )
         return loss_stats, loss
 
     def train(self, epoch: int, data_loader):
-        """Update loss curriculum state before each training epoch."""
         self.loss.set_epoch(epoch)
         return self.run_epoch('train', epoch, data_loader)
 

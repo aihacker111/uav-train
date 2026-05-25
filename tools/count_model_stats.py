@@ -15,12 +15,12 @@ import torch
 from lib.models.model import create_model
 
 COMPONENTS = [
-    ('ecdet.backbone',   'Backbone (ECViT)'),
-    ('ecdet.encoder',    'Encoder (HybridEncoder)'),
-    ('ecdet.decoder',    'Decoder (ECTransformer)'),
-    ('cn_backbone_proj', 'CenterNet Proj'),
-    ('cn_upsample',      'CenterNet Upsample'),
-    ('cn_head',          'CenterNet Head'),
+    ('ecdet.backbone',        'Backbone (ECViT)'),
+    ('ecdet.encoder',         'Encoder (HybridEncoder)'),
+    ('ecdet.encoder.s4_upsample', '  └─ S4 upsample'),
+    ('ecdet.decoder',         'Decoder (ECTransformer)'),
+    ('ecdet.decoder.encoder', '  └─ enc_score_head+proj'),
+    ('reid_mlp',              'ReID MLP'),
 ]
 
 _LINE = '─' * 60
@@ -33,7 +33,7 @@ def build_model(args):
     return create_model(
         arch='hybrid_ecdet',
         heads={'__opt__': Opt()},
-        head_conv=args.head_conv,
+        head_conv=0,          # unused in pure-DETR model, kept for API compat
         num_classes=args.num_classes,
     )
 
@@ -92,11 +92,20 @@ def measure_gpu_mem(model, dummy, device):
     return torch.cuda.max_memory_allocated(device) / 1024 ** 2
 
 
+def _encoder_memory_positions(model, h, w):
+    """Compute total memory positions L = Σ H_i × W_i across all encoder levels."""
+    import math
+    try:
+        strides = model.ecdet.encoder.out_strides
+        return [(math.ceil(h / s), math.ceil(w / s)) for s in strides]
+    except Exception:
+        return []
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--ecdet_config',     required=True, help='Path to ECDet YAML config')
     p.add_argument('--num_classes',      type=int, default=10)
-    p.add_argument('--head_conv',        type=int, default=32)
     p.add_argument('--input-h',          type=int, default=512)
     p.add_argument('--input-w',          type=int, default=832)
     p.add_argument('--batch-size',       type=int, default=1)
@@ -105,7 +114,7 @@ def parse_args():
     p.add_argument('--half',             action='store_true')
     p.add_argument('--no-speed',         action='store_true')
     p.add_argument('--device',           default='')
-    p.add_argument('--backbone_weights', default='', help='Pretrained .pth to check missing keys')
+    p.add_argument('--backbone_weights', default='', help='Pretrained .pth for load_pretrained()')
     return p.parse_args()
 
 
@@ -114,7 +123,7 @@ def main():
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
     print(f'\n{_LINE}')
-    print(f'  Model  : HybridECDet (ECViT + CenterNet head)')
+    print(f'  Model  : HybridECDet  (ECViT + 4-level encoder + DETR)')
     print(f'  Config : {args.ecdet_config}')
     print(f'  Device : {device}  |  Input: {args.input_h}×{args.input_w}  bs={args.batch_size}')
     print(_LINE)
@@ -131,29 +140,39 @@ def main():
 
     # ── Parameters ──────────────────────────────────────────────────────────────
     total, trainable = count_params(model)
-    print(f"  {'Total params':<26}: {total / 1e6:.2f} M")
-    print(f"  {'Trainable params':<26}: {trainable / 1e6:.2f} M")
+    print(f"  {'Total params':<30}: {total / 1e6:.2f} M")
+    print(f"  {'Trainable params':<30}: {trainable / 1e6:.2f} M")
     for attr, label in COMPONENTS:
         obj = model
         try:
             for part in attr.split('.'):
                 obj = getattr(obj, part)
             n = sum(p.numel() for p in obj.parameters())
-            print(f"  {'  └─ ' + label:<26}: {n / 1e6:.2f} M  ({100 * n / total:.1f}%)")
+            print(f"  {'  └─ ' + label:<30}: {n / 1e6:.2f} M  ({100 * n / total:.1f}%)")
         except AttributeError:
             pass
+
+    # ── Encoder memory layout ────────────────────────────────────────────────────
+    print(_DASH)
+    shapes = _encoder_memory_positions(model, args.input_h, args.input_w)
+    if shapes:
+        strides = model.ecdet.encoder.out_strides
+        total_pos = sum(h * w for h, w in shapes)
+        print(f"  Encoder memory  L = {total_pos:,} positions")
+        for s, (h, w) in zip(strides, shapes):
+            print(f"    S{s:<3}  {h}×{w} = {h*w:,}")
 
     # ── GFLOPs & GPU memory ──────────────────────────────────────────────────────
     print(_DASH)
     gflops, status = try_gflops(model, dummy_single)
     if status == 'ok':
-        print(f"  {'GFLOPs (bs=1)':<26}: {gflops:.2f} G")
+        print(f"  {'GFLOPs (bs=1)':<30}: {gflops:.2f} G")
     else:
-        print(f"  GFLOPs                   : [{status}]")
+        print(f"  GFLOPs                         : [{status}]")
 
     mb = measure_gpu_mem(model, dummy, device)
     if mb:
-        print(f"  {'GPU Mem FP32 (fwd)':<26}: {mb:.0f} MB")
+        print(f"  {'GPU Mem FP32 (fwd)':<30}: {mb:.0f} MB")
 
     # ── Speed ────────────────────────────────────────────────────────────────────
     if not args.no_speed:
@@ -167,9 +186,13 @@ def main():
     print(_DASH)
     with torch.no_grad():
         out = model(dummy_single)
-    s1, s2 = out['stage1'], out['stage2']
-    print(f"  stage1 (CenterNet)     hm: {tuple(s1.hm.shape)}  wh: {tuple(s1.wh.shape)}")
-    print(f"  stage2 (ECTransformer) boxes: {tuple(s2.boxes.shape)}  logits: {tuple(s2.logits.shape)}")
+    s2 = out['stage2']
+    print(f"  boxes  : {tuple(s2.boxes.shape)}")
+    print(f"  logits : {tuple(s2.logits.shape)}")
+    enc = s2.enc_aux_outputs
+    if enc:
+        print(f"  enc_aux: logits {tuple(enc[0]['pred_logits'].shape)}  "
+              f"boxes {tuple(enc[0]['pred_boxes'].shape)}")
     print(f'{_LINE}\n')
 
 

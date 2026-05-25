@@ -5,10 +5,7 @@ from __future__ import print_function
 import math
 import os
 import json
-import random
 
-import numpy as np
-# os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 import torch
 import torch.distributed as dist
 import torch.utils.data

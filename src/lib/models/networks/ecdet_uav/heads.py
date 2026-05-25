@@ -34,8 +34,9 @@ class DETROutput:
     reid:       Optional[Tensor]  # (B, K, reid_dim)  L2-normalised; None when reid_dim=0
     boxes_all:  Tensor            # (num_layers, B, K, 4)  all layers for auxiliary loss
     logits_all: Tensor            # (num_layers, B, K, C)  all layers for auxiliary loss
-    dn_outputs: Optional[list] = None   # list of {pred_logits, pred_boxes} per DN layer
-    dn_meta:    Optional[dict] = None   # {dn_num_group, dn_positive_idx, dn_num_split}
+    dn_outputs:       Optional[list] = None  # list of {pred_logits, pred_boxes} per DN layer
+    dn_meta:          Optional[dict] = None  # {dn_num_group, dn_positive_idx, dn_num_split}
+    enc_aux_outputs:  Optional[list] = None  # [{pred_logits, pred_boxes}] encoder top-K supervision
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
