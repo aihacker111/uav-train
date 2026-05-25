@@ -214,6 +214,9 @@ class opts(object):
         self.parser.add_argument('--data_cfg', type=str,
                                  default='../src/lib/cfg/visdrone.json',
                                  help='path to dataset JSON config')
+        self.parser.add_argument('--data_dir', type=str,
+                                 default='/media/jianbo/ioe/UAVdata',
+                                 help='root directory of the dataset')
 
         # ── HybridLoss weights ────────────────────────────────────────────────────
         self.parser.add_argument('--bbox_weight', type=float, default=2.0,
