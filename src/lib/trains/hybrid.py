@@ -30,7 +30,7 @@ class HybridTrainer(BaseTrainer):
     def _get_losses(self, opt):
         loss_stats = [
             'loss',
-            'loss_cls', 'loss_bbox', 'loss_giou',
+            'loss_cls', 'loss_bbox', 'loss_giou', 'loss_enc_aux',
         ]
 
         reid_classifier = None

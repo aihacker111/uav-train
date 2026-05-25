@@ -248,7 +248,9 @@ class HybridLoss(nn.Module):
         # NOTE: enc_aux logits have Q_enc = num_queries (top-K only), while the main
         # decoder may have extra fallback queries → Q_dec > Q_enc.  Filter indices so
         # only src_i < Q_enc are supervised; fallback-query matches have no enc anchor.
+        l_enc_aux = None
         if detr_out.enc_aux_outputs is not None:
+            l_enc_aux = detr_out.logits.sum() * 0.0
             for enc_out in detr_out.enc_aux_outputs:
                 Q_enc = enc_out['pred_logits'].shape[1]
                 enc_indices = [
@@ -262,10 +264,11 @@ class HybridLoss(nn.Module):
                     enc_out['pred_logits'], enc_out['pred_boxes'],
                     targets, enc_indices, num_boxes=num_boxes,
                 )
-                total = total + self.lambda_enc_aux * d_enc['total']
+                l_enc_aux = l_enc_aux + d_enc['total']
+            total = total + self.lambda_enc_aux * l_enc_aux
 
         return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'], 'giou': d['giou'],
-                'indices': indices}
+                'enc_aux': l_enc_aux, 'indices': indices}
 
     def _dn_loss(
         self,
@@ -370,6 +373,8 @@ class HybridLoss(nn.Module):
             'loss_bbox': s2['bbox'],
             'loss_giou': s2['giou'],
         }
+        loss_stats['loss_enc_aux'] = s2['enc_aux'] if s2['enc_aux'] is not None \
+                                     else total.detach() * 0.0
 
         if self.reid_classifier is not None and 'ids' in targets[0]:
             l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])
