@@ -57,5 +57,6 @@ ECTransformer:
   query_select_method: default
   activation: silu
   dim_feedforward: 512
+  num_fallback_queries: 30
 
 eval_spatial_size: [512, 832]

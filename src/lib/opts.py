@@ -661,10 +661,10 @@ class opts(object):
                                       '0 disables the intermediate conv (1×1 only).')
         self.parser.add_argument('--backbone_lr_scale',
                                  type=float,
-                                 default=0.2,
+                                 default=0.05,
                                  help='LR multiplier for ViT backbone (relative to head LR). '
-                                      '0.2 allows faster UAV-domain adaptation than 0.1 '
-                                      'while still protecting pretrained features.')
+                                      '0.05 matches EdgeCrafter COCO training — keeps pretrained '
+                                      'ViT features intact while allowing slow domain adaptation.')
         self.parser.add_argument('--freeze_backbone_epochs',
                                  type=int,
                                  default=0,
@@ -705,9 +705,10 @@ class opts(object):
         # train
         self.parser.add_argument('--lr',
                                  type=float,
-                                 default=4e-4,
-                                 help='learning rate for batch size 16 (single GPU). '
-                                      'Linear-scale with batch: 8e-4 for bs=32, 2e-4 for bs=8.')
+                                 default=5e-4,
+                                 help='learning rate for heads/decoder. '
+                                      'Matches EdgeCrafter COCO base LR (5e-4). '
+                                      'Backbone gets backbone_lr_scale × lr (default 2.5e-5).')
         self.parser.add_argument('--lr_scale',
                                  type=str,
                                  default='linear',
@@ -734,9 +735,9 @@ class opts(object):
                                       'Enabled by default (best practice for ViT). Use --no-cosine-lr to disable.')
         self.parser.add_argument('--warmup_iters',
                                  type=int,
-                                 default=500,
+                                 default=2000,
                                  help='Linear LR warmup iterations (cosine_lr only). '
-                                      '500 ≈ 0.8 epoch at batch=16, ~10k samples.')
+                                      '2000 matches EdgeCrafter COCO training warmup.')
         self.parser.add_argument('--min_lr_ratio',
                                  type=float,
                                  default=0.01,

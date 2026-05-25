@@ -442,6 +442,7 @@ class ECTransformer(nn.Module):
                  share_bbox_head=False,
                  share_score_head=False,
                  mask_downsample_ratio=None,
+                 num_fallback_queries=0,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -527,6 +528,29 @@ class ECTransformer(nn.Module):
             self.register_buffer('anchors', anchors)
             self.register_buffer('valid_mask', valid_mask)
 
+        # Fallback queries: position-independent learnable queries that act as a
+        # safety net for objects Stage-1 misses (occlusion, tiny objects in crowds).
+        # They are concatenated after the num_queries Stage-1 proposals and attend
+        # to the same encoder features. Initialised as a uniform grid across the image.
+        self.num_fallback_queries = num_fallback_queries
+        if num_fallback_queries > 0:
+            self.fallback_query_content = nn.Embedding(num_fallback_queries, hidden_dim)
+            init.xavier_uniform_(self.fallback_query_content.weight)
+
+            n_h = max(1, round(num_fallback_queries ** 0.5))
+            n_w = (num_fallback_queries + n_h - 1) // n_h
+            while n_h * n_w < num_fallback_queries:
+                n_w += 1
+            ys  = torch.linspace(0.1, 0.9, n_h)
+            xs  = torch.linspace(0.1, 0.9, n_w)
+            gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+            cxcy = torch.stack([gx.flatten()[:num_fallback_queries],
+                                 gy.flatten()[:num_fallback_queries]], dim=-1)
+            wh_init = torch.full((num_fallback_queries, 2), 0.05)
+            fb_boxes = torch.cat([cxcy, wh_init], dim=-1).clamp(1e-4, 1 - 1e-4)
+            self.fallback_ref_points = nn.Parameter(
+                torch.log(fb_boxes / (1.0 - fb_boxes))  # logit space, same as heatmap refs
+            )
 
         self._reset_parameters(feat_channels)
 
@@ -688,6 +712,17 @@ class ECTransformer(nn.Module):
 
         enc_topk_bbox_unact = enc_topk_bbox_unact.detach()
 
+        # Append fallback queries after the num_queries Stage-1 proposals.
+        # Positions are learned; content starts from xavier-uniform embedding.
+        # Encoder aux loss (enc_topk_bboxes_list) is captured before this point,
+        # so fallback queries do not affect the encoder-level auxiliary supervision.
+        if self.num_fallback_queries > 0:
+            B = memory.shape[0]
+            fb_content = self.fallback_query_content.weight.unsqueeze(0).expand(B, -1, -1)
+            fb_ref     = self.fallback_ref_points.unsqueeze(0).expand(B, -1, -1)
+            content             = torch.cat([content,             fb_content], dim=1)
+            enc_topk_bbox_unact = torch.cat([enc_topk_bbox_unact, fb_ref],     dim=1)
+
         if denoising_bbox_unact is not None:
             enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
             content = torch.concat([denoising_logits, content], dim=1)
@@ -746,6 +781,20 @@ class ECTransformer(nn.Module):
                 heatmap_ref_points=heatmap_ref_points,
             )
 
+        # Extend DN attention mask to cover fallback queries appended after regular queries.
+        # DN queries block fallback (and vice-versa) to preserve denoising isolation.
+        # Regular queries can freely attend to fallback in self-attention.
+        if self.num_fallback_queries > 0 and attn_mask is not None:
+            N_old  = attn_mask.shape[0]          # N_dn + num_queries
+            N_dn   = N_old - self.num_queries
+            N_fb   = self.num_fallback_queries
+            N_new  = N_old + N_fb
+            ext    = attn_mask.new_zeros(N_new, N_new, dtype=torch.bool)
+            ext[:N_old, :N_old] = attn_mask
+            ext[:N_dn,  N_old:] = True           # DN rows  → block fallback cols
+            ext[N_old:, :N_dn ] = True           # fallback rows → block DN cols
+            attn_mask = ext
+
         # decoder
         out_bboxes, out_logits, out_corners, out_refs, out_masks, pre_bboxes, pre_logits, pre_segs, dec_out_hs = self.decoder(
                 spatial_feat,
@@ -764,6 +813,11 @@ class ECTransformer(nn.Module):
                 dn_meta=dn_meta)
 
         s_idx = dn_meta['dn_num_split'] if dn_meta is not None else None
+        # Extend the regular-query slot in the split index to include fallback queries.
+        # dn_num_split = [N_dn, num_queries]; we need [N_dn, num_queries + N_fb] so that
+        # torch.split correctly separates DN outputs from regular+fallback outputs.
+        if s_idx is not None and self.num_fallback_queries > 0:
+            s_idx = [s_idx[0], s_idx[1] + self.num_fallback_queries]
 
         if self.training and dn_meta is not None:
             dn_pre_logits, pre_logits = self._split(pre_logits, 1, s_idx)

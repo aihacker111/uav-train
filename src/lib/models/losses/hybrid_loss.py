@@ -164,17 +164,18 @@ class HybridLoss(nn.Module):
     def __init__(
         self,
         num_classes:           int   = 7,
-        lambda_wh:             float = 0.1,
+        lambda_wh:             float = 0.4,
         lambda_reg:            float = 1.0,
         lambda_bbox:           float = 5.0,   # EdgeCrafter default (was 2.0)
         lambda_ciou:           float = 2.0,   # GIoU weight (name kept for compat)
         lambda_reid:           float = 1.0,
         lambda_triplet:        float = 0.5,
-        lambda_consist:        float = 0.05,
+        lambda_consist:        float = 0.15,
         consist_warmup_epochs: int   = 5,
         lambda_stage1:         float = 2.0,
         lambda_stage2:         float = 0.3,
         lambda_dn:             float = 1.0,   # weight for DN auxiliary loss
+        dn_warmup_epochs:      int   = 10,    # ramp λ_dn from 0.5→1.0 over first N epochs
         mal_gamma:             float = 1.5,   # MAL/EdgeCrafter exponent
         aux_loss:              bool  = True,
         reid_classifier:       Optional[nn.Linear] = None,
@@ -193,6 +194,7 @@ class HybridLoss(nn.Module):
         self.lambda_stage1         = lambda_stage1
         self.lambda_stage2         = lambda_stage2
         self.lambda_dn             = lambda_dn
+        self.dn_warmup_epochs      = dn_warmup_epochs
         self.mal_gamma             = mal_gamma
         self.aux_loss              = aux_loss
         self.total_epochs          = total_epochs
@@ -340,7 +342,10 @@ class HybridLoss(nn.Module):
         if detr_out.dn_outputs is not None and detr_out.dn_meta is not None:
             l_dn  = self._dn_loss(detr_out.dn_outputs, targets, detr_out.dn_meta,
                                    num_boxes=num_boxes)
-            total = total + self.lambda_dn * l_dn
+            # Ramp λ_dn from 0.5→1.0 over dn_warmup_epochs so Stage-1 proposals
+            # have time to stabilise before DN dominates the decoder gradient.
+            dn_scale = min(1.0, 0.5 + 0.5 * self._epoch / max(1, self.dn_warmup_epochs))
+            total = total + dn_scale * self.lambda_dn * l_dn
 
         return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'], 'giou': d['giou'],
                 'indices': indices}
@@ -386,30 +391,38 @@ class HybridLoss(nn.Module):
 
     def _consistency_loss(
         self,
-        cn_out:  CenterNetOutput,
-        targets: List[dict],
-        indices: list,
+        cn_out:   CenterNetOutput,
+        targets:  List[dict],
+        indices:  list,
+        s2_boxes: Optional[Tensor] = None,  # (B, K, 4) cxcywh [0,1] — detached Stage-2 preds
     ) -> Tensor:
         """
-        Align Stage-1 heatmap with Stage-2 matched objects.
+        Align Stage-1 with Stage-2 matched objects via two signals:
 
-        For every object that Stage-2 Hungarian-matched, the Stage-1 heatmap value
-        at that object's GT center should be 1.0. Uses GT centers (not Stage-2
-        predicted centers) for a stable signal independent of decoder quality.
+        1. Heatmap BCE: push hm → 1.0 at GT centers of Stage-2-matched objects,
+           weighted by match IoU (high confidence → stronger push).
 
-        Improvement over v1: each object's BCE is weighted by its Stage-2 match IoU.
-          - High IoU (e.g. 0.7): Stage-2 is confident → strong consistency push.
-          - Low IoU (e.g. 0.1): Stage-2 barely matched → weak push to avoid
-            Stage-1 learning from a noisy assignment.
-        Only Stage-1 heatmap head receives gradient (no path to Stage-2 decoder).
+        2. WH pseudo-label: use Stage-2's refined box w/h as a soft supervision
+           target for Stage-1's wh head at GT center locations.
+           Only applied when match IoU >= WH_IOU_THRESHOLD (0.4) to avoid noisy
+           matches corrupting Stage-1's size estimates.
+           Gradient flows only to cn_out.wh; s2_boxes must be passed detached.
+
+        Both signals are one-directional: Stage-1 learns from Stage-2, never the
+        reverse (no gradient path to the decoder).
         """
-        hm = cn_out.hm                        # (B, C, H, W) — sigmoid, detached upstream
+        hm  = cn_out.hm    # (B, C, H, W) — sigmoid
+        wh  = cn_out.wh    # (B, 2, H, W) — S4 pixel units
         B, C, H, W = hm.shape
         dev = hm.device
-        Q_MIN = 0.1
+        Q_MIN            = 0.1
+        WH_IOU_THRESHOLD = 0.4
+        WH_CONSIST_SCALE = 0.1  # relative weight of wh term vs hm term
 
-        total    = hm.sum() * 0.0
-        n_images = 0
+        total_hm  = hm.sum() * 0.0
+        total_wh  = wh.sum() * 0.0
+        n_hm      = 0
+        n_wh      = 0
 
         for b, m in enumerate(indices):
             src_i, tgt_i, iou_cached = m['src_i'], m['tgt_i'], m['iou']
@@ -417,29 +430,46 @@ class HybridLoss(nn.Module):
                 continue
 
             ti      = tgt_i.to(dev)
-            quality = iou_cached.to(dev).clamp(min=Q_MIN)   # (n,) IoU-based weight
+            si      = src_i.to(dev)
+            quality = iou_cached.to(dev).clamp(min=Q_MIN)   # (n,)
 
             gt_boxes = targets[b]['boxes'][ti]               # (n, 4) cxcywh normalised
             cx       = gt_boxes[:, 0].clamp(0, 1)
             cy       = gt_boxes[:, 1].clamp(0, 1)
             cls_idx  = targets[b]['labels'][ti]              # (n,) long
 
-            x_hm = (cx * (W - 1)).long().clamp(0, W - 1)
-            y_hm = (cy * (H - 1)).long().clamp(0, H - 1)
+            x_hm = (cx * (W - 1)).long().clamp(0, W - 1)   # S4 col index
+            y_hm = (cy * (H - 1)).long().clamp(0, H - 1)   # S4 row index
 
-            # Sample heatmap at GT centers for each object's class channel
+            # ── 1. Heatmap BCE ──────────────────────────────────────────────────
             hm_vals = hm[b, cls_idx, y_hm, x_hm]           # (n,)
-
-            # IoU-quality-weighted BCE pushing heatmap → 1.0 at matched centers
             bce = F.binary_cross_entropy(
                 hm_vals.clamp(1e-6, 1 - 1e-6),
                 torch.ones_like(hm_vals),
                 reduction='none',
             )
-            total    = total + (quality * bce).sum() / quality.sum().clamp(min=1)
-            n_images += 1
+            total_hm = total_hm + (quality * bce).sum() / quality.sum().clamp(min=1)
+            n_hm     += 1
 
-        return total / max(n_images, 1)
+            # ── 2. WH pseudo-label ──────────────────────────────────────────────
+            if s2_boxes is not None:
+                wh_mask = quality >= WH_IOU_THRESHOLD       # (n,) bool
+                if wh_mask.any():
+                    # Stage-2 normalised w/h → S4 pixel units (same convention as cn_out.wh)
+                    s2_wh   = s2_boxes[b, si, 2:4][wh_mask]  # (m, 2) already detached
+                    tgt_s4  = s2_wh * s2_wh.new_tensor([W, H])  # (m, 2) S4 pixels
+
+                    # Stage-1 predicted wh at GT center grid cells
+                    pred_s4 = wh[b, :, y_hm[wh_mask], x_hm[wh_mask]].T  # (m, 2)
+
+                    q_w  = quality[wh_mask].unsqueeze(-1)    # (m, 1) quality weight
+                    l_wh = F.smooth_l1_loss(pred_s4, tgt_s4, beta=1.0, reduction='none')
+                    total_wh = total_wh + (q_w * l_wh).sum() / (q_w.sum().clamp(min=1e-6) * 2)
+                    n_wh += 1
+
+        loss_hm = total_hm / max(n_hm, 1)
+        loss_wh = total_wh / max(n_wh, 1)
+        return loss_hm + WH_CONSIST_SCALE * loss_wh
 
     # ── ReID loss ──────────────────────────────────────────────────────────────
 
@@ -529,7 +559,10 @@ class HybridLoss(nn.Module):
         # Prevents noisy epoch-0 Stage-2 matching from corrupting Stage-1 peaks,
         # while still establishing alignment once Stage-2 stabilises.
         consist_scale = min(1.0, self._epoch / max(1, self.consist_warmup_epochs))
-        l_consist = self._consistency_loss(outputs['stage1'], targets, s2['indices'])
+        l_consist = self._consistency_loss(
+            outputs['stage1'], targets, s2['indices'],
+            s2_boxes=outputs['stage2'].boxes.detach(),
+        )
         total     = total + self.lambda_consist * consist_scale * l_consist
         loss_stats['loss_consist'] = l_consist
 
