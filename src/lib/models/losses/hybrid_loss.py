@@ -245,11 +245,22 @@ class HybridLoss(nn.Module):
 
         # enc_score_head supervision: forces encoder to score object positions highly
         # so _select_topk reliably picks S4 positions for small objects.
+        # NOTE: enc_aux logits have Q_enc = num_queries (top-K only), while the main
+        # decoder may have extra fallback queries → Q_dec > Q_enc.  Filter indices so
+        # only src_i < Q_enc are supervised; fallback-query matches have no enc anchor.
         if detr_out.enc_aux_outputs is not None:
             for enc_out in detr_out.enc_aux_outputs:
+                Q_enc = enc_out['pred_logits'].shape[1]
+                enc_indices = [
+                    {
+                        'src_i': m['src_i'][m['src_i'] < Q_enc],
+                        'tgt_i': m['tgt_i'][m['src_i'] < Q_enc],
+                    }
+                    for m in indices
+                ]
                 d_enc = self._detr_layer_loss(
                     enc_out['pred_logits'], enc_out['pred_boxes'],
-                    targets, indices, num_boxes=num_boxes,
+                    targets, enc_indices, num_boxes=num_boxes,
                 )
                 total = total + self.lambda_enc_aux * d_enc['total']
 
