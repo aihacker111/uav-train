@@ -47,10 +47,10 @@ def create_model(
 
     encoder_cfg = cfg.yaml_cfg.get('HybridEncoder', {})
     hidden_dim  = encoder_cfg.get('hidden_dim', 256)
-    reg_max     = getattr(opt, 'reg_max',    16) if opt else 16
-    num_convs   = getattr(opt, 'num_convs',   4) if opt else 4
-
-    reid_dim = getattr(opt, 'reid_dim', 0) if opt else 0
+    reg_max      = getattr(opt, 'reg_max',       16)  if opt else 16
+    num_convs    = getattr(opt, 'num_convs',      2)  if opt else 2
+    head_feat_ch = getattr(opt, 'head_feat_ch', 128)  if opt else 128
+    reid_dim     = getattr(opt, 'reid_dim',       0)  if opt else 0
 
     from lib.models.networks.hawkdet.model import HawkDet
     return HawkDet(
@@ -59,6 +59,7 @@ def create_model(
         hidden_dim=hidden_dim,
         reg_max=reg_max,
         num_convs=num_convs,
+        feat_ch=head_feat_ch,
         reid_dim=reid_dim,
     )
 

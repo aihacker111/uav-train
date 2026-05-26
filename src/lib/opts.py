@@ -252,8 +252,10 @@ class opts(object):
         # ── HawkDet (TOOD T-head + DFL) ──────────────────────────────────────
         self.parser.add_argument('--reg_max', type=int, default=16,
                                  help='DFL bin count − 1. Distance range per side = reg_max × stride pixels.')
-        self.parser.add_argument('--num_convs', type=int, default=4,
+        self.parser.add_argument('--num_convs', type=int, default=2,
                                  help='Depth of the shared tower in each THead scale.')
+        self.parser.add_argument('--head_feat_ch', type=int, default=128,
+                                 help='Hidden channels inside THead tower. 128 for -S/M, 256 for -L/X.')
         self.parser.add_argument('--cls_weight', type=float, default=1.0,
                                  help='QFL classification loss weight (lambda_cls).')
         self.parser.add_argument('--dfl_weight', type=float, default=1.5,

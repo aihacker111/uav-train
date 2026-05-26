@@ -39,7 +39,8 @@ class HawkDet(nn.Module):
         num_classes: int,
         hidden_dim:  int  = 256,
         reg_max:     int  = 16,
-        num_convs:   int  = 4,
+        num_convs:   int  = 2,
+        feat_ch:     int  = 128,
         reid_dim:    int  = 0,
     ) -> None:
         super().__init__()
@@ -52,7 +53,8 @@ class HawkDet(nn.Module):
 
         # One T-head per scale (S4, S8, S16, S32)
         self.heads = nn.ModuleList([
-            THead(hidden_dim, num_classes, reg_max, num_convs, reid_dim=reid_dim)
+            THead(hidden_dim, num_classes, reg_max, num_convs,
+                  feat_ch=feat_ch, reid_dim=reid_dim)
             for _ in range(len(self.strides))
         ])
 
