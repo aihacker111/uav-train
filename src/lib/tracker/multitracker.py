@@ -788,7 +788,9 @@ class HawkDetMCTracker(object):
 
         print('Creating HawkDet model...')
         from lib.models.model import create_model, load_model
-        self.model = create_model(opt.arch, opt.heads, opt.head_conv,
+        self.model = create_model(opt.arch,
+                                  getattr(opt, 'heads', {'__opt__': opt}),
+                                  getattr(opt, 'head_conv', 0),
                                   num_classes=opt.num_classes, opt=opt)
         self.model = load_model(self.model, opt.load_model)
         self.model = self.model.to(opt.device)
