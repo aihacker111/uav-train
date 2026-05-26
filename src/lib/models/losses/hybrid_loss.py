@@ -101,58 +101,58 @@ def render_gaussian_heatmaps(
     B = len(targets)
     device = targets[0]['boxes'].device
 
-    gt_hm   = torch.zeros(B, num_classes, feat_h, feat_w, device=device)
-    gt_wh   = torch.zeros(B, 2, feat_h, feat_w, device=device)
-    gt_reg  = torch.zeros(B, 2, feat_h, feat_w, device=device)
-    reg_mask = torch.zeros(B, feat_h, feat_w, device=device)
+    gt_hm    = torch.zeros(B, num_classes, feat_h, feat_w, device=device)
+    gt_wh    = torch.zeros(B, 2,           feat_h, feat_w, device=device)
+    gt_reg   = torch.zeros(B, 2,           feat_h, feat_w, device=device)
+    reg_mask = torch.zeros(B,              feat_h, feat_w, device=device)
 
-    # Precompute coordinate grids (shared across all GT objects)
     gy = torch.arange(feat_h, dtype=torch.float32, device=device)
     gx = torch.arange(feat_w, dtype=torch.float32, device=device)
     grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')  # (H, W)
 
     for b, t in enumerate(targets):
         boxes  = t['boxes']   # (N, 4) cxcywh normalised
-        labels = t['labels']  # (N,)   int
+        labels = t['labels']  # (N,) int
+        N = len(boxes)
+        if N == 0:
+            continue
 
-        for box, label in zip(boxes, labels):
-            cx, cy, bw, bh = box.tolist()
+        fx  = boxes[:, 0] * feat_w   # (N,) float center-x in feature map
+        fy  = boxes[:, 1] * feat_h   # (N,) float center-y
+        fw  = boxes[:, 2] * feat_w   # (N,) float width  in feature-map pixels
+        fh  = boxes[:, 3] * feat_h   # (N,) float height
 
-            fx = cx * feat_w          # float center in feature map
-            fy = cy * feat_h
-            fw = bw * feat_w          # float width  in feature map pixels
-            fh = bh * feat_h          # float height in feature map pixels
+        ix = fx.long().clamp(0, feat_w - 1)  # (N,) snapped integer col
+        iy = fy.long().clamp(0, feat_h - 1)  # (N,) snapped integer row
 
-            ix = int(fx)
-            iy = int(fy)
-            ix = max(0, min(ix, feat_w - 1))
-            iy = max(0, min(iy, feat_h - 1))
+        # Gaussian radius per object — _gaussian_radius is pure Python math,
+        # must stay a loop; it is O(N) scalar work and not the bottleneck.
+        sigmas = torch.tensor(
+            [max(1.0, (2 * max(0, int(_gaussian_radius(fw[i].item(), fh[i].item()))) + 1) / 6.0)
+             for i in range(N)],
+            dtype=torch.float32, device=device,
+        )  # (N,)
 
-            # Gaussian radius from IoU criterion (AMOT / CornerNet).
-            # sigma = diameter/6 matches draw_umich_gaussian in AMOT/image.py.
-            radius   = max(0, int(_gaussian_radius(fw, fh)))
-            diameter = 2 * radius + 1
-            sigma    = max(1.0, diameter / 6.0)
+        # Vectorised gaussian: one exp() over (N, H, W) instead of N × (H, W).
+        # Guarantees gt_hm[iy, ix] = 1.0 exactly (centered at integer cell).
+        dx = grid_x.unsqueeze(0) - ix.float().view(N, 1, 1)   # (N, H, W)
+        dy = grid_y.unsqueeze(0) - iy.float().view(N, 1, 1)   # (N, H, W)
+        gaussians = torch.exp(-(dx ** 2 + dy ** 2) / (2.0 * sigmas.view(N, 1, 1) ** 2))
 
-            # Center Gaussian at the snapped integer cell (ix, iy), NOT at the
-            # float position (fx, fy).  This guarantees gt_hm[iy, ix] = 1.0
-            # exactly, so pos_mask = (gt_hm == 1) always finds positives.
-            # Sub-pixel precision is handled by the reg head separately.
-            gaussian = torch.exp(
-                -((grid_x - ix) ** 2 + (grid_y - iy) ** 2) / (2.0 * sigma ** 2)
-            )
-            c = label.long().item()
-            gt_hm[b, c] = torch.maximum(gt_hm[b, c], gaussian)
+        # Per-class max — loop over C (10) not N, so at most 10 GPU calls.
+        cls = labels.long()
+        for c in range(num_classes):
+            mask_c = (cls == c)
+            if not mask_c.any():
+                continue
+            gt_hm[b, c] = torch.maximum(gt_hm[b, c], gaussians[mask_c].amax(dim=0))
 
-            # wh target: size in feature-map pixel scale
-            gt_wh[b, 0, iy, ix] = fw
-            gt_wh[b, 1, iy, ix] = fh
-
-            # reg target: fractional offset from grid-cell corner
-            gt_reg[b, 0, iy, ix] = fx - ix
-            gt_reg[b, 1, iy, ix] = fy - iy
-
-            reg_mask[b, iy, ix] = 1.0
+        # wh / reg / mask — vectorised fancy indexing (no loop over N).
+        gt_wh[b, 0, iy, ix]  = fw
+        gt_wh[b, 1, iy, ix]  = fh
+        gt_reg[b, 0, iy, ix] = fx - ix.float()
+        gt_reg[b, 1, iy, ix] = fy - iy.float()
+        reg_mask[b, iy, ix]  = 1.0
 
     return gt_hm, gt_wh, gt_reg, reg_mask
 
