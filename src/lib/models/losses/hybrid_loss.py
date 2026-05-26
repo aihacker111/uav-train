@@ -106,8 +106,12 @@ def render_gaussian_heatmaps(
             # Gaussian sigma: proportional to sqrt of box area in feature map
             sigma = max(1.0, (fw * fh) ** 0.5 * 0.25)
 
+            # Center Gaussian at the snapped integer cell (ix, iy), NOT at the
+            # float position (fx, fy).  This guarantees gt_hm[iy, ix] = 1.0
+            # exactly, so pos_mask = (gt_hm == 1) always finds positives.
+            # Sub-pixel precision is handled by the reg head separately.
             gaussian = torch.exp(
-                -((grid_x - fx) ** 2 + (grid_y - fy) ** 2) / (2.0 * sigma ** 2)
+                -((grid_x - ix) ** 2 + (grid_y - iy) ** 2) / (2.0 * sigma ** 2)
             )
             c = label.long().item()
             gt_hm[b, c] = torch.maximum(gt_hm[b, c], gaussian)
