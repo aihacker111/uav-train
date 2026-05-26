@@ -1,21 +1,20 @@
 """
 HybridLoss: pure DETR loss for HybridECDet.
 
-Stage 2 — DETR (Hungarian matching, applied per decoder layer):
+Stage 2 — DETR (Hungarian matching, per decoder layer):
   L = L_mal(cls) + λ_bbox * L_L1(box) + λ_ciou * L_GIoU(box)
-    + λ_reid * (L_CE + L_triplet)(reid)  [if reid_classifier is set]
 
-Auxiliary losses from intermediate decoder layers use progressive weights:
-  layer i weight = 0.4 + 0.6 * i / (num_aux_layers - 1)   range [0.4, 1.0]
-  (shallower layers get smaller weight since their predictions are less refined)
+Heatmap branch (CenterNet on S4):
+  L_hm  — CornerNet focal loss (Gaussian radius from IoU criterion, AMOT-style)
+  L_wh  — NormRegL1Loss: relative error |pred/target − 1|, scale-invariant (AMOT)
+  L_reg — SmoothL1 on sub-pixel offset (AMOT)
 
-  The combined detection loss (final + aux) is then normalised by the sum of all
-  layer weights (≈ 4.5 for 6 decoder layers), so L represents the average
-  per-decoder-layer loss.
+Detection vs ReID weighting — learnable uncertainty (Kendall et al. 2018, AMOT):
+  total = 0.5 * (exp(−s_det) * det_loss + exp(−s_id) * reid_loss + s_det + s_id)
+  s_det, s_id are learnable parameters; model auto-balances the two tasks.
 
 DN (denoising) loss — key for fast DETR convergence:
-  λ_dn ramped from 0.5 → 1.0 over dn_warmup_epochs to let the main detection
-  loss establish a stable gradient before DN contributes at full weight.
+  λ_dn ramped from 0.5 → 1.0 over dn_warmup_epochs.
 """
 from __future__ import annotations
 
@@ -51,6 +50,32 @@ def _gather_at_ind(feat: Tensor, ind: Tensor) -> Tensor:
     flat = feat.permute(0, 2, 3, 1).reshape(B, H * W, C)
     idx  = ind.unsqueeze(-1).expand(B, ind.shape[1], C)
     return flat.gather(1, idx)
+
+
+def _gaussian_radius(fw: float, fh: float, min_overlap: float = 0.7) -> float:
+    """CornerNet IoU-based Gaussian radius — ported from AMOT/src/lib/utils/image.py.
+
+    Returns the largest pixel radius r such that a Gaussian centred at the GT peak
+    still has IoU ≥ min_overlap with the GT box when thresholded at that radius.
+    Three corner-placement scenarios give three quadratics; r = min of all three.
+    """
+    a1  = 1.0;  b1 = fw + fh
+    c1  = fw * fh * (1.0 - min_overlap) / (1.0 + min_overlap)
+    sq1 = math.sqrt(max(0.0, b1 * b1 - 4.0 * a1 * c1))
+    r1  = (b1 + sq1) / 2.0
+
+    a2  = 4.0;  b2 = 2.0 * (fw + fh)
+    c2  = (1.0 - min_overlap) * fw * fh
+    sq2 = math.sqrt(max(0.0, b2 * b2 - 4.0 * a2 * c2))
+    r2  = (b2 + sq2) / 2.0
+
+    a3  = 4.0 * min_overlap
+    b3  = -2.0 * min_overlap * (fw + fh)
+    c3  = (min_overlap - 1.0) * fw * fh
+    sq3 = math.sqrt(max(0.0, b3 * b3 - 4.0 * a3 * c3))
+    r3  = (b3 + sq3) / 2.0
+
+    return min(r1, r2, r3)
 
 
 def render_gaussian_heatmaps(
@@ -103,8 +128,11 @@ def render_gaussian_heatmaps(
             ix = max(0, min(ix, feat_w - 1))
             iy = max(0, min(iy, feat_h - 1))
 
-            # Gaussian sigma: proportional to sqrt of box area in feature map
-            sigma = max(1.0, (fw * fh) ** 0.5 * 0.25)
+            # Gaussian radius from IoU criterion (AMOT / CornerNet).
+            # sigma = diameter/6 matches draw_umich_gaussian in AMOT/image.py.
+            radius   = max(0, int(_gaussian_radius(fw, fh)))
+            diameter = 2 * radius + 1
+            sigma    = max(1.0, diameter / 6.0)
 
             # Center Gaussian at the snapped integer cell (ix, iy), NOT at the
             # float position (fx, fy).  This guarantees gt_hm[iy, ix] = 1.0
@@ -249,6 +277,15 @@ class HybridLoss(nn.Module):
         self.triplet_loss    = TripletLoss(margin=0.3)
         self.matcher         = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
 
+        # Learnable uncertainty weights — AMOT / Kendall et al. 2018.
+        # s = log(σ²): higher s → lower effective weight exp(−s).
+        # s_det=-1.85 → initial det weight ≈ exp(1.85)/2 ≈ 3.18
+        # s_id =-1.05 → initial reid weight ≈ exp(1.05)/2 ≈ 1.43
+        # The model will increase s_id when reid loss is much larger than det loss,
+        # automatically reducing reid's gradient share without manual tuning.
+        self.s_det = nn.Parameter(torch.tensor(-1.85))
+        self.s_id  = nn.Parameter(torch.tensor(-1.05))
+
     def set_epoch(self, epoch: int) -> None:
         """Track epoch for DN warmup schedule."""
         self._epoch = epoch
@@ -365,9 +402,15 @@ class HybridLoss(nn.Module):
             L     = detr_out.boxes_all.shape[0]
             n_aux = L - 1
             for layer in range(n_aux):
+                # Re-match per layer (as in the original EdgeCrafter criterion.py:344-345).
+                # Early layers have different predictions than the final layer, so reusing
+                # final-layer indices sends incorrect gradients to shallow decoder layers.
+                aux_indices = self.matcher(
+                    detr_out.logits_all[layer], detr_out.boxes_all[layer], targets
+                )
                 aux = self._detr_layer_loss(
                     detr_out.logits_all[layer], detr_out.boxes_all[layer],
-                    targets, indices, num_boxes=num_boxes, logit_adj=log_adj,
+                    targets, aux_indices, num_boxes=num_boxes, logit_adj=log_adj,
                 )
                 total            = total + aux['total']   # equal weight per layer
                 layer_weight_sum = layer_weight_sum + 1.0 # matches EdgeCrafter (no progressive ramp)
@@ -497,12 +540,12 @@ class HybridLoss(nn.Module):
         targets: List[dict],
     ) -> Dict[str, Tensor]:
         """
-        CenterNet-style dense heatmap loss on S4 features.
+        CenterNet-style heatmap loss on S4 features — aligned with AMOT.
 
-        Components:
-          loss_hm  — CornerNet focal loss on heatmap (all spatial positions).
-          loss_wh  — L1 loss on width/height at GT grid cells only.
-          loss_reg — L1 loss on sub-pixel offset at GT grid cells only.
+        loss_hm  — CornerNet focal loss; Gaussian radius from IoU criterion.
+        loss_wh  — NormRegL1Loss: |pred/target − 1|, scale-invariant (AMOT).
+                   Avoids large objects dominating wh gradient over tiny UAV objects.
+        loss_reg — SmoothL1 on sub-pixel offset (AMOT default).
         """
         B, C, H, W = hm_out.hm.shape
 
@@ -513,18 +556,26 @@ class HybridLoss(nn.Module):
         loss_hm = centernet_focal_loss(hm_out.hm, gt_hm)
 
         # wh and reg: only at positions where there is a GT object
-        mask = reg_mask.bool()                        # (B, H, W)
+        mask  = reg_mask.bool()                       # (B, H, W)
         n_pos = mask.sum().clamp(min=1).float()
 
         if mask.any():
-            # (B,2,H,W) → gather at positive positions
-            pred_wh  = hm_out.wh.permute(0, 2, 3, 1)[mask]   # (P, 2)
-            pred_reg = hm_out.reg.permute(0, 2, 3, 1)[mask]   # (P, 2)
-            tgt_wh   = gt_wh.permute(0, 2, 3, 1)[mask]        # (P, 2)
-            tgt_reg  = gt_reg.permute(0, 2, 3, 1)[mask]       # (P, 2)
+            # (B,2,H,W) → gather at positive positions → (P, 2)
+            pred_wh  = hm_out.wh.permute(0, 2, 3, 1)[mask]
+            pred_reg = hm_out.reg.permute(0, 2, 3, 1)[mask]
+            tgt_wh   = gt_wh.permute(0, 2, 3, 1)[mask]
+            tgt_reg  = gt_reg.permute(0, 2, 3, 1)[mask]
 
-            loss_wh  = F.l1_loss(pred_wh,  tgt_wh,  reduction='sum') / n_pos
-            loss_reg = F.l1_loss(pred_reg, tgt_reg, reduction='sum') / n_pos
+            # NormRegL1Loss (AMOT): relative error — scale-invariant across object sizes.
+            # Equivalent to: |pred_wh / target_wh − 1|, normalized by n_pos.
+            wh_ratio = pred_wh / (tgt_wh + 1e-4)
+            loss_wh  = F.l1_loss(wh_ratio, torch.ones_like(wh_ratio),
+                                 reduction='sum') / n_pos
+
+            # SmoothL1 for offset (AMOT default 'sl1').
+            # Sub-pixel targets are in [0,1) so SmoothL1 ≈ L1 in practice,
+            # but is more robust to the occasional noisy annotation.
+            loss_reg = F.smooth_l1_loss(pred_reg, tgt_reg, reduction='sum') / n_pos
         else:
             loss_wh  = hm_out.wh.sum()  * 0.0
             loss_reg = hm_out.reg.sum() * 0.0
@@ -550,30 +601,38 @@ class HybridLoss(nn.Module):
         ]
 
         s2 = self._stage2_loss(outputs['stage2'], targets)
-        total = s2['total']
+        det_total = s2['total']   # DETR detection loss (all decoder layers + DN)
 
         loss_stats: Dict[str, Tensor] = {
-            'loss':      total,
             'loss_cls':  s2['cls'],
             'loss_bbox': s2['bbox'],
             'loss_giou': s2['giou'],
         }
         loss_stats['loss_enc_aux'] = s2['enc_aux'] if s2['enc_aux'] is not None \
-                                     else total.detach() * 0.0
+                                     else det_total.detach() * 0.0
 
-        if self.reid_classifier is not None and 'ids' in targets[0]:
-            l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])
-            total  = total + self.lambda_reid * l_reid
-            loss_stats['loss_reid'] = l_reid
-
-        # Heatmap branch: CenterNet focal + wh + reg losses on S4 feature
+        # Heatmap branch is part of detection (same task, same s_det weight).
         hm_out = outputs['stage2'].heatmap_out
         if hm_out is not None:
             l_hm = self._heatmap_loss(hm_out, targets)
-            total = total + l_hm['total']
+            det_total = det_total + l_hm['total']
             loss_stats['loss_hm']  = l_hm['hm']
             loss_stats['loss_wh']  = l_hm['wh']
             loss_stats['loss_reg'] = l_hm['reg']
+
+        # Learnable uncertainty weighting — AMOT / Kendall et al. 2018:
+        #   total = 0.5 * (exp(−s_det)*det + exp(−s_id)*reid + s_det + s_id)
+        # s_det, s_id are learnable: model auto-scales each task's gradient share.
+        if self.reid_classifier is not None and 'ids' in targets[0]:
+            l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])
+            total  = 0.5 * (
+                torch.exp(-self.s_det) * det_total
+                + torch.exp(-self.s_id) * l_reid
+                + self.s_det + self.s_id
+            )
+            loss_stats['loss_reid'] = l_reid
+        else:
+            total = 0.5 * (torch.exp(-self.s_det) * det_total + self.s_det)
 
         loss_stats['loss'] = total
         return total, loss_stats

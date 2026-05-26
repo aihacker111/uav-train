@@ -68,7 +68,7 @@ class CenterNetHead(nn.Module):
     def forward(self, feat: Tensor) -> CenterNetOutput:
         return CenterNetOutput(
             hm  = self.hm(feat).sigmoid(),
-            wh  = self.wh(feat),
+            wh  = F.relu(self.wh(feat)),  # targets are always positive pixel-scale values
             reg = self.reg(feat),
         )
 

@@ -219,7 +219,7 @@ class opts(object):
                                  help='root directory of the dataset')
 
         # ── HybridLoss weights ────────────────────────────────────────────────────
-        self.parser.add_argument('--bbox_weight', type=float, default=2.0,
+        self.parser.add_argument('--bbox_weight', type=float, default=5.0,
                                  help='SmoothL1 bounding-box loss weight (lambda_bbox).')
         self.parser.add_argument('--giou_weight', type=float, default=2.0,
                                  help='CIoU loss weight (lambda_ciou).')
