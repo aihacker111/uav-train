@@ -238,11 +238,6 @@ class opts(object):
                                  help='Weight for width/height L1 loss at GT cells (lambda_wh).')
         self.parser.add_argument('--reg_weight', type=float, default=1.0,
                                  help='Weight for sub-pixel offset L1 loss at GT cells (lambda_reg).')
-        # ── Class-imbalance methods ───────────────────────────────────────────
-        self.parser.add_argument('--logit_adj_tau', type=float, default=0.5,
-                                 help='Logit Adjustment (ICLR 2021) temperature tau. '
-                                      'Adds tau*log(pi_c) to logits at train time to correct for '
-                                      'class-frequency prior. 0 = disabled.')
         self.parser.add_argument('--aux_loss',
                                  default=True,
                                  action=argparse.BooleanOptionalAction,

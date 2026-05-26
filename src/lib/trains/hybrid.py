@@ -52,7 +52,6 @@ class HybridTrainer(BaseTrainer):
             lambda_triplet   = opt.triplet_weight,
             aux_loss         = opt.aux_loss,
             reid_classifier  = reid_classifier,
-            logit_adj_tau    = getattr(opt, 'logit_adj_tau', 0.5),
             lambda_heatmap   = getattr(opt, 'heatmap_weight', 1.0),
             lambda_wh        = getattr(opt, 'wh_weight',      0.1),
             lambda_reg       = getattr(opt, 'reg_weight',     1.0),

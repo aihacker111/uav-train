@@ -15,6 +15,9 @@ Detection vs ReID weighting — learnable uncertainty (Kendall et al. 2018, AMOT
 
 DN (denoising) loss — key for fast DETR convergence:
   λ_dn ramped from 0.5 → 1.0 over dn_warmup_epochs.
+
+Note: Logit Adjustment has been removed — MAL already handles class imbalance
+via p^gamma modulation on negatives.
 """
 from __future__ import annotations
 
@@ -160,18 +163,12 @@ def render_gaussian_heatmaps(
 def mal_loss(
     pred:      Tensor,
     target_q:  Tensor,
-    gamma:     float         = 1.5,
-    num_boxes: int           = 1,
-    logit_adj: Tensor | None = None,
+    gamma:     float = 1.5,
+    num_boxes: int   = 1,
 ) -> Tensor:
-    """
-    Modulation Augmented Loss — EdgeCrafter / D-FINE.
+    """Modulation Augmented Loss — EdgeCrafter / D-FINE.
     target_q: iou^gamma for positives, 0 for negatives.
-
-    logit_adj: [C] log-prior term added to logits at train time (Logit Adjustment).
     """
-    if logit_adj is not None:
-        pred = pred + logit_adj.to(pred.device)
     p      = pred.sigmoid().detach()
     is_pos = (target_q > 0).float()
     weight = p.pow(gamma) * (1.0 - is_pos) + is_pos
@@ -237,10 +234,6 @@ class HybridLoss(nn.Module):
         mal_gamma:        float = 2.0,
         aux_loss:         bool  = True,
         reid_classifier:  Optional[nn.Linear] = None,
-        # Logit Adjustment (ICLR 2021): add tau * log(pi_c) to logits at train
-        # time so the decision boundary corrects for class-frequency prior.
-        # logit_adj_tau=0 disables logit adjustment.
-        logit_adj_tau:    float = 0.0,
         # Heatmap (CenterNet) branch losses
         lambda_heatmap:   float = 1.0,   # focal loss on heatmap
         lambda_wh:        float = 0.1,   # L1 loss on wh (at GT cell positions)
@@ -268,11 +261,6 @@ class HybridLoss(nn.Module):
         self.lambda_wh        = lambda_wh
         self.lambda_reg       = lambda_reg
 
-        self.logit_adj_tau = logit_adj_tau
-        # EMA accumulator: tracks per-class positive match counts for Logit Adjustment.
-        # Initialised to ones so all classes start with equal weight.
-        self.register_buffer('_acc_pos', torch.ones(num_classes))
-
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
         self.matcher         = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
@@ -289,40 +277,6 @@ class HybridLoss(nn.Module):
         """Track epoch for DN warmup schedule."""
         self._epoch = epoch
 
-    # ── Class-imbalance helpers ────────────────────────────────────────────────
-
-    @torch.no_grad()
-    def _update_acc_pos(self, indices: list, targets: List[dict]) -> None:
-        """EMA update of per-class positive match counts (called once per forward pass)."""
-        dev    = self._acc_pos.device
-        counts = torch.zeros(self.num_classes, device=dev)
-        for m, t in zip(indices, targets):
-            si, ti = m['src_i'], m['tgt_i']
-            if len(si):
-                cls = t['labels'][ti.to(t['labels'].device)].to(dev).long()
-                for c in cls:
-                    if 0 <= c.item() < self.num_classes:
-                        counts[c] += 1
-        self._acc_pos.mul_(0.99).add_(counts * 0.01)
-
-    def _logit_adj(self) -> Tensor | None:
-        """Log-prior adjustment vector [C] for Logit Adjustment at train time.
-
-        adj[c] = tau_eff * log(pi_c)  where pi_c = acc_pos[c] / total
-        Ramped from 0 → logit_adj_tau over dn_warmup_epochs.
-        Without ramping, early uniform _acc_pos makes adj identical for all
-        classes (-tau*log(C)), forcing the model to output larger raw logits
-        overall — which inflates inference scores and produces false positives.
-        """
-        if self.logit_adj_tau <= 0:
-            return None
-        ramp    = min(1.0, self._epoch / max(self.dn_warmup_epochs, 1))
-        tau_eff = self.logit_adj_tau * ramp
-        if tau_eff <= 0:
-            return None
-        log_prior = torch.log(self._acc_pos / self._acc_pos.sum().clamp(min=1e-6) + 1e-8)
-        return tau_eff * log_prior
-
     # ── DETR layer loss ────────────────────────────────────────────────────────
 
     def _detr_layer_loss(
@@ -331,8 +285,7 @@ class HybridLoss(nn.Module):
         boxes:     Tensor,
         targets:   List[dict],
         indices:   list,
-        num_boxes: int           = 0,
-        logit_adj: Tensor | None = None,
+        num_boxes: int = 0,
     ) -> Dict[str, Tensor]:
         dev = logits.device
         B, Q, C = logits.shape
@@ -363,8 +316,7 @@ class HybridLoss(nn.Module):
             src_b_list.append(boxes[b][si])
             tgt_b_list.append(targets[b]['boxes'][ti].to(dev))
 
-        loss_cls = mal_loss(logits, target_q, gamma=self.mal_gamma, num_boxes=num_boxes,
-                            logit_adj=logit_adj)
+        loss_cls = mal_loss(logits, target_q, gamma=self.mal_gamma, num_boxes=num_boxes)
 
         if src_b_list:
             src_b     = torch.cat(src_b_list)
@@ -386,14 +338,8 @@ class HybridLoss(nn.Module):
         num_boxes = max(sum(len(t['labels']) for t in targets), 1)
         indices   = self.matcher(detr_out.logits, detr_out.boxes, targets)
 
-        # Update per-class positive counts for Logit Adjustment.
-        if self.training:
-            self._update_acc_pos(indices, targets)
-
-        log_adj = self._logit_adj()
-
         d = self._detr_layer_loss(detr_out.logits, detr_out.boxes, targets, indices,
-                                   num_boxes=num_boxes, logit_adj=log_adj)
+                                   num_boxes=num_boxes)
         layer_weight_sum = 1.0
         total = d['total']
 
@@ -409,7 +355,7 @@ class HybridLoss(nn.Module):
                 )
                 aux = self._detr_layer_loss(
                     detr_out.logits_all[layer], detr_out.boxes_all[layer],
-                    targets, aux_indices, num_boxes=num_boxes, logit_adj=log_adj,
+                    targets, aux_indices, num_boxes=num_boxes,
                 )
                 total            = total + aux['total']   # equal weight per layer
                 layer_weight_sum = layer_weight_sum + 1.0 # matches EdgeCrafter (no progressive ramp)
@@ -418,7 +364,7 @@ class HybridLoss(nn.Module):
 
         if detr_out.dn_outputs is not None and detr_out.dn_meta is not None:
             l_dn     = self._dn_loss(detr_out.dn_outputs, targets, detr_out.dn_meta,
-                                     num_boxes=num_boxes, logit_adj=log_adj)
+                                     num_boxes=num_boxes)
             dn_scale = min(1.0, 0.5 + 0.5 * self._epoch / max(1, self.dn_warmup_epochs))
             total    = total + dn_scale * self.lambda_dn * l_dn
 
@@ -440,7 +386,7 @@ class HybridLoss(nn.Module):
                 ]
                 d_enc = self._detr_layer_loss(
                     enc_out['pred_logits'], enc_out['pred_boxes'],
-                    targets, enc_indices, num_boxes=num_boxes, logit_adj=log_adj,
+                    targets, enc_indices, num_boxes=num_boxes,
                 )
                 l_enc_aux = l_enc_aux + d_enc['total']
                 n_enc += 1
@@ -455,8 +401,7 @@ class HybridLoss(nn.Module):
         dn_outputs: list,
         targets:    List[dict],
         dn_meta:    dict,
-        num_boxes:  int           = 1,
-        logit_adj:  Tensor | None = None,
+        num_boxes:  int = 1,
     ) -> Tensor:
         dn_positive_idx = dn_meta['dn_positive_idx']
         dn_num_group    = dn_meta['dn_num_group']
@@ -479,7 +424,7 @@ class HybridLoss(nn.Module):
         for layer_out in dn_outputs:
             d = self._detr_layer_loss(
                 layer_out['pred_logits'], layer_out['pred_boxes'],
-                targets, dn_indices, num_boxes=dn_num_boxes, logit_adj=logit_adj,
+                targets, dn_indices, num_boxes=dn_num_boxes,
             )
             total_dn = d['total'] if total_dn is None else total_dn + d['total']
 
