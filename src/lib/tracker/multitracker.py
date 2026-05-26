@@ -39,7 +39,7 @@ class MCTrack(MCBaseTrack):
         self.cls_id = cls_id
 
         # wait activate
-        self._tlwh = np.asarray(tlwh, dtype=np.float)
+        self._tlwh = np.asarray(tlwh, dtype=np.float64)
 
         self.kalman_filter = None
         self.mean, self.covariance = None, None
@@ -53,7 +53,7 @@ class MCTrack(MCBaseTrack):
         self.features = deque([], maxlen=buff_size)  # 指定了限制长度
         self.alpha = 0.9
 
-        self.curr_tlwh = np.asarray(tlwh, dtype=np.float)
+        self.curr_tlwh = np.asarray(tlwh, dtype=np.float64)
 
         self.tlwh_deque = deque([], maxlen=30)
 
