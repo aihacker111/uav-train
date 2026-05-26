@@ -279,12 +279,11 @@ class HybridLoss(nn.Module):
 
         # Learnable uncertainty weights — AMOT / Kendall et al. 2018.
         # s = log(σ²): higher s → lower effective weight exp(−s).
-        # s_det=-1.85 → initial det weight ≈ exp(1.85)/2 ≈ 3.18
-        # s_id =-1.05 → initial reid weight ≈ exp(1.05)/2 ≈ 1.43
-        # The model will increase s_id when reid loss is much larger than det loss,
-        # automatically reducing reid's gradient share without manual tuning.
-        self.s_det = nn.Parameter(torch.tensor(-1.85))
-        self.s_id  = nn.Parameter(torch.tensor(-1.05))
+        # s = -log(2) ≈ -0.693 → exp(-s) = 2 → net weight = 2/2 = 1.0
+        # This initialises the Kendall formula to the same loss scale as the
+        # unweighted sum (det + reid), so initial loss ≈ 14–16 as expected.
+        self.s_det = nn.Parameter(torch.tensor(-0.693))
+        self.s_id  = nn.Parameter(torch.tensor(-0.693))
 
     def set_epoch(self, epoch: int) -> None:
         """Track epoch for DN warmup schedule."""
