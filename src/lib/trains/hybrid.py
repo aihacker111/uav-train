@@ -51,6 +51,9 @@ class HybridTrainer(BaseTrainer):
             lambda_triplet   = opt.triplet_weight,
             aux_loss         = opt.aux_loss,
             reid_classifier  = reid_classifier,
+            efl_beta         = getattr(opt, 'efl_beta',      0.999),
+            efl_gamma        = getattr(opt, 'efl_gamma',     0.5),
+            logit_adj_tau    = getattr(opt, 'logit_adj_tau', 0.5),
         )
         return loss_stats, loss
 

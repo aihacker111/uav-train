@@ -304,11 +304,25 @@ class COCOEvaluator:
             ar_mean = {cls: float(np.mean(v)) for cls, v in ar_area.items()}
             result[f'mAR_{area_name[0].upper()}'] = self._mean_over_classes(ar_mean)
 
-        # ── Per-class AP@50 ───────────────────────────────────────────────────
+        # ── Per-class AP@50 and per-class mAP ────────────────────────────────
         for cls, v in sorted(ap50.items()):
             name = self.class_names[cls] if cls < len(self.class_names) else f'cls{cls}'
             result[f'AP50_{name}'] = v
             result[f'AP50_cls{cls}'] = v   # legacy key
+
+        # Per-class full mAP (AP@[.5:.95]) — matches EdgeCrafter's bbox-AP column
+        for cls, v in sorted(map_per_cls.items()):
+            name = self.class_names[cls] if cls < len(self.class_names) else f'cls{cls}'
+            result[f'AP_{name}'] = v
+            result[f'AP_cls{cls}'] = v     # legacy key
+
+        # EdgeCrafter-compatible list format: same 12-value order as pycocotools/faster_coco_eval
+        result['coco_eval_bbox'] = [
+            result['mAP'],     result['mAP50'],   result['mAP75'],
+            result['mAP_S'],   result['mAP_M'],   result['mAP_L'],
+            result['mAR_1'],   result['mAR_10'],  result['mAR_100'],
+            result['mAR_S'],   result['mAR_M'],   result['mAR_L'],
+        ]
 
         return result
 
@@ -338,13 +352,23 @@ class COCOEvaluator:
             v = stats.get(key, -1.0)
             print(f' {label} = {v:0.3f}')
 
-        # Per-class breakdown
-        print()
-        print(' Per-class AP @ IoU=0.50:')
+        # Per-class breakdown — matches EdgeCrafter's "### Class-wise Evaluation Metrics ###" table
+        rows = []
         for cls in range(self.num_classes):
-            name = self.class_names[cls] if cls < len(self.class_names) else f'cls{cls}'
-            v = stats.get(f'AP50_{name}', 0.0)
-            print(f'   {name:<20s} {v:0.3f}')
+            name  = self.class_names[cls] if cls < len(self.class_names) else f'cls{cls}'
+            ap    = stats.get(f'AP_{name}',   0.0) * 100
+            ap50  = stats.get(f'AP50_{name}', 0.0) * 100
+            rows.append([name, f'{ap:.2f}', f'{ap50:.2f}'])
+        print(f'\n### Class-wise Evaluation Metrics ###')
+        try:
+            from tabulate import tabulate as _tabulate
+            print(_tabulate(rows, headers=['class', 'bbox-AP', 'bbox-AP50'], tablefmt='pretty'))
+        except ImportError:
+            header = f"{'class':<22} {'bbox-AP':>8} {'bbox-AP50':>10}"
+            print(header)
+            print('-' * len(header))
+            for row in rows:
+                print(f'{row[0]:<22} {row[1]:>8} {row[2]:>10}')
         print()
 
 

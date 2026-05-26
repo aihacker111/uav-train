@@ -2,7 +2,7 @@
 HybridLoss: pure DETR loss for HybridECDet.
 
 Stage 2 — DETR (Hungarian matching, applied per decoder layer):
-  L = L_varifocal(cls) + λ_bbox * L_L1(box) + λ_ciou * L_CIoU(box)
+  L = L_mal(cls) + λ_bbox * L_L1(box) + λ_ciou * L_GIoU(box)
     + λ_reid * (L_CE + L_triplet)(reid)  [if reid_classifier is set]
 
 Auxiliary losses from intermediate decoder layers use progressive weights:
@@ -54,18 +54,29 @@ def _gather_at_ind(feat: Tensor, ind: Tensor) -> Tensor:
 
 
 def mal_loss(
-    pred:      Tensor,
-    target_q:  Tensor,
-    gamma:     float = 1.5,
-    num_boxes: int   = 1,
+    pred:        Tensor,
+    target_q:    Tensor,
+    gamma:       float         = 1.5,
+    num_boxes:   int           = 1,
+    efl_weights: Tensor | None = None,
+    logit_adj:   Tensor | None = None,
 ) -> Tensor:
     """
     Modulation Augmented Loss — EdgeCrafter / D-FINE.
     target_q: iou^gamma for positives, 0 for negatives.
+
+    efl_weights: [C] per-class suppression factor for negatives (Equalized Focal Loss).
+    logit_adj:   [C] log-prior term added to logits at train time (Logit Adjustment).
     """
+    if logit_adj is not None:
+        pred = pred + logit_adj.to(pred.device)
     p      = pred.sigmoid().detach()
     is_pos = (target_q > 0).float()
     weight = p.pow(gamma) * (1.0 - is_pos) + is_pos
+    if efl_weights is not None:
+        # Suppress negative-sample gradient for frequent classes; leave positives unchanged.
+        eq     = efl_weights.to(pred.device).view(1, 1, -1)
+        weight = weight * (is_pos + (1.0 - is_pos) * eq)
     loss   = F.binary_cross_entropy_with_logits(pred, target_q, weight=weight, reduction='none')
     return loss.mean(1).sum() * pred.shape[1] / max(num_boxes, 1)
 
@@ -125,9 +136,19 @@ class HybridLoss(nn.Module):
         lambda_dn:        float = 1.0,
         dn_warmup_epochs: int   = 10,
         lambda_enc_aux:   float = 1.0,   # enc_score_head supervision weight
-        mal_gamma:        float = 1.5,
+        mal_gamma:        float = 2.0,
         aux_loss:         bool  = True,
         reid_classifier:  Optional[nn.Linear] = None,
+        # ── Class-imbalance methods ───────────────────────────────────────────
+        # Equalized Focal Loss (EFL, CVPR 2022): accumulates per-class positive
+        # match counts via EMA and suppresses negative gradients for frequent classes.
+        # efl_beta=0 disables EFL entirely.
+        efl_beta:         float = 0.999,  # suppression strength in 1 - beta * freq^gamma
+        efl_gamma:        float = 0.5,    # frequency exponent (0.5 from EFL paper)
+        # Logit Adjustment (ICLR 2021): add tau * log(pi_c) to logits at train
+        # time so the decision boundary corrects for class-frequency prior.
+        # logit_adj_tau=0 disables logit adjustment.
+        logit_adj_tau:    float = 0.0,
         # kept for call-site backward compat — silently ignored
         lambda_wh:             float = 0.0,
         lambda_reg:            float = 0.0,
@@ -150,6 +171,13 @@ class HybridLoss(nn.Module):
         self.aux_loss         = aux_loss
         self._epoch           = 0
 
+        self.efl_beta      = efl_beta
+        self.efl_gamma     = efl_gamma
+        self.logit_adj_tau = logit_adj_tau
+        # EMA accumulator: tracks average per-class positive matches per forward pass.
+        # Initialised to ones so all classes start with equal weight.
+        self.register_buffer('_acc_pos', torch.ones(num_classes))
+
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
         self.matcher         = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
@@ -158,15 +186,56 @@ class HybridLoss(nn.Module):
         """Track epoch for DN warmup schedule."""
         self._epoch = epoch
 
+    # ── Class-imbalance helpers ────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _update_efl_stats(self, indices: list, targets: List[dict]) -> None:
+        """EMA update of per-class positive match counts (called once per forward pass)."""
+        dev    = self._acc_pos.device
+        counts = torch.zeros(self.num_classes, device=dev)
+        for m, t in zip(indices, targets):
+            si, ti = m['src_i'], m['tgt_i']
+            if len(si):
+                cls = t['labels'][ti.to(t['labels'].device)].to(dev).long()
+                for c in cls:
+                    if 0 <= c.item() < self.num_classes:
+                        counts[c] += 1
+        # EMA decay = 0.99; counts update at rate 0.01 per step
+        self._acc_pos.mul_(0.99).add_(counts * 0.01)
+
+    def _efl_weights(self) -> Tensor | None:
+        """Per-class equalization factor [C] for EFL negative suppression.
+
+        eq[c] = 1 - efl_beta * (acc_pos[c] / total)^efl_gamma
+        Frequent classes (e.g. car) get eq << 1 → their negative gradient is suppressed.
+        """
+        if self.efl_beta <= 0:
+            return None
+        freq = self._acc_pos / self._acc_pos.sum().clamp(min=1e-6)
+        return (1.0 - self.efl_beta * freq.pow(self.efl_gamma)).clamp(0.0, 1.0)
+
+    def _logit_adj(self) -> Tensor | None:
+        """Log-prior adjustment vector [C] for Logit Adjustment at train time.
+
+        adj[c] = tau * log(pi_c)  where pi_c = acc_pos[c] / total
+        Added to logits so rare classes are easier to predict positively.
+        """
+        if self.logit_adj_tau <= 0:
+            return None
+        log_prior = torch.log(self._acc_pos / self._acc_pos.sum().clamp(min=1e-6) + 1e-8)
+        return self.logit_adj_tau * log_prior
+
     # ── DETR layer loss ────────────────────────────────────────────────────────
 
     def _detr_layer_loss(
         self,
-        logits:    Tensor,
-        boxes:     Tensor,
-        targets:   List[dict],
-        indices:   list,
-        num_boxes: int = 0,
+        logits:      Tensor,
+        boxes:       Tensor,
+        targets:     List[dict],
+        indices:     list,
+        num_boxes:   int           = 0,
+        efl_weights: Tensor | None = None,
+        logit_adj:   Tensor | None = None,
     ) -> Dict[str, Tensor]:
         dev = logits.device
         B, Q, C = logits.shape
@@ -197,7 +266,8 @@ class HybridLoss(nn.Module):
             src_b_list.append(boxes[b][si])
             tgt_b_list.append(targets[b]['boxes'][ti].to(dev))
 
-        loss_cls = mal_loss(logits, target_q, gamma=self.mal_gamma, num_boxes=num_boxes)
+        loss_cls = mal_loss(logits, target_q, gamma=self.mal_gamma, num_boxes=num_boxes,
+                            efl_weights=efl_weights, logit_adj=logit_adj)
 
         if src_b_list:
             src_b     = torch.cat(src_b_list)
@@ -218,8 +288,17 @@ class HybridLoss(nn.Module):
     ) -> Dict[str, Tensor]:
         num_boxes = max(sum(len(t['labels']) for t in targets), 1)
         indices   = self.matcher(detr_out.logits, detr_out.boxes, targets)
-        d         = self._detr_layer_loss(detr_out.logits, detr_out.boxes, targets, indices,
-                                          num_boxes=num_boxes)
+
+        # Update EFL stats once per forward pass (training only).
+        if self.training:
+            self._update_efl_stats(indices, targets)
+
+        efl_w   = self._efl_weights()
+        log_adj = self._logit_adj()
+
+        d = self._detr_layer_loss(detr_out.logits, detr_out.boxes, targets, indices,
+                                   num_boxes=num_boxes,
+                                   efl_weights=efl_w, logit_adj=log_adj)
         layer_weight_sum = 1.0
         total = d['total']
 
@@ -227,30 +306,30 @@ class HybridLoss(nn.Module):
             L     = detr_out.boxes_all.shape[0]
             n_aux = L - 1
             for layer in range(n_aux):
-                aux   = self._detr_layer_loss(
+                aux = self._detr_layer_loss(
                     detr_out.logits_all[layer], detr_out.boxes_all[layer],
                     targets, indices, num_boxes=num_boxes,
+                    efl_weights=efl_w, logit_adj=log_adj,
                 )
-                aux_w = 0.4 + 0.6 * (layer / max(n_aux - 1, 1))
-                total = total + aux_w * aux['total']
-                layer_weight_sum += aux_w
+                total            = total + aux['total']   # equal weight per layer
+                layer_weight_sum = layer_weight_sum + 1.0 # matches EdgeCrafter (no progressive ramp)
 
-        total = total / layer_weight_sum
+        total = total / layer_weight_sum  # average over all decoder layers
 
         if detr_out.dn_outputs is not None and detr_out.dn_meta is not None:
             l_dn     = self._dn_loss(detr_out.dn_outputs, targets, detr_out.dn_meta,
-                                     num_boxes=num_boxes)
+                                     num_boxes=num_boxes,
+                                     efl_weights=efl_w, logit_adj=log_adj)
             dn_scale = min(1.0, 0.5 + 0.5 * self._epoch / max(1, self.dn_warmup_epochs))
             total    = total + dn_scale * self.lambda_dn * l_dn
 
         # enc_score_head supervision: forces encoder to score object positions highly
         # so _select_topk reliably picks S4 positions for small objects.
-        # NOTE: enc_aux logits have Q_enc = num_queries (top-K only), while the main
-        # decoder may have extra fallback queries → Q_dec > Q_enc.  Filter indices so
-        # only src_i < Q_enc are supervised; fallback-query matches have no enc anchor.
+        # NOTE: enc_aux logits have Q_enc = num_queries (top-K only).
         l_enc_aux = None
         if detr_out.enc_aux_outputs is not None:
             l_enc_aux = detr_out.logits.sum() * 0.0
+            n_enc = 0
             for enc_out in detr_out.enc_aux_outputs:
                 Q_enc = enc_out['pred_logits'].shape[1]
                 enc_indices = [
@@ -263,8 +342,11 @@ class HybridLoss(nn.Module):
                 d_enc = self._detr_layer_loss(
                     enc_out['pred_logits'], enc_out['pred_boxes'],
                     targets, enc_indices, num_boxes=num_boxes,
+                    efl_weights=efl_w, logit_adj=log_adj,
                 )
                 l_enc_aux = l_enc_aux + d_enc['total']
+                n_enc += 1
+            l_enc_aux = l_enc_aux / max(n_enc, 1)  # average over enc heads, not raw sum
             total = total + self.lambda_enc_aux * l_enc_aux
 
         return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'], 'giou': d['giou'],
@@ -272,10 +354,12 @@ class HybridLoss(nn.Module):
 
     def _dn_loss(
         self,
-        dn_outputs: list,
-        targets:    List[dict],
-        dn_meta:    dict,
-        num_boxes:  int = 1,
+        dn_outputs:  list,
+        targets:     List[dict],
+        dn_meta:     dict,
+        num_boxes:   int           = 1,
+        efl_weights: Tensor | None = None,
+        logit_adj:   Tensor | None = None,
     ) -> Tensor:
         dn_positive_idx = dn_meta['dn_positive_idx']
         dn_num_group    = dn_meta['dn_num_group']
@@ -299,6 +383,7 @@ class HybridLoss(nn.Module):
             d = self._detr_layer_loss(
                 layer_out['pred_logits'], layer_out['pred_boxes'],
                 targets, dn_indices, num_boxes=dn_num_boxes,
+                efl_weights=efl_weights, logit_adj=logit_adj,
             )
             total_dn = d['total'] if total_dn is None else total_dn + d['total']
 

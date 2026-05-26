@@ -124,7 +124,7 @@ class opts(object):
                                  help='Reference batch size the base --lr was tuned for.')
         self.parser.add_argument('--lr_step',
                                  type=str,
-                                 default='10, 20',
+                                 default='20, 27',
                                  help='Epochs to drop LR by 10× (step decay, used when cosine_lr=False).')
         self.parser.add_argument('--cosine_lr',
                                  default=True,
@@ -227,10 +227,21 @@ class opts(object):
                                  help='Denoising loss weight (lambda_dn).')
         self.parser.add_argument('--dn_warmup_epochs', type=int, default=10,
                                  help='Epochs over which DN loss weight ramps from 0.5×λ_dn → λ_dn.')
-        self.parser.add_argument('--enc_aux_weight', type=float, default=1.0,
+        self.parser.add_argument('--enc_aux_weight', type=float, default=0.25,
                                  help='Encoder top-K supervision loss weight.')
-        self.parser.add_argument('--mal_gamma', type=float, default=1.5,
+        self.parser.add_argument('--mal_gamma', type=float, default=2.0,
                                  help='Exponent for MAL (Modulation Augmented Loss) quality target.')
+        # ── Class-imbalance methods ───────────────────────────────────────────
+        self.parser.add_argument('--efl_beta', type=float, default=0.999,
+                                 help='Equalized Focal Loss (CVPR 2022) suppression strength. '
+                                      '0 = disabled. Suppresses negative gradient of frequent classes '
+                                      'via: eq[c] = 1 - beta * freq[c]^efl_gamma.')
+        self.parser.add_argument('--efl_gamma', type=float, default=0.5,
+                                 help='Frequency exponent for EFL equalization factor (default 0.5 from paper).')
+        self.parser.add_argument('--logit_adj_tau', type=float, default=0.5,
+                                 help='Logit Adjustment (ICLR 2021) temperature tau. '
+                                      'Adds tau*log(pi_c) to logits at train time to correct for '
+                                      'class-frequency prior. 0 = disabled.')
         self.parser.add_argument('--aux_loss',
                                  default=True,
                                  action=argparse.BooleanOptionalAction,

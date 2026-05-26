@@ -383,11 +383,11 @@ def run(opt):
 
         # ── Step-decay (only when cosine scheduler is NOT used) ──────────────────
         if not use_cosine and epoch in opt.lr_step:
-            decay = 0.1 ** (opt.lr_step.index(epoch) + 1)
             for pg in optimizer.param_groups:
-                pg['lr'] *= decay
+                pg['lr'] *= 0.1   # 10× drop each step (was: 0.1^(n+1) — bug causing 1000× at step 2)
             if rank == 0:
-                print(f'Epoch {epoch}: LR × {decay}')
+                cur_lr = optimizer.param_groups[-1]['lr']
+                print(f'Epoch {epoch}: LR step → {cur_lr:.2e}')
 
         if rank == 0:
             logger.write('\n')
