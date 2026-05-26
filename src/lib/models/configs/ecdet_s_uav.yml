@@ -46,7 +46,7 @@ ECTransformer:
   eval_idx: -1
   num_queries: 300
   num_classes: 10
-  num_denoising: 150
+  num_denoising: 100
   label_noise_ratio: 0.4
   box_noise_scale: 0.8
   reg_max: 32

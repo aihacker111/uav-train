@@ -53,30 +53,96 @@ def _gather_at_ind(feat: Tensor, ind: Tensor) -> Tensor:
     return flat.gather(1, idx)
 
 
+def render_gaussian_heatmaps(
+    targets: List[dict],
+    num_classes: int,
+    feat_h: int,
+    feat_w: int,
+) -> tuple:
+    """
+    Render CenterNet-style Gaussian heatmaps for a batch from normalised GT boxes.
+
+    Args:
+        targets:     List[dict] with 'boxes' (N,4) cxcywh [0,1] and 'labels' (N,).
+        num_classes: Number of foreground classes.
+        feat_h, feat_w: Feature map spatial dimensions (S4 resolution).
+
+    Returns:
+        gt_hm  (B, C, H, W)  — Gaussian heatmap peaked at GT centers.
+        gt_wh  (B, 2, H, W)  — Width/height in feature-map pixel scale at GT cells.
+        gt_reg (B, 2, H, W)  — Sub-pixel offset at GT cells.
+        reg_mask (B, H, W)   — Binary mask: 1 at GT grid cells, 0 elsewhere.
+    """
+    B = len(targets)
+    device = targets[0]['boxes'].device
+
+    gt_hm   = torch.zeros(B, num_classes, feat_h, feat_w, device=device)
+    gt_wh   = torch.zeros(B, 2, feat_h, feat_w, device=device)
+    gt_reg  = torch.zeros(B, 2, feat_h, feat_w, device=device)
+    reg_mask = torch.zeros(B, feat_h, feat_w, device=device)
+
+    # Precompute coordinate grids (shared across all GT objects)
+    gy = torch.arange(feat_h, dtype=torch.float32, device=device)
+    gx = torch.arange(feat_w, dtype=torch.float32, device=device)
+    grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')  # (H, W)
+
+    for b, t in enumerate(targets):
+        boxes  = t['boxes']   # (N, 4) cxcywh normalised
+        labels = t['labels']  # (N,)   int
+
+        for box, label in zip(boxes, labels):
+            cx, cy, bw, bh = box.tolist()
+
+            fx = cx * feat_w          # float center in feature map
+            fy = cy * feat_h
+            fw = bw * feat_w          # float width  in feature map pixels
+            fh = bh * feat_h          # float height in feature map pixels
+
+            ix = int(fx)
+            iy = int(fy)
+            ix = max(0, min(ix, feat_w - 1))
+            iy = max(0, min(iy, feat_h - 1))
+
+            # Gaussian sigma: proportional to sqrt of box area in feature map
+            sigma = max(1.0, (fw * fh) ** 0.5 * 0.25)
+
+            gaussian = torch.exp(
+                -((grid_x - fx) ** 2 + (grid_y - fy) ** 2) / (2.0 * sigma ** 2)
+            )
+            c = label.long().item()
+            gt_hm[b, c] = torch.maximum(gt_hm[b, c], gaussian)
+
+            # wh target: size in feature-map pixel scale
+            gt_wh[b, 0, iy, ix] = fw
+            gt_wh[b, 1, iy, ix] = fh
+
+            # reg target: fractional offset from grid-cell corner
+            gt_reg[b, 0, iy, ix] = fx - ix
+            gt_reg[b, 1, iy, ix] = fy - iy
+
+            reg_mask[b, iy, ix] = 1.0
+
+    return gt_hm, gt_wh, gt_reg, reg_mask
+
+
 def mal_loss(
-    pred:        Tensor,
-    target_q:    Tensor,
-    gamma:       float         = 1.5,
-    num_boxes:   int           = 1,
-    efl_weights: Tensor | None = None,
-    logit_adj:   Tensor | None = None,
+    pred:      Tensor,
+    target_q:  Tensor,
+    gamma:     float         = 1.5,
+    num_boxes: int           = 1,
+    logit_adj: Tensor | None = None,
 ) -> Tensor:
     """
     Modulation Augmented Loss — EdgeCrafter / D-FINE.
     target_q: iou^gamma for positives, 0 for negatives.
 
-    efl_weights: [C] per-class suppression factor for negatives (Equalized Focal Loss).
-    logit_adj:   [C] log-prior term added to logits at train time (Logit Adjustment).
+    logit_adj: [C] log-prior term added to logits at train time (Logit Adjustment).
     """
     if logit_adj is not None:
         pred = pred + logit_adj.to(pred.device)
     p      = pred.sigmoid().detach()
     is_pos = (target_q > 0).float()
     weight = p.pow(gamma) * (1.0 - is_pos) + is_pos
-    if efl_weights is not None:
-        # Suppress negative-sample gradient for frequent classes; leave positives unchanged.
-        eq     = efl_weights.to(pred.device).view(1, 1, -1)
-        weight = weight * (is_pos + (1.0 - is_pos) * eq)
     loss   = F.binary_cross_entropy_with_logits(pred, target_q, weight=weight, reduction='none')
     return loss.mean(1).sum() * pred.shape[1] / max(num_boxes, 1)
 
@@ -139,19 +205,15 @@ class HybridLoss(nn.Module):
         mal_gamma:        float = 2.0,
         aux_loss:         bool  = True,
         reid_classifier:  Optional[nn.Linear] = None,
-        # ── Class-imbalance methods ───────────────────────────────────────────
-        # Equalized Focal Loss (EFL, CVPR 2022): accumulates per-class positive
-        # match counts via EMA and suppresses negative gradients for frequent classes.
-        # efl_beta=0 disables EFL entirely.
-        efl_beta:         float = 0.999,  # suppression strength in 1 - beta * freq^gamma
-        efl_gamma:        float = 0.5,    # frequency exponent (0.5 from EFL paper)
         # Logit Adjustment (ICLR 2021): add tau * log(pi_c) to logits at train
         # time so the decision boundary corrects for class-frequency prior.
         # logit_adj_tau=0 disables logit adjustment.
         logit_adj_tau:    float = 0.0,
+        # Heatmap (CenterNet) branch losses
+        lambda_heatmap:   float = 1.0,   # focal loss on heatmap
+        lambda_wh:        float = 0.1,   # L1 loss on wh (at GT cell positions)
+        lambda_reg:       float = 1.0,   # L1 loss on sub-pixel offset
         # kept for call-site backward compat — silently ignored
-        lambda_wh:             float = 0.0,
-        lambda_reg:            float = 0.0,
         lambda_consist:        float = 0.0,
         consist_warmup_epochs: int   = 0,
         lambda_stage1:         float = 0.0,
@@ -170,11 +232,12 @@ class HybridLoss(nn.Module):
         self.mal_gamma        = mal_gamma
         self.aux_loss         = aux_loss
         self._epoch           = 0
+        self.lambda_heatmap   = lambda_heatmap
+        self.lambda_wh        = lambda_wh
+        self.lambda_reg       = lambda_reg
 
-        self.efl_beta      = efl_beta
-        self.efl_gamma     = efl_gamma
         self.logit_adj_tau = logit_adj_tau
-        # EMA accumulator: tracks average per-class positive matches per forward pass.
+        # EMA accumulator: tracks per-class positive match counts for Logit Adjustment.
         # Initialised to ones so all classes start with equal weight.
         self.register_buffer('_acc_pos', torch.ones(num_classes))
 
@@ -189,7 +252,7 @@ class HybridLoss(nn.Module):
     # ── Class-imbalance helpers ────────────────────────────────────────────────
 
     @torch.no_grad()
-    def _update_efl_stats(self, indices: list, targets: List[dict]) -> None:
+    def _update_acc_pos(self, indices: list, targets: List[dict]) -> None:
         """EMA update of per-class positive match counts (called once per forward pass)."""
         dev    = self._acc_pos.device
         counts = torch.zeros(self.num_classes, device=dev)
@@ -200,26 +263,7 @@ class HybridLoss(nn.Module):
                 for c in cls:
                     if 0 <= c.item() < self.num_classes:
                         counts[c] += 1
-        # EMA decay = 0.99; counts update at rate 0.01 per step
         self._acc_pos.mul_(0.99).add_(counts * 0.01)
-
-    def _efl_weights(self) -> Tensor | None:
-        """Per-class equalization factor [C] for EFL negative suppression.
-
-        eq[c] = 1 - beta_eff * (acc_pos[c] / total)^efl_gamma
-        Ramped from 0 → efl_beta over dn_warmup_epochs to avoid suppressing
-        negative gradients before the class-frequency EMA has stabilised.
-        In early epochs (uniform _acc_pos) a full beta would reduce ALL classes'
-        negative weights equally, hurting background suppression → false positives.
-        """
-        if self.efl_beta <= 0:
-            return None
-        ramp      = min(1.0, self._epoch / max(self.dn_warmup_epochs, 1))
-        beta_eff  = self.efl_beta * ramp
-        if beta_eff <= 0:
-            return None
-        freq = self._acc_pos / self._acc_pos.sum().clamp(min=1e-6)
-        return (1.0 - beta_eff * freq.pow(self.efl_gamma)).clamp(0.0, 1.0)
 
     def _logit_adj(self) -> Tensor | None:
         """Log-prior adjustment vector [C] for Logit Adjustment at train time.
@@ -243,13 +287,12 @@ class HybridLoss(nn.Module):
 
     def _detr_layer_loss(
         self,
-        logits:      Tensor,
-        boxes:       Tensor,
-        targets:     List[dict],
-        indices:     list,
-        num_boxes:   int           = 0,
-        efl_weights: Tensor | None = None,
-        logit_adj:   Tensor | None = None,
+        logits:    Tensor,
+        boxes:     Tensor,
+        targets:   List[dict],
+        indices:   list,
+        num_boxes: int           = 0,
+        logit_adj: Tensor | None = None,
     ) -> Dict[str, Tensor]:
         dev = logits.device
         B, Q, C = logits.shape
@@ -281,7 +324,7 @@ class HybridLoss(nn.Module):
             tgt_b_list.append(targets[b]['boxes'][ti].to(dev))
 
         loss_cls = mal_loss(logits, target_q, gamma=self.mal_gamma, num_boxes=num_boxes,
-                            efl_weights=efl_weights, logit_adj=logit_adj)
+                            logit_adj=logit_adj)
 
         if src_b_list:
             src_b     = torch.cat(src_b_list)
@@ -303,16 +346,14 @@ class HybridLoss(nn.Module):
         num_boxes = max(sum(len(t['labels']) for t in targets), 1)
         indices   = self.matcher(detr_out.logits, detr_out.boxes, targets)
 
-        # Update EFL stats once per forward pass (training only).
+        # Update per-class positive counts for Logit Adjustment.
         if self.training:
-            self._update_efl_stats(indices, targets)
+            self._update_acc_pos(indices, targets)
 
-        efl_w   = self._efl_weights()
         log_adj = self._logit_adj()
 
         d = self._detr_layer_loss(detr_out.logits, detr_out.boxes, targets, indices,
-                                   num_boxes=num_boxes,
-                                   efl_weights=efl_w, logit_adj=log_adj)
+                                   num_boxes=num_boxes, logit_adj=log_adj)
         layer_weight_sum = 1.0
         total = d['total']
 
@@ -322,8 +363,7 @@ class HybridLoss(nn.Module):
             for layer in range(n_aux):
                 aux = self._detr_layer_loss(
                     detr_out.logits_all[layer], detr_out.boxes_all[layer],
-                    targets, indices, num_boxes=num_boxes,
-                    efl_weights=efl_w, logit_adj=log_adj,
+                    targets, indices, num_boxes=num_boxes, logit_adj=log_adj,
                 )
                 total            = total + aux['total']   # equal weight per layer
                 layer_weight_sum = layer_weight_sum + 1.0 # matches EdgeCrafter (no progressive ramp)
@@ -332,8 +372,7 @@ class HybridLoss(nn.Module):
 
         if detr_out.dn_outputs is not None and detr_out.dn_meta is not None:
             l_dn     = self._dn_loss(detr_out.dn_outputs, targets, detr_out.dn_meta,
-                                     num_boxes=num_boxes,
-                                     efl_weights=efl_w, logit_adj=log_adj)
+                                     num_boxes=num_boxes, logit_adj=log_adj)
             dn_scale = min(1.0, 0.5 + 0.5 * self._epoch / max(1, self.dn_warmup_epochs))
             total    = total + dn_scale * self.lambda_dn * l_dn
 
@@ -355,8 +394,7 @@ class HybridLoss(nn.Module):
                 ]
                 d_enc = self._detr_layer_loss(
                     enc_out['pred_logits'], enc_out['pred_boxes'],
-                    targets, enc_indices, num_boxes=num_boxes,
-                    efl_weights=efl_w, logit_adj=log_adj,
+                    targets, enc_indices, num_boxes=num_boxes, logit_adj=log_adj,
                 )
                 l_enc_aux = l_enc_aux + d_enc['total']
                 n_enc += 1
@@ -368,12 +406,11 @@ class HybridLoss(nn.Module):
 
     def _dn_loss(
         self,
-        dn_outputs:  list,
-        targets:     List[dict],
-        dn_meta:     dict,
-        num_boxes:   int           = 1,
-        efl_weights: Tensor | None = None,
-        logit_adj:   Tensor | None = None,
+        dn_outputs: list,
+        targets:    List[dict],
+        dn_meta:    dict,
+        num_boxes:  int           = 1,
+        logit_adj:  Tensor | None = None,
     ) -> Tensor:
         dn_positive_idx = dn_meta['dn_positive_idx']
         dn_num_group    = dn_meta['dn_num_group']
@@ -396,8 +433,7 @@ class HybridLoss(nn.Module):
         for layer_out in dn_outputs:
             d = self._detr_layer_loss(
                 layer_out['pred_logits'], layer_out['pred_boxes'],
-                targets, dn_indices, num_boxes=dn_num_boxes,
-                efl_weights=efl_weights, logit_adj=logit_adj,
+                targets, dn_indices, num_boxes=dn_num_boxes, logit_adj=logit_adj,
             )
             total_dn = d['total'] if total_dn is None else total_dn + d['total']
 
@@ -449,6 +485,52 @@ class HybridLoss(nn.Module):
         )
         return loss_ce + self.lambda_triplet * loss_tri
 
+    # ── Heatmap branch loss ────────────────────────────────────────────────────
+
+    def _heatmap_loss(
+        self,
+        hm_out,          # CenterNetOutput: .hm (B,C,H,W), .wh (B,2,H,W), .reg (B,2,H,W)
+        targets: List[dict],
+    ) -> Dict[str, Tensor]:
+        """
+        CenterNet-style dense heatmap loss on S4 features.
+
+        Components:
+          loss_hm  — CornerNet focal loss on heatmap (all spatial positions).
+          loss_wh  — L1 loss on width/height at GT grid cells only.
+          loss_reg — L1 loss on sub-pixel offset at GT grid cells only.
+        """
+        B, C, H, W = hm_out.hm.shape
+
+        gt_hm, gt_wh, gt_reg, reg_mask = render_gaussian_heatmaps(
+            targets, self.num_classes, H, W
+        )
+
+        loss_hm = centernet_focal_loss(hm_out.hm, gt_hm)
+
+        # wh and reg: only at positions where there is a GT object
+        mask = reg_mask.bool()                        # (B, H, W)
+        n_pos = mask.sum().clamp(min=1).float()
+
+        if mask.any():
+            # (B,2,H,W) → gather at positive positions
+            pred_wh  = hm_out.wh.permute(0, 2, 3, 1)[mask]   # (P, 2)
+            pred_reg = hm_out.reg.permute(0, 2, 3, 1)[mask]   # (P, 2)
+            tgt_wh   = gt_wh.permute(0, 2, 3, 1)[mask]        # (P, 2)
+            tgt_reg  = gt_reg.permute(0, 2, 3, 1)[mask]       # (P, 2)
+
+            loss_wh  = F.l1_loss(pred_wh,  tgt_wh,  reduction='sum') / n_pos
+            loss_reg = F.l1_loss(pred_reg, tgt_reg, reduction='sum') / n_pos
+        else:
+            loss_wh  = hm_out.wh.sum()  * 0.0
+            loss_reg = hm_out.reg.sum() * 0.0
+
+        total = (self.lambda_heatmap * loss_hm
+                 + self.lambda_wh    * loss_wh
+                 + self.lambda_reg   * loss_reg)
+
+        return {'total': total, 'hm': loss_hm, 'wh': loss_wh, 'reg': loss_reg}
+
     # ── Forward ────────────────────────────────────────────────────────────────
 
     def forward(
@@ -479,6 +561,15 @@ class HybridLoss(nn.Module):
             l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])
             total  = total + self.lambda_reid * l_reid
             loss_stats['loss_reid'] = l_reid
+
+        # Heatmap branch: CenterNet focal + wh + reg losses on S4 feature
+        hm_out = outputs['stage2'].heatmap_out
+        if hm_out is not None:
+            l_hm = self._heatmap_loss(hm_out, targets)
+            total = total + l_hm['total']
+            loss_stats['loss_hm']  = l_hm['hm']
+            loss_stats['loss_wh']  = l_hm['wh']
+            loss_stats['loss_reg'] = l_hm['reg']
 
         loss_stats['loss'] = total
         return total, loss_stats

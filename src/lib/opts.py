@@ -231,13 +231,14 @@ class opts(object):
                                  help='Encoder top-K supervision loss weight.')
         self.parser.add_argument('--mal_gamma', type=float, default=2.0,
                                  help='Exponent for MAL (Modulation Augmented Loss) quality target.')
+        # ── Heatmap (CenterNet) branch losses ────────────────────────────────
+        self.parser.add_argument('--heatmap_weight', type=float, default=1.0,
+                                 help='Weight for CenterNet focal heatmap loss (lambda_heatmap).')
+        self.parser.add_argument('--wh_weight', type=float, default=0.1,
+                                 help='Weight for width/height L1 loss at GT cells (lambda_wh).')
+        self.parser.add_argument('--reg_weight', type=float, default=1.0,
+                                 help='Weight for sub-pixel offset L1 loss at GT cells (lambda_reg).')
         # ── Class-imbalance methods ───────────────────────────────────────────
-        self.parser.add_argument('--efl_beta', type=float, default=0.999,
-                                 help='Equalized Focal Loss (CVPR 2022) suppression strength. '
-                                      '0 = disabled. Suppresses negative gradient of frequent classes '
-                                      'via: eq[c] = 1 - beta * freq[c]^efl_gamma.')
-        self.parser.add_argument('--efl_gamma', type=float, default=0.5,
-                                 help='Frequency exponent for EFL equalization factor (default 0.5 from paper).')
         self.parser.add_argument('--logit_adj_tau', type=float, default=0.5,
                                  help='Logit Adjustment (ICLR 2021) temperature tau. '
                                       'Adds tau*log(pi_c) to logits at train time to correct for '

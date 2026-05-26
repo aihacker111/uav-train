@@ -644,8 +644,16 @@ class ECTransformer(nn.Module):
                            spatial_shapes,
                            denoising_logits=None,
                            denoising_bbox_unact=None,
-                           heatmap_ref_points=None):
-
+                           heatmap_ref_points=None,
+                           heatmap_topk_idx=None):
+        """
+        heatmap_ref_points: (B, num_queries, 4) in logit space — peaks from
+            CenterNet heatmap head. When provided, these replace encoder top-K
+            positions and content is sampled from memory at peak locations.
+            enc_aux supervision is skipped (heatmap loss provides that signal).
+        heatmap_topk_idx: (B, num_queries) — flat indices into the S4 slice of
+            the flattened memory, used to gather content features at peak positions.
+        """
         # prepare input for decoder
         if self.training or self.eval_spatial_size is None:
             anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
@@ -655,27 +663,31 @@ class ECTransformer(nn.Module):
         if memory.shape[0] > 1:
             anchors = anchors.repeat(memory.shape[0], 1, 1)
 
-        # memory = torch.where(valid_mask, memory, 0)
         memory = valid_mask.to(memory.dtype) * memory
+        enc_outputs_logits: torch.Tensor = self.enc_score_head(memory)
 
-        enc_outputs_logits :torch.Tensor = self.enc_score_head(memory)
-
-        # select topk queries
+        # select topk queries from encoder (always computed; used when heatmap not available)
         enc_topk_memory, enc_topk_logits, enc_topk_anchors = \
             self._select_topk(memory, enc_outputs_logits, anchors, self.num_queries)
+        enc_topk_bbox_unact: torch.Tensor = self.enc_bbox_head(enc_topk_memory) + enc_topk_anchors
 
-        enc_topk_bbox_unact :torch.Tensor = self.enc_bbox_head(enc_topk_memory) + enc_topk_anchors
-
-        # When CenterNet heatmap peaks are provided, use them as reference positions.
-        # Content queries (enc_topk_memory) are kept from the encoder — they carry
-        # semantic features for classification even though positions come from heatmap.
-        # This lets the decoder cross-attend to features near heatmap-detected objects,
-        # which is more accurate than encoder anchors for UAV small-object detection.
         if heatmap_ref_points is not None:
+            # Replace reference positions with heatmap peaks.
             enc_topk_bbox_unact = heatmap_ref_points   # (B, K, 4) logit space
 
+            # Replace content with memory features sampled at peak positions.
+            # S4 tokens occupy the first H4*W4 slots of the flattened memory,
+            # so heatmap_topk_idx is a direct index into memory dim-1.
+            if heatmap_topk_idx is not None:
+                C = memory.shape[-1]
+                enc_topk_memory = memory.gather(
+                    1, heatmap_topk_idx.unsqueeze(-1).expand(-1, -1, C)
+                )
+
+        # enc_aux supervision: only enabled when encoder drives query selection.
+        # When heatmap drives queries, heatmap loss provides the equivalent signal.
         enc_topk_bboxes_list, enc_topk_logits_list = [], []
-        if self.training:
+        if self.training and heatmap_ref_points is None:
             enc_topk_bboxes = F.sigmoid(enc_topk_bbox_unact)
             enc_topk_bboxes_list.append(enc_topk_bboxes)
             enc_topk_logits_list.append(enc_topk_logits)
@@ -721,7 +733,8 @@ class ECTransformer(nn.Module):
     def _split(x, dim, s_idx):
         return torch.split(x, s_idx, dim=dim) if x is not None else (None, None)
 
-    def forward(self, feats, targets=None, spatial_feat=None, heatmap_ref_points=None):
+    def forward(self, feats, targets=None, spatial_feat=None,
+                heatmap_ref_points=None, heatmap_topk_idx=None):
         # input projection and embedding
         memory, spatial_shapes = self._get_encoder_input(feats)
 
@@ -743,6 +756,7 @@ class ECTransformer(nn.Module):
             self._get_decoder_input(
                 memory, spatial_shapes, denoising_logits, denoising_bbox_unact,
                 heatmap_ref_points=heatmap_ref_points,
+                heatmap_topk_idx=heatmap_topk_idx,
             )
 
         # decoder

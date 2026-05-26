@@ -26,7 +26,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Dict, Any, List, Optional
 
-from .heads import DETROutput
+from .heads import CenterNetHead, CenterNetOutput, DETROutput, extract_peaks_as_ref_points
+from .config import CenterNetHeadConfig
 
 
 class HybridECDet(nn.Module):
@@ -36,6 +37,7 @@ class HybridECDet(nn.Module):
         num_classes: int,
         hidden_dim: int = 256,
         reid_dim: int   = 0,
+        heatmap_head_conv: int = 64,
     ) -> None:
         super().__init__()
         self.ecdet = ecdet
@@ -46,6 +48,15 @@ class HybridECDet(nn.Module):
             nn.Linear(hidden_dim, reid_dim),
         ) if reid_dim > 0 else None
 
+        # CenterNet heatmap head on S4 feature (stride-4, hidden_dim channels).
+        # Its peaks are used as dynamic reference points for ECTransformer queries
+        # instead of the fixed encoder top-K selection.
+        hm_cfg = CenterNetHeadConfig(head_conv=heatmap_head_conv, num_classes=num_classes)
+        self.heatmap_head = CenterNetHead(in_ch=hidden_dim, cfg=hm_cfg)
+
+        # num_queries is needed during forward to cap topK from heatmap
+        self._num_queries: int = ecdet.decoder.num_queries
+
     # ── Forward ─────────────────────────────────────────────────────────────────
 
     def forward(
@@ -53,13 +64,78 @@ class HybridECDet(nn.Module):
         x: Tensor,
         targets: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        backbone_feats = self.ecdet.backbone(x)          # [S8, S16, S32]
+        backbone_feats = self.ecdet.backbone(x)              # [S8, S16, S32]
         feats          = self.ecdet.encoder(backbone_feats)  # [S4, S8, S16, S32]
 
-        ec_targets = self._format_targets(targets, x.device)
-        ec_out = self.ecdet.decoder(feats, ec_targets)
+        # Run CenterNet heatmap head on S4 feature.
+        hm_out: CenterNetOutput = self.heatmap_head(feats[0])
 
-        return {'stage1': None, 'stage2': self._wrap_ec(ec_out)}
+        # Extract top-K peaks → reference points for ECTransformer queries.
+        # topk_idx is the flat S4 position index (used to gather memory content).
+        heatmap_ref_points, heatmap_topk_idx = self._peaks_from_heatmap(hm_out)
+
+        ec_targets = self._format_targets(targets, x.device)
+        ec_out = self.ecdet.decoder(
+            feats, ec_targets,
+            heatmap_ref_points=heatmap_ref_points,
+            heatmap_topk_idx=heatmap_topk_idx,
+        )
+
+        detr_out = self._wrap_ec(ec_out)
+        detr_out.heatmap_out = hm_out
+        return {'stage1': hm_out, 'stage2': detr_out}
+
+    @torch.no_grad()
+    def _peaks_from_heatmap(self, hm_out: CenterNetOutput):
+        """
+        Extract top-K peaks from heatmap for ECTransformer query init.
+
+        Both ref_points and topk_idx are derived from the SAME topk call so
+        their ordering is guaranteed to match — the i-th ref_point corresponds
+        to the i-th index in topk_idx.
+
+        Returns:
+            ref_points: (B, K, 4) inverse-sigmoid — passed as heatmap_ref_points.
+            topk_idx:   (B, K) flat S4 indices    — used to gather memory content.
+        """
+        hm, wh, reg = hm_out.hm, hm_out.wh, hm_out.reg
+        B, C, H, W = hm.shape
+        num_q = self._num_queries
+
+        # NMS: suppress non-maxima in 3×3 neighbourhood
+        hm_max = F.max_pool2d(hm, kernel_size=3, stride=1, padding=1)
+        hm_nms = (hm_max == hm).float() * hm
+
+        scores, _ = hm_nms.max(dim=1)          # (B, H, W) class-agnostic
+        scores_flat = scores.flatten(1)         # (B, H*W)
+
+        K = min(num_q, H * W)
+        # sorted=True ensures ref_points[i] ↔ topk_idx[i] everywhere
+        _, topk_idx = scores_flat.topk(K, dim=1, sorted=True)   # (B, K)
+
+        topk_y = (topk_idx // W).float()
+        topk_x = (topk_idx  % W).float()
+
+        def _gather2(feat2d):
+            flat = feat2d.permute(0, 2, 3, 1).reshape(B, H * W, 2)
+            return flat.gather(1, topk_idx.unsqueeze(-1).expand(-1, -1, 2))
+
+        topk_reg = _gather2(reg)   # (B, K, 2)
+        topk_wh  = _gather2(wh)    # (B, K, 2)
+
+        cx = ((topk_x + topk_reg[..., 0]) / W).clamp(1e-4, 1 - 1e-4)
+        cy = ((topk_y + topk_reg[..., 1]) / H).clamp(1e-4, 1 - 1e-4)
+        bw = (topk_wh[..., 0] / W).clamp(1e-4, 1.0)
+        bh = (topk_wh[..., 1] / H).clamp(1e-4, 1.0)
+        ref = torch.stack([cx, cy, bw, bh], dim=-1)  # (B, K, 4)
+
+        # Pad to exactly num_queries if feature map is smaller than num_queries
+        if K < num_q:
+            ref      = torch.cat([ref,      ref[:, :1, :].expand(-1, num_q - K, -1)], dim=1)
+            topk_idx = torch.cat([topk_idx, topk_idx[:, :1].expand(-1, num_q - K)],   dim=1)
+
+        ref_points = torch.log(ref / (1.0 - ref + 1e-6))   # inverse sigmoid
+        return ref_points, topk_idx
 
     # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -104,6 +180,7 @@ class HybridECDet(nn.Module):
             dn_outputs      = ec_out.get('dn_outputs',      None),
             dn_meta         = ec_out.get('dn_meta',         None),
             enc_aux_outputs = ec_out.get('enc_aux_outputs', None),
+            heatmap_out     = None,  # populated by HybridECDet.forward() after wrapping
         )
 
     def load_pretrained(self, path: str) -> None:

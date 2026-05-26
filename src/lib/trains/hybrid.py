@@ -31,6 +31,7 @@ class HybridTrainer(BaseTrainer):
         loss_stats = [
             'loss',
             'loss_cls', 'loss_bbox', 'loss_giou', 'loss_enc_aux',
+            'loss_hm', 'loss_wh', 'loss_reg',
         ]
 
         reid_classifier = None
@@ -51,9 +52,10 @@ class HybridTrainer(BaseTrainer):
             lambda_triplet   = opt.triplet_weight,
             aux_loss         = opt.aux_loss,
             reid_classifier  = reid_classifier,
-            efl_beta         = getattr(opt, 'efl_beta',      0.999),
-            efl_gamma        = getattr(opt, 'efl_gamma',     0.5),
             logit_adj_tau    = getattr(opt, 'logit_adj_tau', 0.5),
+            lambda_heatmap   = getattr(opt, 'heatmap_weight', 1.0),
+            lambda_wh        = getattr(opt, 'wh_weight',      0.1),
+            lambda_reg       = getattr(opt, 'reg_weight',     1.0),
         )
         return loss_stats, loss
 
