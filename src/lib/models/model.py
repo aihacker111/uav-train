@@ -8,61 +8,62 @@ import torch
 import torch.nn as nn
 
 
-def create_model(arch: str, heads: dict, head_conv: int,
-                 reid_dim: int = 256, num_classes: int = 7,
-                 opt=None) -> nn.Module:
+def create_model(
+    arch:        str,
+    heads:       dict,
+    head_conv:   int,
+    num_classes: int   = 7,
+    opt=None,
+) -> nn.Module:
     """
-    Instantiate a model by architecture string.
+    Instantiate a HawkDet model from an ECDet YAML config.
 
-    For hybrid architectures, pass --ecdet_config pointing to an ECDet YAML
-    (e.g. lib/models/configs/ecdet_s_uav.yml).  The factory:
-      1. Loads the YAML via EdgeCrafter's YAMLConfig / registry system.
-      2. Overrides num_classes in ECTransformer to match the dataset.
-      3. Wraps the ECDet model in HybridECDet (pure DETR flow with 4-level encoder).
+    Requires --ecdet_config pointing to an ECDet YAML
+    (e.g. lib/models/configs/ecdet_s_uav.yml).
     """
-    if 'hybrid' not in arch:
+    if 'hawkdet' not in arch:
         raise NotImplementedError(
             f"create_model: arch={arch!r} is not registered. "
-            "Only 'hybrid*' architectures are supported."
+            "Use 'hawkdet_s', 'hawkdet_m', 'hawkdet_l', or 'hawkdet_x'."
         )
 
-    opt = (heads.get('__opt__') if isinstance(heads, dict) else None) or opt
+    opt          = (heads.get('__opt__') if isinstance(heads, dict) else None) or opt
     ecdet_config = getattr(opt, 'ecdet_config', '') if opt else ''
     if not ecdet_config:
         raise ValueError(
-            "--ecdet_config is required for hybrid architectures. "
+            "--ecdet_config is required. "
             "Example: --ecdet_config lib/models/configs/ecdet_s_uav.yml"
         )
 
-    # Add src/lib/models/ to sys.path so `engine` package (copied from EdgeCrafter)
-    # is importable and its @register() decorators fire.
+    # Add src/lib/models/ to sys.path so the `engine` package is importable.
     _models_dir = os.path.dirname(os.path.abspath(__file__))
     if _models_dir not in sys.path:
         sys.path.insert(0, _models_dir)
 
     from engine.core import YAMLConfig
 
-    cfg = YAMLConfig(ecdet_config)
-
-    # Override ECTransformer num_classes to match the dataset (COCO=80, VisDrone=10)
-    if 'ECTransformer' in cfg.yaml_cfg:
-        cfg.yaml_cfg['ECTransformer']['num_classes'] = num_classes
-
-    ecdet_model = cfg.model   # ECDet(backbone=ECViT, encoder=HybridEncoder, decoder=ECTransformer)
+    cfg         = YAMLConfig(ecdet_config)
+    ecdet_model = cfg.model   # ECDet(backbone=ECViT, encoder=HybridEncoder, ...)
 
     encoder_cfg = cfg.yaml_cfg.get('HybridEncoder', {})
     hidden_dim  = encoder_cfg.get('hidden_dim', 256)
+    reg_max     = getattr(opt, 'reg_max',    16) if opt else 16
+    num_convs   = getattr(opt, 'num_convs',   4) if opt else 4
 
-    from lib.models.networks.ecdet_uav.ec_model import HybridECDet
-    return HybridECDet(
+    reid_dim = getattr(opt, 'reid_dim', 0) if opt else 0
+
+    from lib.models.networks.hawkdet.model import HawkDet
+    return HawkDet(
         ecdet=ecdet_model,
         num_classes=num_classes,
         hidden_dim=hidden_dim,
+        reg_max=reg_max,
+        num_convs=num_convs,
         reid_dim=reid_dim,
     )
 
 
-# ── Weight loading ──────────────────────────────────────────────────────────────
+# ── Weight loading ───────────────────────────────────────────────────────────
 
 def load_model(
     model:      nn.Module,
@@ -74,8 +75,7 @@ def load_model(
     use_cosine: bool  = False,
     loss:       Optional[nn.Module] = None,
 ):
-    """
-    Load a full AMOT checkpoint (model weights + optional optimizer state).
+    """Load a HawkDet checkpoint (model weights + optional optimizer state).
 
     Shape mismatches are handled gracefully: mismatched tensors are replaced
     with the model's current random weights so training can continue.

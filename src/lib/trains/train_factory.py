@@ -1,7 +1,5 @@
-from .mot import MotTrainer
-from .hybrid import HybridTrainer
+from .hawkdet import HawkDetTrainer
 
 train_factory = {
-    'mot':    MotTrainer,
-    'hybrid': HybridTrainer,
+    'hawkdet': HawkDetTrainer,
 }

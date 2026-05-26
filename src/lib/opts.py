@@ -60,17 +60,12 @@ class opts(object):
 
         # model
         self.parser.add_argument('--arch',
-                                 default='hybrid_ecdet',
-                                 help='model architecture. "hybrid" activates HybridECDet path.')
+                                 default='hawkdet_s',
+                                 help='model size variant: hawkdet_s / hawkdet_m / hawkdet_l / hawkdet_x')
         self.parser.add_argument('--ecdet_config',
                                  type=str,
                                  default='',
-                                 help='Path to ECDet YAML config. Required for hybrid architectures.')
-        self.parser.add_argument('--head_conv',
-                                 type=int,
-                                 default=32,
-                                 help='intermediate conv channels for CenterNet auxiliary head. '
-                                      '0 disables the intermediate conv (1×1 only).')
+                                 help='Path to ECDet YAML config (e.g. lib/models/configs/ecdet_s_uav.yml).')
         self.parser.add_argument('--backbone_lr_scale',
                                  type=float,
                                  default=0.05,
@@ -88,10 +83,6 @@ class opts(object):
                                  default=False,
                                  help='Enable gradient checkpointing on the ViT backbone. '
                                       'Reduces backbone VRAM by ~50%% at ~20%% slower backward.')
-        self.parser.add_argument('--down_ratio',
-                                 type=int,
-                                 default=4,
-                                 help='Output stride used by the dataset to compute heatmap size.')
 
         # input
         self.parser.add_argument('--input_res',
@@ -183,7 +174,7 @@ class opts(object):
         # evaluation
         self.parser.add_argument('--score_thr',
                                  type=float,
-                                 default=0.3,
+                                 default=0.25,
                                  help='Detection score threshold for val evaluation.')
         self.parser.add_argument('--K',
                                  type=int,
@@ -218,40 +209,16 @@ class opts(object):
                                  default='/media/jianbo/ioe/UAVdata',
                                  help='root directory of the dataset')
 
-        # ── HybridLoss weights ────────────────────────────────────────────────────
-        self.parser.add_argument('--bbox_weight', type=float, default=5.0,
-                                 help='SmoothL1 bounding-box loss weight (lambda_bbox).')
-        self.parser.add_argument('--giou_weight', type=float, default=2.0,
-                                 help='CIoU loss weight (lambda_ciou).')
-        self.parser.add_argument('--dn_weight', type=float, default=1.0,
-                                 help='Denoising loss weight (lambda_dn).')
-        self.parser.add_argument('--dn_warmup_epochs', type=int, default=10,
-                                 help='Epochs over which DN loss weight ramps from 0.5×λ_dn → λ_dn.')
-        self.parser.add_argument('--enc_aux_weight', type=float, default=0.25,
-                                 help='Encoder top-K supervision loss weight.')
-        self.parser.add_argument('--mal_gamma', type=float, default=2.0,
-                                 help='Exponent for MAL (Modulation Augmented Loss) quality target.')
-        # ── Heatmap (CenterNet) branch losses ────────────────────────────────
-        self.parser.add_argument('--heatmap_weight', type=float, default=1.0,
-                                 help='Weight for CenterNet focal heatmap loss (lambda_heatmap).')
-        self.parser.add_argument('--wh_weight', type=float, default=0.1,
-                                 help='Weight for width/height L1 loss at GT cells (lambda_wh).')
-        self.parser.add_argument('--reg_weight', type=float, default=1.0,
-                                 help='Weight for sub-pixel offset L1 loss at GT cells (lambda_reg).')
-        self.parser.add_argument('--aux_loss',
-                                 default=True,
-                                 action=argparse.BooleanOptionalAction,
-                                 help='Auxiliary losses from intermediate decoder layers. '
-                                      'Use --no-aux_loss to disable.')
+        # ── HawkDet loss weights ──────────────────────────────────────────────────
+        self.parser.add_argument('--giou_weight', type=float, default=2.5,
+                                 help='GIoU regression loss weight (lambda_giou).')
 
         # ── ReID ──────────────────────────────────────────────────────────────────
         self.parser.add_argument('--id_weight', type=float, default=1.0,
                                  help='ReID loss weight. 0 = detection only.')
         self.parser.add_argument('--triplet_weight', type=float, default=0.5,
-                                 help='Triplet loss weight within ReID. L_reid = L_ce + triplet_weight * L_tri.')
-        self.parser.add_argument('--reid_dim',
-                                 type=int,
-                                 default=256,
+                                 help='Triplet loss weight within ReID.')
+        self.parser.add_argument('--reid_dim', type=int, default=256,
                                  help='ReID embedding dimension.')
         self.parser.add_argument('--reid_cls_ids',
                                  default='0,1,2,3,4,5,6,7,8,9',
@@ -276,6 +243,30 @@ class opts(object):
                                  default=0.001,
                                  help='Frequency threshold t for repeat factor: rf=sqrt(t/f(c)).')
 
+        self.parser.add_argument('--nID', type=int, default=0,
+                                 help='Total number of unique track identities across all classes '
+                                      '(sum of per-class IDs). Used by ReID classifier. '
+                                      'Set automatically from dataset when possible; '
+                                      'override with --nID 7104 for VisDrone-7cls.')
+
+        # ── HawkDet (TOOD T-head + DFL) ──────────────────────────────────────
+        self.parser.add_argument('--reg_max', type=int, default=16,
+                                 help='DFL bin count − 1. Distance range per side = reg_max × stride pixels.')
+        self.parser.add_argument('--num_convs', type=int, default=4,
+                                 help='Depth of the shared tower in each THead scale.')
+        self.parser.add_argument('--cls_weight', type=float, default=1.0,
+                                 help='QFL classification loss weight (lambda_cls).')
+        self.parser.add_argument('--dfl_weight', type=float, default=1.5,
+                                 help='DFL regression loss weight (lambda_dfl).')
+        self.parser.add_argument('--tal_topk', type=int, default=13,
+                                 help='Number of top-k positives per GT in TAL assignment.')
+        self.parser.add_argument('--tal_alpha', type=float, default=1.0,
+                                 help='cls-score exponent in TAL metric: t = s^alpha * iou^beta.')
+        self.parser.add_argument('--tal_beta', type=float, default=6.0,
+                                 help='IoU exponent in TAL metric: t = s^alpha * iou^beta.')
+        self.parser.add_argument('--qfl_beta', type=float, default=2.0,
+                                 help='Modulating exponent beta in Quality Focal Loss.')
+
     def parse(self, args=''):
         if args == '':
             opt = self.parser.parse_args()
@@ -287,7 +278,7 @@ class opts(object):
         opt.lr_step = [int(i) for i in opt.lr_step.split(',')]
 
         # ECViT backbone always requires ImageNet normalization.
-        if 'hybrid' in opt.arch:
+        if 'hawkdet' in opt.arch:
             opt.use_imagenet_norm = True
 
         import torch
@@ -338,8 +329,17 @@ class opts(object):
             opt.heads = {}
             if opt.id_weight > 0:
                 opt.nID_dict = dataset.nID_dict
+        elif opt.task == 'hawkdet':
+            opt.heads = {}   # hawkdet doesn't use a heads dict; set for compatibility
+            # nID: prefer summing dataset.nID_dict (populated by real dataloader);
+            # fall back to --nID CLI arg for init() calls with a fake dataset stub.
+            if opt.id_weight > 0:
+                nid_from_ds = int(sum(dataset.nID_dict.values())) if getattr(dataset, 'nID_dict', {}) else 0
+                if nid_from_ds > 0:
+                    opt.nID = nid_from_ds
+                # else: keep CLI --nID value (user must pass --nID <count>)
         else:
-            raise ValueError(f'Unknown task: {opt.task!r}. Only "hybrid" is supported.')
+            raise ValueError(f'Unknown task: {opt.task!r}. Supported: "hybrid", "hawkdet".')
 
         print('heads: ', opt.heads)
         return opt

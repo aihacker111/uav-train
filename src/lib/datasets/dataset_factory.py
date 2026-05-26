@@ -6,7 +6,7 @@ from .dataset.jde import JointDataset
 
 
 def get_dataset(dataset, task):
-  if task in ('mot', 'hybrid'):
+  if task in ('mot', 'hybrid', 'hawkdet'):
     return JointDataset
   else:
     return None

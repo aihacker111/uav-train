@@ -105,9 +105,9 @@ def run(opt):
 
     pil_transform = build_aerial_mot_transforms()
 
-    # ── Collate function (hybrid task needs variable-length DETR targets) ────────
+    # ── Collate function (hybrid/hawkdet need variable-length DETR targets) ──────
     collate_fn = None
-    if opt.task == 'hybrid':
+    if opt.task in ('hybrid', 'hawkdet'):
         from lib.datasets.dataset.jde import hybrid_collate_fn
         collate_fn = hybrid_collate_fn
 
@@ -189,23 +189,27 @@ def run(opt):
 
     if rank == 0:
         print('Creating model...')
-    # Pass opt via sentinel key so hybrid create_model can read grad_checkpoint
-    # and ecdet_config without changing the public create_model signature.
-    _heads = dict(opt.heads, **{'__opt__': opt}) if opt.task == 'hybrid' else opt.heads
-    model = create_model(opt.arch, _heads, opt.head_conv,
-                         reid_dim=getattr(opt, 'reid_dim', 256),
+    # Pass opt via sentinel key so hybrid/hawkdet create_model can read ecdet_config etc.
+    _heads = dict(opt.heads, **{'__opt__': opt}) if opt.task in ('hybrid', 'hawkdet') else opt.heads
+    model = create_model(opt.arch, _heads, getattr(opt, 'head_conv', 0),
+                         reid_dim=getattr(opt, 'reid_dim', 0),
                          num_classes=opt.num_classes)
 
-    # Build optimizer: 4-way split for HybridECDet (backbone / norm / encoder / rest)
-    if 'hybrid' in opt.arch and hasattr(model, 'ecdet'):
+    # Build optimizer: 4-way split for HybridECDet and HawkDet (backbone/norm/encoder/rest)
+    _is_ecvit = (('hybrid' in opt.arch and hasattr(model, 'ecdet'))
+                 or ('hawkdet' in opt.arch and hasattr(model, 'backbone')))
+    if _is_ecvit:
+        # prefix for backbone/encoder varies by arch
+        _bb_prefix  = 'ecdet.backbone' if hasattr(model, 'ecdet') else 'backbone'
+        _enc_prefix = 'ecdet.encoder'  if hasattr(model, 'ecdet') else 'encoder'
         backbone_params, norm_params, encoder_params, rest_params = [], [], [], []
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
             in_norm     = any(x in name for x in ('.bn.', '.norm.', 'bn.weight', 'bn.bias',
                                                    'norm.weight', 'norm.bias'))
-            in_backbone = name.startswith('ecdet.backbone')
-            in_encoder  = name.startswith('ecdet.encoder')
+            in_backbone = name.startswith(_bb_prefix)
+            in_encoder  = name.startswith(_enc_prefix)
             if in_norm:
                 norm_params.append(p)
             elif in_backbone:
@@ -214,7 +218,7 @@ def run(opt):
                 encoder_params.append(p)
             else:
                 rest_params.append(p)
-        _blr = opt.lr * getattr(opt, 'backbone_lr_scale', 0.2)
+        _blr = opt.lr * getattr(opt, 'backbone_lr_scale', 0.05)
         _elr = opt.lr * getattr(opt, 'encoder_lr_scale',  0.5)
         _bwd = getattr(opt, 'backbone_wd',   0.01)
         _wd  = getattr(opt, 'weight_decay',  1e-4)

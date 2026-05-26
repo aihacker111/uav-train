@@ -709,6 +709,30 @@ class JointDataset(LoadImagesAndLabels):  # for training
                     start_idx = self.tid_start_idx_of_cls_ids[ds][cls_id]
                     labels[i, 1] += start_idx
 
+        # ── HawkDet: dense DETR-style targets; skip CenterNet heatmap entirely ──
+        if getattr(self.opt, 'task', '') == 'hawkdet':
+            num_objs_hd = labels.shape[0]
+            if num_objs_hd > 0:
+                _vm = (labels[:, 0] >= 0) & (labels[:, 0] < self.num_classes)
+                _vl = labels[_vm]
+                if _vm.any():
+                    _hd_boxes  = torch.from_numpy(_vl[:, 2:6].copy()).float()
+                    _hd_labels = torch.from_numpy(_vl[:, 0].copy()).long()
+                    _hd_ids    = torch.from_numpy((_vl[:, 1] - 1).copy()).long()
+                else:
+                    _hd_boxes  = torch.zeros((0, 4), dtype=torch.float32)
+                    _hd_labels = torch.zeros((0,),   dtype=torch.long)
+                    _hd_ids    = torch.full((0,), -1, dtype=torch.long)
+            else:
+                _hd_boxes  = torch.zeros((0, 4), dtype=torch.float32)
+                _hd_labels = torch.zeros((0,),   dtype=torch.long)
+                _hd_ids    = torch.full((0,), -1, dtype=torch.long)
+            return {
+                'input':   imgs,
+                'targets': {'boxes': _hd_boxes, 'labels': _hd_labels, 'ids': _hd_ids},
+                'meta':    {'img_id': torch.tensor(idx, dtype=torch.long)},
+            }
+
         output_h = imgs.shape[1] // self.opt.down_ratio  # 向下取整除法
         output_w = imgs.shape[2] // self.opt.down_ratio
         # print('output_h, output_w: %d %d' % (output_h, output_w))
