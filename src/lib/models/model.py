@@ -92,16 +92,38 @@ def load_model(
     }
 
     model_state = model.state_dict()
+
+    # Remap keys from old HybridECDet checkpoints so HawkDet can load
+    # backbone + encoder weights transparently.
+    #   ecdet.backbone.* → backbone.*
+    #   ecdet.encoder.*  → encoder.*
+    remapped: dict = {}
     for k, v in state_dict.items():
-        if k in model_state and v.shape != model_state[k].shape:
+        if k.startswith('ecdet.backbone.'):
+            remapped[k.replace('ecdet.backbone.', 'backbone.', 1)] = v
+        elif k.startswith('ecdet.encoder.'):
+            remapped[k.replace('ecdet.encoder.', 'encoder.', 1)] = v
+        else:
+            remapped[k] = v
+    state_dict = remapped
+
+    # Drop keys not in the current model, skip shape mismatches.
+    filtered: dict = {}
+    for k, v in state_dict.items():
+        if k not in model_state:
+            continue
+        if v.shape != model_state[k].shape:
             print(f'  [skip] {k}: ckpt {v.shape} != model {model_state[k].shape}')
-            state_dict[k] = model_state[k]
+            continue
+        filtered[k] = v
 
-    for k in model_state:
-        if k not in state_dict:
-            state_dict[k] = model_state[k]
+    loaded  = len(filtered)
+    missing = [k for k in model_state if k not in filtered]
+    if missing:
+        print(f'  [load_model] {loaded} tensors loaded, {len(missing)} kept from init '
+              f'(not in ckpt or remapped)')
 
-    model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict({**model_state, **filtered}, strict=True)
 
     if optimizer is not None and resume:
         if 'optimizer' in checkpoint:
