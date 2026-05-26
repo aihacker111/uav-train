@@ -206,24 +206,38 @@ class HybridLoss(nn.Module):
     def _efl_weights(self) -> Tensor | None:
         """Per-class equalization factor [C] for EFL negative suppression.
 
-        eq[c] = 1 - efl_beta * (acc_pos[c] / total)^efl_gamma
-        Frequent classes (e.g. car) get eq << 1 → their negative gradient is suppressed.
+        eq[c] = 1 - beta_eff * (acc_pos[c] / total)^efl_gamma
+        Ramped from 0 → efl_beta over dn_warmup_epochs to avoid suppressing
+        negative gradients before the class-frequency EMA has stabilised.
+        In early epochs (uniform _acc_pos) a full beta would reduce ALL classes'
+        negative weights equally, hurting background suppression → false positives.
         """
         if self.efl_beta <= 0:
             return None
+        ramp      = min(1.0, self._epoch / max(self.dn_warmup_epochs, 1))
+        beta_eff  = self.efl_beta * ramp
+        if beta_eff <= 0:
+            return None
         freq = self._acc_pos / self._acc_pos.sum().clamp(min=1e-6)
-        return (1.0 - self.efl_beta * freq.pow(self.efl_gamma)).clamp(0.0, 1.0)
+        return (1.0 - beta_eff * freq.pow(self.efl_gamma)).clamp(0.0, 1.0)
 
     def _logit_adj(self) -> Tensor | None:
         """Log-prior adjustment vector [C] for Logit Adjustment at train time.
 
-        adj[c] = tau * log(pi_c)  where pi_c = acc_pos[c] / total
-        Added to logits so rare classes are easier to predict positively.
+        adj[c] = tau_eff * log(pi_c)  where pi_c = acc_pos[c] / total
+        Ramped from 0 → logit_adj_tau over dn_warmup_epochs.
+        Without ramping, early uniform _acc_pos makes adj identical for all
+        classes (-tau*log(C)), forcing the model to output larger raw logits
+        overall — which inflates inference scores and produces false positives.
         """
         if self.logit_adj_tau <= 0:
             return None
+        ramp    = min(1.0, self._epoch / max(self.dn_warmup_epochs, 1))
+        tau_eff = self.logit_adj_tau * ramp
+        if tau_eff <= 0:
+            return None
         log_prior = torch.log(self._acc_pos / self._acc_pos.sum().clamp(min=1e-6) + 1e-8)
-        return self.logit_adj_tau * log_prior
+        return tau_eff * log_prior
 
     # ── DETR layer loss ────────────────────────────────────────────────────────
 
