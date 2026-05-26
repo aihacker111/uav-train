@@ -192,8 +192,8 @@ def run(opt):
     # Pass opt via sentinel key so hybrid/hawkdet create_model can read ecdet_config etc.
     _heads = dict(opt.heads, **{'__opt__': opt}) if opt.task in ('hybrid', 'hawkdet') else opt.heads
     model = create_model(opt.arch, _heads, getattr(opt, 'head_conv', 0),
-                         reid_dim=getattr(opt, 'reid_dim', 0),
-                         num_classes=opt.num_classes)
+                         num_classes=opt.num_classes,
+                         opt=opt)
 
     # Build optimizer: 4-way split for HybridECDet and HawkDet (backbone/norm/encoder/rest)
     _is_ecvit = (('hybrid' in opt.arch and hasattr(model, 'ecdet'))
