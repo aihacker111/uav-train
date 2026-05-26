@@ -157,7 +157,7 @@ class TALAssigner:
         # ── Resolve conflicts: each pred → one GT (highest IoU) ─────────────
         is_pos = is_topk.any(dim=-1)   # (P,)
         if not is_pos.any():
-            return assigned_labels, assigned_boxes, assigned_scores
+            return assigned_labels, assigned_boxes, assigned_scores, assigned_gt_idx
 
         # Among all GTs a pred is topk for, keep the one with highest IoU
         masked_iou  = iou_mat * is_topk.float()     # (P, G)
