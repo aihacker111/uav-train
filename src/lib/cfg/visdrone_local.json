@@ -1,0 +1,9 @@
+{
+    "root": "/Users/tinvo0908/Desktop/uav-train/VisDrone2019-7cls",
+    "train": {
+        "visdrone_train": "/Users/tinvo0908/Desktop/uav-train/VisDrone2019-7cls/VisDrone6cls.train"
+    },
+    "val": {
+        "visdrone_val": "/Users/tinvo0908/Desktop/uav-train/VisDrone2019-7cls/VisDrone6cls.val"
+    }
+}
