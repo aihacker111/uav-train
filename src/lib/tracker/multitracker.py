@@ -839,7 +839,8 @@ class HawkDetMCTracker(object):
         if reid_out is not None:
             reid_feats = reid_out[0].cpu().numpy()            # (N, D) L2-normalised
         else:
-            reid_feats = np.zeros((len(pred_boxes), 1), dtype=np.float32)
+            # Constant unit vector: normalises to itself, avoids NaN in embedding_distance
+            reid_feats = np.ones((len(pred_boxes), 1), dtype=np.float32)
 
         # ── cxcywh [0,1] → xyxy pixels ──────────────────────────────────────
         cx, cy, bw, bh = (pred_boxes[:, i] for i in range(4))
@@ -852,6 +853,13 @@ class HawkDetMCTracker(object):
         # ── Raw detections for mAP (score >= 0.01) ───────────────────────────
         cls_labels  = pred_scores.argmax(axis=1)   # (N,) best class per anchor
         cls_scores  = pred_scores.max(axis=1)      # (N,) best score per anchor
+
+        if self.frame_id == 1:
+            logger.info(
+                f'[HawkDetMCTracker] frame1 score stats: '
+                f'max={cls_scores.max():.3f}  mean={cls_scores.mean():.3f}  '
+                f'above_thresh({self.det_thresh})={( cls_scores > self.det_thresh).sum()}'
+            )
         self.last_raw_dets = defaultdict(list)
         for idx in np.where(cls_scores >= 0.01)[0]:
             det = np.array([boxes_xyxy[idx, 0], boxes_xyxy[idx, 1],

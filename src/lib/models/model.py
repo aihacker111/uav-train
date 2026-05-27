@@ -16,18 +16,23 @@ def create_model(
     opt=None,
 ) -> nn.Module:
     """
-    Instantiate a HawkDet model from an ECDet YAML config.
+    Instantiate a detection model from an ECDet YAML config.
 
-    Requires --ecdet_config pointing to an ECDet YAML
-    (e.g. lib/models/configs/ecdet_s_uav.yml).
+    Supported arch prefixes:
+      hawkdet_*   — ECViT + HybridEncoder + 4-scale TOOD T-head (dense, DFL)
+      ecdet_jde_* — ECViT + HybridEncoder + CenterNet JDE heads (hm/wh/reg/id)
+                    Compatible with AMOT's MCJDETracker.
+
+    Requires --ecdet_config pointing to an ECDet YAML.
     """
-    if 'hawkdet' not in arch:
+    opt = (heads.get('__opt__') if isinstance(heads, dict) else None) or opt
+
+    if 'hawkdet' not in arch and 'ecdet_jde' not in arch:
         raise NotImplementedError(
             f"create_model: arch={arch!r} is not registered. "
-            "Use 'hawkdet_s', 'hawkdet_m', 'hawkdet_l', or 'hawkdet_x'."
+            "Use 'hawkdet_s/m/l/x' or 'ecdet_jde_s/m/l/x'."
         )
 
-    opt          = (heads.get('__opt__') if isinstance(heads, dict) else None) or opt
     ecdet_config = getattr(opt, 'ecdet_config', '') if opt else ''
     if not ecdet_config:
         raise ValueError(
@@ -47,10 +52,24 @@ def create_model(
 
     encoder_cfg = cfg.yaml_cfg.get('HybridEncoder', {})
     hidden_dim  = encoder_cfg.get('hidden_dim', 256)
+    reid_dim    = getattr(opt, 'reid_dim', 0) if opt else 0
+
+    if 'ecdet_jde' in arch:
+        # CenterNet JDE heads for AMOT-style MCJDETracker
+        from lib.models.networks.ecdet_jde.model import EdgeCrafterJDE
+        _head_conv = head_conv if isinstance(head_conv, int) and head_conv > 0 else 64
+        return EdgeCrafterJDE(
+            ecdet=ecdet_model,
+            num_classes=num_classes,
+            hidden_dim=hidden_dim,
+            head_conv=_head_conv,
+            reid_dim=reid_dim,
+        )
+
+    # HawkDet: 4-scale dense T-head with DFL
     reg_max      = getattr(opt, 'reg_max',       16)  if opt else 16
     num_convs    = getattr(opt, 'num_convs',      2)  if opt else 2
     head_feat_ch = getattr(opt, 'head_feat_ch', 128)  if opt else 128
-    reid_dim     = getattr(opt, 'reid_dim',       0)  if opt else 0
 
     from lib.models.networks.hawkdet.model import HawkDet
     return HawkDet(

@@ -61,7 +61,7 @@ class opts(object):
         # model
         self.parser.add_argument('--arch',
                                  default='hawkdet_s',
-                                 help='model size variant: hawkdet_s / hawkdet_m / hawkdet_l / hawkdet_x')
+                                 help='model size variant: hawkdet_s/m/l/x or ecdet_jde_s/m/l/x')
         self.parser.add_argument('--ecdet_config',
                                  type=str,
                                  default='',
@@ -83,6 +83,70 @@ class opts(object):
                                  default=False,
                                  help='Enable gradient checkpointing on the ViT backbone. '
                                       'Reduces backbone VRAM by ~50%% at ~20%% slower backward.')
+
+        # ── ECDet JDE training (McMotLoss / MotTrainer) ─────────────────────────
+        self.parser.add_argument('--mse_loss',
+                                 action='store_true',
+                                 default=False,
+                                 help='Use MSE loss for heatmap instead of CornerNet focal loss.')
+        self.parser.add_argument('--hm_gauss',
+                                 type=int,
+                                 default=8,
+                                 help='Gaussian radius for heatmap when --mse_loss is set.')
+        self.parser.add_argument('--reg_loss',
+                                 default='l1',
+                                 choices=['l1', 'sl1'],
+                                 help='Regression loss type: l1 (L1) or sl1 (Smooth-L1).')
+        self.parser.add_argument('--dense_wh',
+                                 action='store_true',
+                                 default=False,
+                                 help='Use dense WH supervision instead of sparse.')
+        self.parser.add_argument('--norm_wh',
+                                 action='store_true',
+                                 default=False,
+                                 help='Normalised regression loss for WH (scale-invariant).')
+        self.parser.add_argument('--hm_weight',
+                                 type=float,
+                                 default=1.0,
+                                 help='Heatmap loss weight (lambda_hm).')
+        self.parser.add_argument('--wh_weight',
+                                 type=float,
+                                 default=0.1,
+                                 help='Width/height loss weight (lambda_wh).')
+        self.parser.add_argument('--off_weight',
+                                 type=float,
+                                 default=1.0,
+                                 help='Center-offset regression loss weight (lambda_off).')
+        self.parser.add_argument('--num_stacks',
+                                 type=int,
+                                 default=1,
+                                 help='Number of decoder stacks. Always 1 for EdgeCrafterJDE.')
+        self.parser.add_argument('--tri',
+                                 default=True,
+                                 action=argparse.BooleanOptionalAction,
+                                 help='Include triplet loss in ReID training. '
+                                      'Disable with --no-tri.')
+
+        # ── MCJDETracker (AMOT-compatible) options ────────────────────────────
+        self.parser.add_argument('--down_ratio',
+                                 type=int,
+                                 default=4,
+                                 help='Stride of the feature map used by MCJDETracker. '
+                                      '4 for S4 (EdgeCrafterJDE) or DLA-34 output.')
+        self.parser.add_argument('--cat_spec_wh',
+                                 action='store_true',
+                                 default=False,
+                                 help='Use class-specific W/H in CenterNet decode.')
+        self.parser.add_argument('--reg_offset',
+                                 default=True,
+                                 action=argparse.BooleanOptionalAction,
+                                 help='Use sub-pixel center offset (reg) in CenterNet decode. '
+                                      'Disable with --no-reg-offset.')
+        self.parser.add_argument('--head_conv',
+                                 type=int,
+                                 default=64,
+                                 help='Hidden channels in CenterNet detection heads '
+                                      '(used by EdgeCrafterJDE / MCJDETracker).')
 
         # input
         self.parser.add_argument('--input_res',
@@ -280,8 +344,14 @@ class opts(object):
         opt.lr_step = [int(i) for i in opt.lr_step.split(',')]
 
         # ECViT backbone always requires ImageNet normalization.
-        if 'hawkdet' in opt.arch:
+        if 'hawkdet' in opt.arch or 'ecdet_jde' in opt.arch:
             opt.use_imagenet_norm = True
+
+        # Auto-derive task from arch so user only needs --arch ecdet_jde_s.
+        if 'ecdet_jde' in opt.arch and opt.task not in ('ecdet_jde',):
+            opt.task = 'ecdet_jde'
+        elif 'hawkdet' in opt.arch and opt.task == 'hybrid':
+            opt.task = 'hawkdet'
 
         import torch
         if not torch.cuda.is_available() and 'cuda' in opt.device:
@@ -340,8 +410,18 @@ class opts(object):
                 if nid_from_ds > 0:
                     opt.nID = nid_from_ds
                 # else: keep CLI --nID value (user must pass --nID <count>)
+        elif opt.task == 'ecdet_jde':
+            # AMOT-compatible: CenterNet JDE heads on S4 via EdgeCrafterJDE backbone
+            opt.heads = {
+                'hm':  opt.num_classes,
+                'wh':  2,
+                'reg': 2,
+                'id':  opt.reid_dim,
+            }
+            if opt.id_weight > 0:
+                opt.nID_dict = getattr(dataset, 'nID_dict', {})
         else:
-            raise ValueError(f'Unknown task: {opt.task!r}. Supported: "hybrid", "hawkdet".')
+            raise ValueError(f'Unknown task: {opt.task!r}. Supported: "hybrid", "hawkdet", "ecdet_jde".')
 
         print('heads: ', opt.heads)
         return opt
@@ -349,7 +429,7 @@ class opts(object):
     def init(self, args=''):
         opt = self.parse(args)
 
-        use_imagenet_norm = 'hybrid' in opt.arch
+        use_imagenet_norm = 'hybrid' in opt.arch or 'ecdet_jde' in opt.arch
         _common = {
             'default_input_wh': [opt.input_wh[1], opt.input_wh[0]],
             'num_classes': len(opt.reid_cls_ids.split(',')),

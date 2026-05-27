@@ -206,7 +206,10 @@ def main(opt,
     mkdir_if_missing(result_root)
     data_type = 'mot'
 
-    use_imagenet_norm = getattr(opt, 'use_imagenet_norm', False)
+    # ECViT backbone always needs ImageNet normalization regardless of how opt was created
+    use_imagenet_norm = getattr(opt, 'use_imagenet_norm',
+                                'hawkdet' in opt.arch or 'hybrid' in opt.arch
+                                or 'ecdet_jde' in opt.arch)
 
     accs = []
     n_frame = 0

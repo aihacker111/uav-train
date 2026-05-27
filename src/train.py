@@ -105,7 +105,8 @@ def run(opt):
 
     pil_transform = build_aerial_mot_transforms()
 
-    # ── Collate function (hybrid/hawkdet need variable-length DETR targets) ──────
+    # ── Collate function ──────────────────────────────────────────────────────────
+    # hybrid/hawkdet use variable-length DETR targets; ecdet_jde uses fixed tensors
     collate_fn = None
     if opt.task in ('hybrid', 'hawkdet'):
         from lib.datasets.dataset.jde import hybrid_collate_fn
@@ -189,15 +190,16 @@ def run(opt):
 
     if rank == 0:
         print('Creating model...')
-    # Pass opt via sentinel key so hybrid/hawkdet create_model can read ecdet_config etc.
-    _heads = dict(opt.heads, **{'__opt__': opt}) if opt.task in ('hybrid', 'hawkdet') else opt.heads
-    model = create_model(opt.arch, _heads, getattr(opt, 'head_conv', 0),
+    # Pass opt via sentinel key so create_model can read ecdet_config, reid_dim, etc.
+    _heads = dict(opt.heads, **{'__opt__': opt}) if opt.task in ('hybrid', 'hawkdet', 'ecdet_jde') else opt.heads
+    model = create_model(opt.arch, _heads, getattr(opt, 'head_conv', 64),
                          num_classes=opt.num_classes,
                          opt=opt)
 
-    # Build optimizer: 4-way split for HybridECDet and HawkDet (backbone/norm/encoder/rest)
+    # Build optimizer: 4-way split for ECViT models (backbone/norm/encoder/rest)
     _is_ecvit = (('hybrid' in opt.arch and hasattr(model, 'ecdet'))
-                 or ('hawkdet' in opt.arch and hasattr(model, 'backbone')))
+                 or ('hawkdet' in opt.arch and hasattr(model, 'backbone'))
+                 or ('ecdet_jde' in opt.arch and hasattr(model, 'backbone')))
     if _is_ecvit:
         # prefix for backbone/encoder varies by arch
         _bb_prefix  = 'ecdet.backbone' if hasattr(model, 'ecdet') else 'backbone'
