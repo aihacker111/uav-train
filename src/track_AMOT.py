@@ -205,7 +205,7 @@ def main(opt,
     mkdir_if_missing(result_root)
     data_type = 'mot'
 
-    use_imagenet_norm = getattr(opt, 'use_imagenet_norm', False)
+    use_imagenet_norm = 'deim' in opt.arch or 'hybrid' in opt.arch
 
     accs = []
     n_frame = 0

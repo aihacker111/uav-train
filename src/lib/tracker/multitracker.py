@@ -364,6 +364,10 @@ class MCJDETracker(object):
 
         self.gmc = GMC(method='sparseOptFlow', verbose=[None, False])
 
+        # {cls_id: np.ndarray[N, 5+]} xyxy+score in original image coords
+        # populated every frame for mAP computation in track_AMOT.py
+        self.last_raw_dets: dict = {}
+
     @staticmethod
     def _detr_to_orig(boxes_np, scores_np, labels_np, net_h, net_w, h_orig, w_orig):
         """Convert DETR normalized cxcywh [0,1] → per-class xyxy in original image coords."""
@@ -564,6 +568,8 @@ class MCJDETracker(object):
                     cls_id_feats.append(cls_id_feature)
 
                 dets = map2orig(det_raw, h_out, w_out, height, width, self.opt.num_classes)
+
+        self.last_raw_dets = dets
         # ----- parse each object class
         _empty = np.zeros((0, 5), dtype=np.float32)
         for cls_id in range(self.opt.num_classes):
