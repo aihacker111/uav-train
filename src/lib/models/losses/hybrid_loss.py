@@ -739,12 +739,6 @@ class HybridLoss(nn.Module):
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
 
-        # Learnable uncertainty weight for ReID (Kendall et al. 2018).
-        # Initialised to -1.05 matching AMOT's s_id — gives exp(-s_id) ≈ 2.86 at start.
-        # Only created when reid_classifier is provided; registered as nn.Parameter so
-        # base_trainer automatically adds it to the optimizer param group.
-        if reid_classifier is not None:
-            self.s_id = nn.Parameter(-1.05 * torch.ones(1))
 
         self.matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
 
@@ -877,28 +871,25 @@ class HybridLoss(nn.Module):
 
         emb   = torch.cat(valid_emb)                  # (N, reid_dim) — L2-normalised from DETRHead
         ids_t = torch.cat(valid_ids).to(emb.device)  # (N,)
-        n     = emb.shape[0]
 
-        # Embedding scale normalization (AMOT emb_scale_dict):
-        #   emb_scale = sqrt(2) * log(nID - 1)  — applied before both CE and Triplet.
-        # DETRHead already L2-normalises; F.normalize is kept for AMP safety.
+        # emb_unit  : unit sphere — for TripletLoss (metric learning, distances in [0, 2])
+        # emb_normed: scaled by emb_scale — for linear classifier (angular softmax margin)
+        #   emb_scale = sqrt(2) * log(nID - 1)  matching AMOT's emb_scale_dict
         n_ids      = self.reid_classifier.out_features
         emb_scale  = math.sqrt(2) * math.log(max(n_ids - 1, 1))
-        emb_normed = emb_scale * F.normalize(emb, p=2, dim=-1)
+        emb_unit   = F.normalize(emb, p=2, dim=-1)
+        emb_normed = emb_scale * emb_unit
 
         logits  = self.reid_classifier(emb_normed)
         loss_ce = F.cross_entropy(logits, ids_t)
 
         unique_ids = ids_t.unique()
-        if unique_ids.numel() >= 2 and n >= 2:
-            loss_tri = self.triplet_loss(emb_normed, ids_t)
+        if unique_ids.numel() >= 2 and ids_t.numel() >= 2:
+            loss_tri = self.triplet_loss(emb_unit, ids_t)   # unit sphere: distances in [0, 2]
         else:
-            loss_tri = emb_normed.sum() * 0.0
+            loss_tri = emb_unit.sum() * 0.0
 
-        # Normalise by N — REQUIRED with emb_scale*Triplet to prevent explosion.
-        # emb_scale ~9-10x inflates distances → Triplet can reach ~18.
-        # /N keeps l_reid small; exp(-s_id) in forward compensates (AMOT pattern).
-        return (loss_ce + self.lambda_triplet * loss_tri) / n
+        return loss_ce + self.lambda_triplet * loss_tri
 
     # ── Forward ────────────────────────────────────────────────────────────────
 
@@ -934,14 +925,8 @@ class HybridLoss(nn.Module):
 
         if self.reid_classifier is not None and 'ids' in targets[0]:
             l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])
-            # Kendall et al. 2018 homoscedastic uncertainty (matching AMOT exactly):
-            #   L_weighted = 0.5 * (exp(-s_id) * L_reid + s_id)
-            # The 0.5 is the correct Kendall factor: L/(2σ²) + log(σ) = 0.5*(exp(-s)*L + s).
-            # With /N in _reid_loss, l_reid ~0.1-0.2 → exp(-s_id)*l_reid ~0.3-0.6 at init.
-            # s_id adjusts until exp(-s_id) ≈ 1/l_reid (equilibrium).
-            total  = total + 0.5 * (torch.exp(-self.s_id) * l_reid + self.s_id)
+            total  = total + self.lambda_reid * l_reid
             loss_stats['loss_reid'] = l_reid
-            loss_stats['s_id']      = self.s_id.detach()
             loss_stats['loss']      = total
 
         return total, loss_stats
