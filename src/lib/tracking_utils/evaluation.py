@@ -10,7 +10,7 @@ from lib.tracking_utils.io import read_results, unzip_objs
 class Evaluator(object):
 
     def __init__(self, data_root, seq_name, data_type):
-        self.data_root = '/media/jianbo/ioe/UAVdata/VisDrone2019/test-dev/annotations_car'
+        self.data_root = data_root
         self.seq_name = seq_name
         self.data_type = data_type
 
@@ -79,8 +79,7 @@ class Evaluator(object):
         self.reset_accumulator()
 
         result_frame_dict = read_results(filename, self.data_type, is_gt=False)
-        #frames = sorted(list(set(self.gt_frame_dict.keys()) | set(result_frame_dict.keys())))
-        frames = sorted(list(set(result_frame_dict.keys())))
+        frames = sorted(list(set(self.gt_frame_dict.keys()) | set(result_frame_dict.keys())))
         for frame_id in frames:
             trk_objs = result_frame_dict.get(frame_id, [])
             trk_tlwhs, trk_ids = unzip_objs(trk_objs)[:2]
