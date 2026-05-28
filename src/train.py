@@ -198,7 +198,8 @@ def run(opt):
     _heads = dict(opt.heads, **{'__opt__': opt}) if opt.task == 'hybrid' else opt.heads
     model = create_model(opt.arch, _heads, opt.head_conv,
                          reid_dim=getattr(opt, 'reid_dim', 256),
-                         num_classes=opt.num_classes)
+                         num_classes=opt.num_classes,
+                         opt=opt)
 
     # Build optimizer: 3-way split for HybridDEIM (backbone / norm / rest)
     if 'hybrid' in opt.arch and hasattr(model, 'deim'):
