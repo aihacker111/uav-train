@@ -1,24 +1,65 @@
 """
 DEIMMotNet: DEIMv2 backbone/encoder + CenterNet detection + ReID heads.
 
-Replaces the DETR decoder entirely, producing the same output format as
-the original AMOT (DLA-34) model so the full AMOT tracking pipeline is
-reused without modification:
-
+Output format (compatible with AMOT tracking pipeline):
     [{'hm': (B,C,H,W), 'wh': (B,2,H,W), 'reg': (B,2,H,W), 'id': (B,D,H,W)}]
 
-Benefits vs HybridDEIM:
-  - No query limit (num_queries cap removed — all objects decoded)
-  - Spatial ReID map → reid_motion tracking in MCJDETracker works correctly
-  - Faster inference (no decoder cross-attention)
-  - McMotLoss (AMOT) directly applicable
+S4 strategy (DINOv3STAs backbone)
+----------------------------------
+DINOv3STAs contains a SpatialPriorModulev2 (STA) that computes:
+
+    stem(x) → S4 (16ch, H/4×W/4)   ← computed, never returned
+    conv2   → S8 (32ch)
+    conv3   → S16 (64ch)
+    conv4   → S32 (64ch)
+
+We register a forward hook on sta.stem to capture the S4 tensor as a
+side-effect — zero extra compute, backbone/encoder interface unchanged.
+
+Final S4 feature map:
+    enc_S8 ─[bilinear ×2]──→ ⊕ → heads (H/4, W/4)
+    sta_S4 ─[lateral 1×1]──┘
+
+    lateral proj: Conv2d(16, hidden_dim, 1) = ~3 K params only
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from typing import Any, Dict, List, Optional
+
+
+class DilatedContext(nn.Module):
+    """
+    Multi-scale depthwise-dilated context block for dense / cluttered regions.
+
+    Two parallel depthwise convolutions (d1, d2) widen the receptive field on
+    the S4 feature map without changing resolution or channel count.  A
+    pointwise conv merges the branches; a residual skip preserves semantics.
+
+    On S4 (stride-4 map, default dilations=2,4):
+        d=2 → 5×5 kernel  → ~20×20 original-image pixels
+        d=4 → 9×9 kernel  → ~36×36 original-image pixels
+
+    Extra params: 2×(C×9) depthwise + 2C×C pointwise  ≈ 135 K for C=256
+    """
+
+    def __init__(self, channels: int, dilations: tuple = (2, 4)) -> None:
+        super().__init__()
+        d1, d2 = dilations
+        self.dw1 = nn.Conv2d(channels, channels, 3,
+                             padding=d1, dilation=d1, groups=channels, bias=False)
+        self.dw2 = nn.Conv2d(channels, channels, 3,
+                             padding=d2, dilation=d2, groups=channels, bias=False)
+        self.pw  = nn.Conv2d(channels * 2, channels, 1, bias=False)
+        self.bn  = nn.BatchNorm2d(channels)
+        nn.init.kaiming_normal_(self.pw.weight, mode='fan_out')
+
+    def forward(self, x: Tensor) -> Tensor:
+        ctx = torch.cat([self.dw1(x), self.dw2(x)], dim=1)   # (B, 2C, H, W)
+        return x + self.bn(F.relu(self.pw(ctx), inplace=True))
 
 
 def _make_head(in_ch: int, out_ch: int, head_conv: int) -> nn.Sequential:
@@ -34,16 +75,11 @@ class DEIMMotNet(nn.Module):
     """
     DEIM backbone + HybridEncoder + CenterNet/ReID heads.
 
-    The decoder from the original DEIM model is ignored at inference time.
-    Pretrained backbone/encoder weights are loaded via load_pretrained().
-
     Args:
         deim       : Full DEIM model (backbone + encoder + decoder).
-                     Only backbone and encoder are used in forward().
         num_classes: Number of object categories.
-        hidden_dim : Encoder output channels — must match HybridEncoder.hidden_dim
-                     in the YAML config (typically 256).
-        head_conv  : Intermediate channels for all conv heads (64 is a good default).
+        hidden_dim : Encoder output channels (HybridEncoder.hidden_dim).
+        head_conv  : Intermediate channels for prediction heads.
         reid_dim   : ReID embedding dimension.
     """
 
@@ -58,24 +94,76 @@ class DEIMMotNet(nn.Module):
         super().__init__()
         self.deim = deim
 
-        # S8 → S4 upsample
-        # self.cn_upsample = nn.Sequential(
-        #     nn.ConvTranspose2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False),
-        #     nn.GroupNorm(32, hidden_dim),
-        #     nn.ReLU(inplace=True),
-        # )
-        self.cn_upsample = nn.Sequential(
-            nn.ConvTranspose2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False)
-        )
+        # ── S4 lateral via hook on sta.stem ───────────────────────────────────
+        self._s4_cache: Optional[Tensor] = None
+        self._hook_handle = None
 
-        # Prediction heads — all output raw logits (sigmoid applied in the loss)
+        s4_ch = self._register_s4_hook(deim)
+
+        # proj_enc: 1×1 to stabilise enc_S8 before bilinear upsample
+        self.proj_enc = nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False)
+        nn.init.kaiming_normal_(self.proj_enc.weight, mode='fan_out')
+
+        if s4_ch is not None:
+            self.lateral_s4 = nn.Conv2d(s4_ch, hidden_dim, 1, bias=False)
+            nn.init.kaiming_normal_(self.lateral_s4.weight, mode='fan_out')
+            print(f'[DEIMMotNet] STA S4 lateral: {s4_ch}ch → {hidden_dim}ch  '
+                  f'({s4_ch * hidden_dim:,} params)')
+        else:
+            self.lateral_s4 = None
+            print('[DEIMMotNet] STA not found — using bilinear upsample only')
+
+        # ── Dilated context (dense-scene receptive field widening) ────────────
+        self.dilated_ctx = DilatedContext(hidden_dim)
+
+        # ── Prediction heads ──────────────────────────────────────────────────
         self.hm_head  = _make_head(hidden_dim, num_classes, head_conv)
         self.wh_head  = _make_head(hidden_dim, 2,           head_conv)
         self.reg_head = _make_head(hidden_dim, 2,           head_conv)
         self.id_head  = _make_head(hidden_dim, reid_dim,    head_conv)
 
-        # CenterNet-style heatmap bias init: prior ≈ 0.01  →  logit ≈ −4.6
-        nn.init.constant_(self.hm_head[-1].bias, -4.595)
+        self._init_head_weights()
+
+    # ── Hook setup ─────────────────────────────────────────────────────────────
+
+    def _register_s4_hook(self, deim: nn.Module) -> Optional[int]:
+        """
+        Register a forward hook on deim.backbone.sta.stem.
+        Returns the S4 channel count, or None if STA is not present.
+        """
+        backbone = deim.backbone
+        if not (hasattr(backbone, 'sta') and hasattr(backbone.sta, 'stem')):
+            return None
+
+        def _hook(module, inp, out):
+            self._s4_cache = out
+
+        self._hook_handle = backbone.sta.stem.register_forward_hook(_hook)
+
+        # Probe channel count with a dummy forward
+        try:
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, 64, 64)
+                backbone(dummy)
+            s4_ch = self._s4_cache.shape[1]
+            self._s4_cache = None
+            return s4_ch
+        except Exception as e:
+            print(f'[DEIMMotNet] S4 probe failed: {e} — disabling lateral')
+            if self._hook_handle is not None:
+                self._hook_handle.remove()
+                self._hook_handle = None
+            return None
+
+    # ── Weight init ────────────────────────────────────────────────────────────
+
+    def _init_head_weights(self) -> None:
+        for head in (self.hm_head, self.wh_head, self.reg_head, self.id_head):
+            nn.init.kaiming_normal_(head[0].weight, mode='fan_out', nonlinearity='relu')
+            nn.init.constant_(head[0].bias, 0.0)
+            nn.init.constant_(head[2].bias, 0.0)
+        # heatmap prior: sigmoid(−4.595) ≈ 0.01
+        nn.init.constant_(self.hm_head[2].bias, -4.595)
 
     # ── Forward ────────────────────────────────────────────────────────────────
 
@@ -85,22 +173,30 @@ class DEIMMotNet(nn.Module):
         targets: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Tensor]]:
         """
-        Args:
-            x      : (B, 3, H, W) input image (ImageNet-normalised).
-            targets: ignored — kept for API compatibility with HybridDEIM.
-
-        Returns:
-            List of one dict (num_stacks = 1):
-              'hm'  (B, C, Hf, Wf)       raw heatmap logits
-              'wh'  (B, 2, Hf, Wf)       width/height
-              'reg' (B, 2, Hf, Wf)       sub-pixel offset
-              'id'  (B, reid_dim, Hf, Wf) reid embedding map
-            where Hf = H/4, Wf = W/4  (stride 4, same as AMOT).
+        Returns list of one dict:
+          'hm'  (B, C, H/4, W/4)        raw heatmap logits
+          'wh'  (B, 2, H/4, W/4)        width / height
+          'reg' (B, 2, H/4, W/4)        sub-pixel offset
+          'id'  (B, reid_dim, H/4, W/4) reid embedding map
         """
-        feats = self.deim.backbone(x)
-        feats = self.deim.encoder(feats)   # list of [S8, S16, S32] feature maps
+        # Reset cache; hook fills it during backbone forward
+        self._s4_cache = None
 
-        s4 = self.cn_upsample(feats[0])    # (B, hidden_dim, H/4, W/4)
+        feats     = self.deim.backbone(x)          # [S8, S16, S32] unchanged
+        enc_feats = self.deim.encoder(feats)        # [enc_S8, enc_S16, enc_S32]
+
+        # Bilinear upsample enc_S8 → S4 resolution (no learnable kernel)
+        s4 = F.interpolate(
+            self.proj_enc(enc_feats[0]),
+            scale_factor=2, mode='bilinear', align_corners=False,
+        )
+
+        # Fuse with STA S4: fine-grained spatial details captured by hook
+        if self.lateral_s4 is not None and self._s4_cache is not None:
+            s4 = s4 + self.lateral_s4(self._s4_cache)
+
+        # Widen receptive field for dense / closely-packed objects
+        s4 = self.dilated_ctx(s4)
 
         return [{
             'hm':  self.hm_head(s4),
@@ -109,10 +205,10 @@ class DEIMMotNet(nn.Module):
             'id':  self.id_head(s4),
         }]
 
-    # ── Weight utilities ───────────────────────────────────────────────────────
+    # ── Weight loading ─────────────────────────────────────────────────────────
 
     def load_pretrained(self, path: str) -> None:
-        """Load DEIM backbone+encoder pretrained weights (decoder keys are skipped)."""
+        """Load DEIM backbone+encoder pretrained weights (decoder keys skipped)."""
         ckpt  = torch.load(path, map_location='cpu', weights_only=False)
         state = ckpt.get('ema', ckpt.get('model', ckpt)) if isinstance(ckpt, dict) else ckpt
         if any(k.startswith('module.') for k in state):

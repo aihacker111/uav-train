@@ -32,9 +32,10 @@ COMPONENTS_HYBRID = [
 ]
 
 COMPONENTS_DEIM_MOT = [
-    ('deim.backbone', 'Backbone (DEIM-UAV)'),
-    ('deim.encoder',  'Encoder (DEIM-UAV)'),
-    ('cn_upsample',   'CenterNet Upsample'),
+    ('deim.backbone', 'Backbone (DINOv3STAs)'),
+    ('deim.encoder',  'Encoder (HybridEncoder)'),
+    ('proj_enc',      'Enc proj 1×1'),
+    ('lateral_s4',    'S4 lateral 1×1'),
     ('hm_head',       'Heatmap Head'),
     ('wh_head',       'WH Head'),
     ('reg_head',      'Offset Head'),
@@ -96,10 +97,35 @@ def count_params(model):
     return total, trainable
 
 
+def _fix_s4_hook(m):
+    """Re-register the STA S4 forward hook lost during deepcopy.
+
+    PyTorch hooks are not transferred by deepcopy, so _s4_cache stays None
+    on the copy and lateral_s4 is never applied.  This re-wires the hook on
+    the copied backbone's sta.stem.
+    """
+    if not (hasattr(m, '_s4_cache') and hasattr(m, 'lateral_s4') and m.lateral_s4 is not None):
+        return
+    try:
+        stem = m.deim.backbone.sta.stem
+    except AttributeError:
+        return
+    if hasattr(m, '_hook_handle') and m._hook_handle is not None:
+        try:
+            m._hook_handle.remove()
+        except Exception:
+            pass
+    def _hook(module, inp, out):
+        m._s4_cache = out
+    m._hook_handle = stem.register_forward_hook(_hook)
+
+
 def try_gflops(model, dummy):
     try:
         from thop import profile
-        macs, _ = profile(copy.deepcopy(model).eval().cpu(), inputs=(dummy.cpu(),), verbose=False)
+        m_copy = copy.deepcopy(model).eval().cpu()
+        _fix_s4_hook(m_copy)
+        macs, _ = profile(m_copy, inputs=(dummy.cpu(),), verbose=False)
         return macs * 2 / 1e9, 'ok'
     except ImportError:
         return 0.0, 'thop not installed'
@@ -109,6 +135,7 @@ def try_gflops(model, dummy):
 
 def measure_fps(model, dummy, device, warmup, runs, half):
     m = copy.deepcopy(model).to(device).eval()
+    _fix_s4_hook(m)
     d = dummy.to(device)
     if half:
         m, d = m.half(), d.half()
@@ -203,6 +230,10 @@ def main():
 
     model = _build_model(args)
     model.eval()
+
+    if args.arch == 'deim_mot':
+        s4_on = getattr(model, 'lateral_s4', None) is not None
+        print(f"  STA S4 lateral       : {'active' if s4_on else 'disabled (STA not found)'}")
 
     # Allow arbitrary resolution — clear cached spatial sizes
     for submod in (getattr(model.deim, 'encoder', None), getattr(model.deim, 'decoder', None)):

@@ -925,6 +925,18 @@ class opts(object):
                                  type=float,
                                  default=0.1,
                                  help='loss weight for bounding box size.')
+        self.parser.add_argument('--iou_weight',
+                                 type=float,
+                                 default=1.0,
+                                 help='weight for CIoU loss (deim_mot only). 0 to disable.')
+        self.parser.add_argument('--vfl',
+                                 action='store_true',
+                                 default=False,
+                                 help='Use Varifocal Loss for heatmap (aligns score with IoU quality).')
+        self.parser.add_argument('--log_wh',
+                                 action='store_true',
+                                 default=False,
+                                 help='Supervise WH head in log-space (scale-invariant, better for tiny objects).')
         self.parser.add_argument('--id_loss',
                                  default='ce',
                                  help='reid loss: ce | triplet')

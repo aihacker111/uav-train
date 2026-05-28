@@ -1,15 +1,12 @@
 """
 DeimMotLoss + DeimMotTrainer — McMotLoss-style training for DEIMMotNet.
 
-Loss formula (identical to AMOT's McMotLoss):
-    det_loss  = hm_weight * hm_loss + wh_weight * wh_loss + off_weight * off_loss
-    reid_loss = Σ_cls [ CE(emb_scale * norm(id_feat), cls_tr_ids)
-                         + tri * TripletLoss(id_feat, cls_tr_ids) ] / N_obj
-    total     = exp(−s_det) * det_loss + exp(−s_id) * reid_loss + (s_det + s_id)
-    total    *= 0.5
+Loss formula — Kendall et al., CVPR 2018, eq. 9 (flat, one σ per sub-loss):
+    L = ½ · Σᵢ [ exp(−sᵢ) · Lᵢ + sᵢ ]
 
-s_det and s_id are learnable temperature parameters that balance detection
-and ReID losses without manual weight tuning (Kendall et al. 2018).
+    sᵢ = log(σᵢ²) is a learnable scalar; σᵢ is the homoscedastic uncertainty.
+    Active sub-losses: hm, wh, off, [iou], [repul], [id].
+    Manual hm_weight / wh_weight / … are superseded by exp(−sᵢ).
 """
 from __future__ import annotations
 
@@ -23,6 +20,7 @@ import torch.nn.functional as F
 
 from lib.models.base_losses import (
     FocalLoss, RegL1Loss, RegLoss, NormRegL1Loss, RegWeightedL1Loss, TripletLoss,
+    ciou_loss, VarifocalLoss, LogWHLoss, repulsion_loss,
 )
 from lib.models.decode import mot_decode
 from lib.models.utils import _sigmoid, _tranpose_and_gather_feat
@@ -52,15 +50,25 @@ class DeimMotLoss(nn.Module):
         self.opt = opt
 
         # Heatmap loss
-        self.crit = torch.nn.MSELoss() if opt.mse_loss else FocalLoss()
+        if opt.mse_loss:
+            self.crit = torch.nn.MSELoss()
+        elif getattr(opt, 'vfl', False):
+            self.crit = VarifocalLoss()
+        else:
+            self.crit = FocalLoss()
+        self.use_vfl = getattr(opt, 'vfl', False) and not opt.mse_loss
 
         # Box regression losses
         self.crit_reg = RegL1Loss() if opt.reg_loss == 'l1' else RegLoss()
-        self.crit_wh  = (
-            NormRegL1Loss()   if opt.norm_wh    else
-            RegWeightedL1Loss() if opt.cat_spec_wh else
-            self.crit_reg
-        )
+        self.use_log_wh = getattr(opt, 'log_wh', False)
+        if self.use_log_wh:
+            self.crit_wh = LogWHLoss()
+        elif opt.norm_wh:
+            self.crit_wh = NormRegL1Loss()
+        elif opt.cat_spec_wh:
+            self.crit_wh = RegWeightedL1Loss()
+        else:
+            self.crit_wh = self.crit_reg
 
         # ReID losses
         if opt.id_weight > 0:
@@ -77,23 +85,94 @@ class DeimMotLoss(nn.Module):
 
             self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
             self.TriLoss = TripletLoss()
-            self.s_id    = nn.Parameter(-1.05 * torch.ones(1))
 
-        # Learnable detection loss temperature (init = exp(1.85) ≈ 6.36 scale)
-        self.s_det = nn.Parameter(-1.85 * torch.ones(1))
+        # Repulsion loss smoothing threshold (0.0 = plain −log(1 − IoU))
+        self.repul_sigma = getattr(opt, 'repul_sigma', 0.0)
+
+        # ── Kendall uncertainty parameters ────────────────────────────────────
+        # Kendall et al., CVPR 2018 — "Multi-Task Learning Using Uncertainty
+        # to Weigh Losses for Scene Geometry and Semantics", eq. 9.
+        #
+        #   L = ½ · Σᵢ [ exp(−sᵢ) · Lᵢ + sᵢ ]
+        #
+        # sᵢ = log(σᵢ²) is a learnable scalar per sub-loss.
+        # σᵢ is the homoscedastic (task-specific) uncertainty.
+        # Effective weight = exp(−sᵢ); regulariser = sᵢ prevents σᵢ → ∞.
+        #
+        # Init: 0.0 → weight = 1 at the start of training.
+        # 'id' is initialised at −1.05 to preserve prior scaling (exp(1.05) ≈ 2.86×).
+        _lv_keys = ['hm', 'wh', 'off']
+        if opt.id_weight > 0:
+            _lv_keys.append('id')
+        if getattr(opt, 'iou_weight',   0.0) > 0:
+            _lv_keys.append('iou')
+        if getattr(opt, 'repul_weight', 0.0) > 0:
+            _lv_keys.append('repul')
+        self.log_vars = nn.ParameterDict({
+            k: nn.Parameter(torch.tensor(-1.05 if k == 'id' else 0.0))
+            for k in _lv_keys
+        })
 
     def forward(self, outputs, batch) -> tuple:
         opt = self.opt
-        hm_loss = wh_loss = off_loss = reid_loss = 0.0
+        hm_loss = wh_loss = off_loss = reid_loss = iou_loss = repul = 0.0
 
         for s in range(opt.num_stacks):
             output = outputs[s]
             dev    = output['hm'].device
 
             # ── Detection ──────────────────────────────────────────────────────
-            # Apply sigmoid + numerical clamp (avoids log(0) in FocalLoss)
-            hm = _sigmoid(output['hm'])
-            hm_loss += self.crit(hm, batch['hm'].to(dev)) / opt.num_stacks
+            hm_gt  = batch['hm'].to(dev)
+
+            if self.use_vfl:
+                # Build IoU quality map for positive pixels if CIoU is also enabled
+                iou_map = None
+                if getattr(opt, 'iou_weight', 0.0) > 0 and opt.reg_offset:
+                    W_feat   = output['hm'].shape[3]
+                    ind_v    = batch['ind'].to(dev)
+                    mask_v   = batch['reg_mask'].to(dev).bool()
+                    pred_wh_v  = _tranpose_and_gather_feat(output['wh'],  ind_v)
+                    pred_reg_v = _tranpose_and_gather_feat(output['reg'], ind_v)
+                    cx_int_v = (ind_v % W_feat).float()
+                    cy_int_v = (ind_v // W_feat).float()
+                    gt_wh_v  = batch['wh'].to(dev)
+                    gt_reg_v = batch['reg'].to(dev)
+
+                    def _xyxy(cx, cy, wh):
+                        return torch.stack([cx - wh[...,0]*.5, cy - wh[...,1]*.5,
+                                            cx + wh[...,0]*.5, cy + wh[...,1]*.5], -1)
+
+                    pred_wh_dec = (torch.exp(pred_wh_v) if self.use_log_wh
+                                   else pred_wh_v)
+                    pb = _xyxy(cx_int_v + pred_reg_v[...,0], cy_int_v + pred_reg_v[...,1], pred_wh_dec)
+                    gb = _xyxy(cx_int_v + gt_reg_v[...,0],  cy_int_v + gt_reg_v[...,1],  gt_wh_v)
+
+                    # Compute per-object IoU for valid objects only
+                    B, max_obj = ind_v.shape
+                    H_f, W_f = output['hm'].shape[2], W_feat
+                    iou_map = output['hm'].new_zeros(B, opt.num_classes, H_f, W_f)
+                    for b in range(B):
+                        valid_idx = mask_v[b].nonzero(as_tuple=True)[0]
+                        if len(valid_idx) == 0:
+                            continue
+                        pb_v = pb[b][valid_idx]; gb_v = gb[b][valid_idx]
+                        ix1 = torch.max(pb_v[:,0], gb_v[:,0]); iy1 = torch.max(pb_v[:,1], gb_v[:,1])
+                        ix2 = torch.min(pb_v[:,2], gb_v[:,2]); iy2 = torch.min(pb_v[:,3], gb_v[:,3])
+                        inter = (ix2-ix1).clamp(0) * (iy2-iy1).clamp(0)
+                        pw=(pb_v[:,2]-pb_v[:,0]).clamp(0); ph=(pb_v[:,3]-pb_v[:,1]).clamp(0)
+                        gw=(gb_v[:,2]-gb_v[:,0]).clamp(0); gh=(gb_v[:,3]-gb_v[:,1]).clamp(0)
+                        iou = inter / (pw*ph + gw*gh - inter + 1e-7)
+                        # scatter IoU values onto the heatmap at peak positions
+                        peak_inds = ind_v[b][valid_idx]
+                        # use hm GT to find which class each peak belongs to
+                        cls_at_peak = hm_gt[b, :, peak_inds // W_f, peak_inds % W_f].argmax(0)
+                        for i, (pi, cls, q) in enumerate(zip(peak_inds, cls_at_peak, iou)):
+                            iou_map[b, cls, pi // W_f, pi % W_f] = q.detach()
+
+                hm_loss += self.crit(output['hm'], hm_gt, iou_map) / opt.num_stacks
+            else:
+                hm = _sigmoid(output['hm'])
+                hm_loss += self.crit(hm, hm_gt) / opt.num_stacks
 
             if opt.wh_weight > 0:
                 wh_loss += self.crit_wh(
@@ -110,6 +189,48 @@ class DeimMotLoss(nn.Module):
                     batch['ind'].to(dev),
                     batch['reg'].to(dev),
                 ) / opt.num_stacks
+
+            # ── CIoU loss + Repulsion loss (shared box computation) ───────────
+            _use_iou   = 'iou'   in self.log_vars
+            _use_repul = 'repul' in self.log_vars
+            if (_use_iou or _use_repul) and opt.reg_offset:
+                W_feat   = output['hm'].shape[3]
+                mask_reg = batch['reg_mask'].to(dev).bool()          # (B, max_obj)
+                ind      = batch['ind'].to(dev)                      # (B, max_obj)
+
+                pred_wh  = _tranpose_and_gather_feat(output['wh'],  ind)  # (B, max_obj, 2)
+                pred_reg = _tranpose_and_gather_feat(output['reg'], ind)  # (B, max_obj, 2)
+
+                cx_int = (ind % W_feat).float()
+                cy_int = (ind // W_feat).float()
+
+                gt_wh  = batch['wh'].to(dev)   # (B, max_obj, 2)
+                gt_reg = batch['reg'].to(dev)  # (B, max_obj, 2)
+
+                # Apply log→linear decoding if log_wh head was used
+                pred_wh_dec = torch.exp(pred_wh) if self.use_log_wh else pred_wh
+
+                def _to_xyxy(cx, cy, wh):
+                    return torch.stack([
+                        cx - wh[..., 0] * 0.5, cy - wh[..., 1] * 0.5,
+                        cx + wh[..., 0] * 0.5, cy + wh[..., 1] * 0.5,
+                    ], dim=-1)
+
+                pred_boxes = _to_xyxy(cx_int + pred_reg[..., 0],
+                                      cy_int + pred_reg[..., 1], pred_wh_dec)
+                gt_boxes   = _to_xyxy(cx_int + gt_reg[..., 0],
+                                      cy_int + gt_reg[..., 1],   gt_wh)
+
+                if _use_iou:
+                    valid_pred = pred_boxes[mask_reg]
+                    valid_gt   = gt_boxes[mask_reg]
+                    if valid_pred.shape[0] > 0:
+                        iou_loss += ciou_loss(valid_pred, valid_gt) / opt.num_stacks
+
+                if _use_repul:
+                    repul += repulsion_loss(
+                        pred_boxes, gt_boxes, mask_reg, self.repul_sigma,
+                    ) / opt.num_stacks
 
             # ── ReID ───────────────────────────────────────────────────────────
             if opt.id_weight > 0:
@@ -140,23 +261,20 @@ class DeimMotLoss(nn.Module):
                     else:
                         reid_loss += self.ce_loss(pred, target_ids) / n
 
-        # ── Combine with learned temperature scaling ───────────────────────────
-        det_loss = (
-            opt.hm_weight  * hm_loss
-            + opt.wh_weight  * wh_loss
-            + opt.off_weight * off_loss
-        )
+        # ── Kendall uncertainty weighting (Kendall et al., CVPR 2018, eq. 9) ──
+        # L = ½ · Σᵢ [ exp(−sᵢ) · Lᵢ + sᵢ ]
+        # Manual hm/wh/off/iou/repul/id weights are superseded by exp(−sᵢ).
+        def _kendall(key: str, val) -> torch.Tensor:
+            s = self.log_vars[key]
+            v = val if isinstance(val, torch.Tensor) else hm_loss.new_zeros(())
+            return torch.exp(-s) * v + s
 
-        if opt.id_weight > 0:
-            loss = (
-                torch.exp(-self.s_det) * det_loss
-                + torch.exp(-self.s_id) * reid_loss
-                + (self.s_det + self.s_id)
-            )
-        else:
-            loss = torch.exp(-self.s_det) * det_loss + self.s_det
+        components = [('hm', hm_loss), ('wh', wh_loss), ('off', off_loss)]
+        if 'iou'   in self.log_vars: components.append(('iou',   iou_loss))
+        if 'repul' in self.log_vars: components.append(('repul', repul))
+        if 'id'    in self.log_vars: components.append(('id',    reid_loss))
 
-        loss *= 0.5
+        loss = 0.5 * sum(_kendall(k, v) for k, v in components)
 
         def _t(v):
             return v if isinstance(v, torch.Tensor) else torch.tensor(float(v))
@@ -167,8 +285,12 @@ class DeimMotLoss(nn.Module):
             'wh_loss':  _t(wh_loss),
             'off_loss': _t(off_loss),
         }
-        if opt.id_weight > 0:
-            loss_stats['id_loss'] = _t(reid_loss)
+        if 'iou'   in self.log_vars: loss_stats['iou_loss']   = _t(iou_loss)
+        if 'repul' in self.log_vars: loss_stats['repul_loss'] = _t(repul)
+        if 'id'    in self.log_vars: loss_stats['id_loss']    = _t(reid_loss)
+        # Kendall effective weights — monitor how σᵢ evolves during training
+        for k, s in self.log_vars.items():
+            loss_stats[f'w_{k}'] = torch.exp(-s).detach()
 
         return loss, loss_stats
 
@@ -185,19 +307,26 @@ class DeimMotTrainer(BaseTrainer):
 
     def _get_losses(self, opt):
         loss_states = ['loss', 'hm_loss', 'wh_loss', 'off_loss']
-        if opt.id_weight > 0:
-            loss_states.append('id_loss')
+        if getattr(opt, 'iou_weight',   0.0) > 0: loss_states.append('iou_loss')
+        if getattr(opt, 'repul_weight', 0.0) > 0: loss_states.append('repul_loss')
+        if opt.id_weight > 0:                      loss_states.append('id_loss')
+        # Kendall effective weights logged every iteration
+        loss_states += ['w_hm', 'w_wh', 'w_off']
+        if opt.id_weight > 0:                      loss_states.append('w_id')
+        if getattr(opt, 'iou_weight',   0.0) > 0: loss_states.append('w_iou')
+        if getattr(opt, 'repul_weight', 0.0) > 0: loss_states.append('w_repul')
         return loss_states, DeimMotLoss(opt)
 
     def save_result(self, output, batch, results) -> None:
         out = output[0] if isinstance(output, (list, tuple)) else output
         reg = out.get('reg') if self.opt.reg_offset else None
-        dets = mot_decode(
+        dets, _, _ = mot_decode(
             heatmap=_sigmoid(out['hm']),
             wh=out['wh'],
             reg=reg,
             cat_spec_wh=self.opt.cat_spec_wh,
             K=self.opt.K,
+            log_wh=getattr(self.opt, 'log_wh', False),
         )
         dets = dets.detach().cpu().numpy().reshape(1, -1, dets.shape[2])
         dets_out = ctdet_post_process(
@@ -245,12 +374,13 @@ class DeimMotTrainer(BaseTrainer):
 
                 # Decode detections: (B, K, 6) → [x1, y1, x2, y2, score, cls]
                 reg  = out.get('reg') if opt.reg_offset else None
-                dets = mot_decode(
+                dets, _, _ = mot_decode(
                     heatmap=_sigmoid(out['hm']),
                     wh=out['wh'],
                     reg=reg,
                     cat_spec_wh=opt.cat_spec_wh,
                     K=opt.K,
+                    log_wh=getattr(opt, 'log_wh', False),
                 )
                 dets_np = dets.detach().cpu().numpy()  # (B, K, 6)
 

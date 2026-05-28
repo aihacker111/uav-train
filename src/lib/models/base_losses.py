@@ -1447,3 +1447,187 @@ class GBF(nn.Module):
             pos_w = 1 + self.alpha * (1 - neg_w)
 
         return pos_w, neg_w
+
+def ciou_loss(pred_boxes: Tensor, gt_boxes: Tensor, eps: float = 1e-7) -> Tensor:
+    """
+    Paired CIoU loss for N matched (pred, gt) box pairs.
+
+    Args:
+        pred_boxes: (N, 4) xyxy in feature-map pixel coords
+        gt_boxes  : (N, 4) xyxy in feature-map pixel coords
+    Returns:
+        scalar mean CIoU loss over N pairs
+    """
+    px1, py1, px2, py2 = pred_boxes.unbind(-1)
+    gx1, gy1, gx2, gy2 = gt_boxes.unbind(-1)
+
+    ix1 = torch.max(px1, gx1);  iy1 = torch.max(py1, gy1)
+    ix2 = torch.min(px2, gx2);  iy2 = torch.min(py2, gy2)
+    inter = (ix2 - ix1).clamp(0) * (iy2 - iy1).clamp(0)
+
+    pw = (px2 - px1).clamp(0);  ph = (py2 - py1).clamp(0)
+    gw = (gx2 - gx1).clamp(0);  gh = (gy2 - gy1).clamp(0)
+    union = pw * ph + gw * gh - inter + eps
+    iou   = inter / union
+
+    ex1 = torch.min(px1, gx1);  ey1 = torch.min(py1, gy1)
+    ex2 = torch.max(px2, gx2);  ey2 = torch.max(py2, gy2)
+    c2  = (ex2 - ex1).pow(2) + (ey2 - ey1).pow(2) + eps
+
+    pcx = (px1 + px2) * 0.5;  pcy = (py1 + py2) * 0.5
+    gcx = (gx1 + gx2) * 0.5;  gcy = (gy1 + gy2) * 0.5
+    d2  = (pcx - gcx).pow(2) + (pcy - gcy).pow(2)
+
+    v = (4.0 / math.pi ** 2) * (
+        torch.atan(gw / (gh + eps)) - torch.atan(pw / (ph + eps))
+    ).pow(2)
+    with torch.no_grad():
+        alpha = v / (1.0 - iou + v + eps)
+
+    return (1.0 - (iou - d2 / c2 - alpha * v)).mean()
+
+
+class VarifocalLoss(nn.Module):
+    """
+    Varifocal Loss (VFL) for heatmap supervision.
+
+    For positive pixels: target = IoU(pred_box, gt_box) * gt_hm_value
+    For negative pixels: standard focal suppression α * pred^γ * BCE
+
+    This aligns heatmap score with actual localization quality — a detection
+    that predicts the right location but wrong size gets a lower target score
+    than one that predicts both correctly.
+
+    Reference: Zhang et al. "VarifocalNet" CVPR 2021.
+    """
+
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred: Tensor, gt_hm: Tensor,
+                iou_map: Tensor | None = None) -> Tensor:
+        """
+        Args:
+            pred    : (B, C, H, W) raw logits
+            gt_hm   : (B, C, H, W) Gaussian-rendered heatmap targets in [0,1]
+            iou_map : (B, C, H, W) IoU quality at positive locations (optional).
+                      When provided, positive targets = iou_map * (gt_hm == 1).
+                      When None, falls back to standard focal loss.
+        """
+        pred_sigmoid = pred.sigmoid()
+
+        if iou_map is not None:
+            # positive target = iou quality; negative target = 0
+            pos_mask = (gt_hm == 1.0).float()
+            target   = iou_map * pos_mask + gt_hm * (1.0 - pos_mask)
+        else:
+            target = gt_hm
+
+        # VFL: positives weighted by |q - p|^γ, negatives weighted by α * p^γ
+        pos_mask = (target > 0).float()
+        weight = (
+            pos_mask * (target - pred_sigmoid).abs().pow(self.gamma)
+            + (1.0 - pos_mask) * self.alpha * pred_sigmoid.pow(self.gamma)
+        )
+
+        bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        return (bce * weight).sum() / (pos_mask.sum().clamp(min=1.0))
+
+
+class LogWHLoss(nn.Module):
+    """
+    Scale-invariant WH loss: supervise in log space.
+
+    The WH head predicts log(w), log(h).  GT targets are log(gt_w), log(gt_h).
+    This makes a 2× error on a 5px object identical in loss magnitude to a
+    2× error on a 50px object — critical for UAV where objects span 10–200px.
+
+    At inference, apply exp() to the head output before using box coordinates.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, output: Tensor, mask: Tensor,
+                ind: Tensor, target: Tensor) -> Tensor:
+        """
+        Args:
+            output : (B, 2, H, W)     raw wh head output (predicts log-space)
+            mask   : (B, max_obj)     valid-object binary mask
+            ind    : (B, max_obj)     flat spatial peak indices
+            target : (B, max_obj, 2)  GT wh in pixel coords (will be log-ified)
+        """
+        pred = _tranpose_and_gather_feat(output, ind)   # (B, max_obj, 2)
+        mask = mask.unsqueeze(2).expand_as(pred).float()
+
+        log_target = torch.log(target.clamp(min=1e-4))  # log(gt_wh)
+        loss = F.l1_loss(pred * mask, log_target * mask, reduction='sum')
+        return loss / (mask.sum() + 1e-4)
+
+
+# ── Repulsion Loss ─────────────────────────────────────────────────────────────
+# Wang et al., "Repulsion Loss: Repulsing Proposals in Object Detection",
+# CVPR 2018.  Penalises predicted boxes that overlap the GT of a neighbouring
+# object, preventing box drift in dense / closely-packed scenes.
+
+def _pairwise_iou(boxes1: Tensor, boxes2: Tensor) -> Tensor:
+    """(n, m) IoU matrix between two sets of xyxy boxes."""
+    a1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(0)
+    a2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(0)
+    ix1 = torch.max(boxes1[:, None, 0], boxes2[None, :, 0])
+    iy1 = torch.max(boxes1[:, None, 1], boxes2[None, :, 1])
+    ix2 = torch.min(boxes1[:, None, 2], boxes2[None, :, 2])
+    iy2 = torch.min(boxes1[:, None, 3], boxes2[None, :, 3])
+    inter = (ix2 - ix1).clamp(0) * (iy2 - iy1).clamp(0)
+    return inter / (a1[:, None] + a2[None, :] - inter + 1e-7)
+
+
+def repulsion_loss(
+    pred_boxes: Tensor,
+    gt_boxes:   Tensor,
+    mask:       Tensor,
+    sigma:      float = 0.0,
+) -> Tensor:
+    """
+    Repulsion Loss — penalises each predicted box for overlapping the GT of
+    any *neighbouring* object (i.e. every GT except its own matched one).
+
+    Args:
+        pred_boxes: (B, max_obj, 4)  xyxy, feature-map coordinates.
+        gt_boxes:   (B, max_obj, 4)  xyxy, feature-map coordinates.
+        mask:       (B, max_obj)     bool — True for real (non-padded) objects.
+        sigma:      Smooth-ln threshold.  0.0 → plain −log(1 − IoU).
+
+    Returns:
+        Scalar averaged over images that have ≥ 2 valid objects.
+    """
+    total, n_img = pred_boxes.new_zeros(()), 0
+
+    for b in range(pred_boxes.shape[0]):
+        valid = mask[b]
+        n = int(valid.sum())
+        if n < 2:
+            continue
+
+        p = pred_boxes[b][valid]                         # (n, 4)
+        g = gt_boxes[b][valid]                           # (n, 4)
+
+        iou = _pairwise_iou(p, g).fill_diagonal_(0.0)   # zero out matched pairs
+        repul_iou, _ = iou.max(dim=1)                   # nearest non-matched GT
+
+        if sigma > 0.0:
+            penalty = torch.where(
+                repul_iou < sigma,
+                -torch.log(1.0 - repul_iou + 1e-7),
+                (repul_iou - sigma) / (1.0 - sigma + 1e-7)
+                + math.log(1.0 / (1.0 - sigma + 1e-7)),
+            )
+        else:
+            penalty = -torch.log(1.0 - repul_iou + 1e-7)
+
+        total  = total + penalty.mean()
+        n_img += 1
+
+    return total / max(n_img, 1)

@@ -558,6 +558,7 @@ class MCJDETracker(object):
                     num_classes=self.opt.num_classes,
                     cat_spec_wh=self.opt.cat_spec_wh,
                     K=self.opt.K,
+                    log_wh=getattr(self.opt, 'log_wh', False),
                 )
 
                 cls_id_feats = []
