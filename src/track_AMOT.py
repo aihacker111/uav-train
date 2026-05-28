@@ -14,7 +14,7 @@ import torch
 
 from collections import defaultdict
 from tqdm import tqdm
-from lib.tracker.multitracker import MCJDETracker, HybridMCJDETracker
+from lib.tracker.multitracker import MCJDETracker
 from lib.tracking_utils import visualization as vis
 from lib.tracking_utils.log import logger
 from lib.tracking_utils.timer import Timer
@@ -123,8 +123,7 @@ def eval_seq(opt,
     if save_dir:
         mkdir_if_missing(save_dir)
 
-    is_hybrid = 'hybrid' in opt.arch
-    tracker = HybridMCJDETracker(opt, frame_rate) if is_hybrid else MCJDETracker(opt, frame_rate)
+    tracker = MCJDETracker(opt, frame_rate)
 
     timer = Timer()
     results_dict = defaultdict(list)

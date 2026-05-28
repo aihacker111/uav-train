@@ -337,7 +337,8 @@ class MCJDETracker(object):
 
         # ----- init model
         print('Creating model...')
-        self.model = create_model(opt.arch, opt.heads, opt.head_conv)
+        self.model = create_model(opt.arch, opt.heads, opt.head_conv,
+                                  num_classes=opt.num_classes, opt=opt)
         self.model = load_model(self.model, opt.load_model)  # load specified checkpoint
         self.model = self.model.to(opt.device)
         self.model.eval()
@@ -449,40 +450,88 @@ class MCJDETracker(object):
 
         ''' Step 1: Network forward, get detections & embeddings'''
         with torch.no_grad():
-            output = self.model.forward(im_blob)[-1]
-            hm = output['hm'].sigmoid_()
-            wh = output['wh']
-            reg = output['reg'] if self.opt.reg_offset else None
-            id_feature = output['id']
+            raw_output = self.model.forward(im_blob)
 
-            # L2 normalize the reid feature vector
-            id_feature = F.normalize(id_feature, dim=1)
+            if isinstance(raw_output, dict) and 'stage2' in raw_output:
+                # ── Hybrid model: stage-1 seeds ref points for stage-2.
+                # Use stage-2 (DETR) as the final refined detections.
+                stage2 = raw_output['stage2']
 
-            self.past_id_feature.append(id_feature)
-            self.past_reg.append(reg)
+                boxes_t  = stage2.boxes[0]              # (K, 4) cxcywh [0,1]
+                probs    = stage2.logits[0].sigmoid()   # (K, C)
+                scores_t, labels_t = probs.max(dim=-1)
 
-            #  detection decoding
-            dets, inds, cls_inds_mask = mot_decode(heatmap=hm,
-                                                   wh=wh,
-                                                   reg=reg,
-                                                   num_classes=self.opt.num_classes,
-                                                   cat_spec_wh=self.opt.cat_spec_wh,
-                                                   K=self.opt.K)
+                boxes_np  = boxes_t.cpu().numpy()
+                scores_np = scores_t.cpu().numpy().astype(np.float32)
+                labels_np = labels_t.cpu().numpy().astype(int)
 
-            # ----- get ReID feature vector by object class
-            cls_id_feats = []  # topK feature vectors of each object class
-            for cls_id in range(self.opt.num_classes):  # cls_id starts from 0
-                # get inds of each object class
-                cls_inds = inds[:, cls_inds_mask[cls_id]]
+                # Pre-filter background queries before per-class split
+                keep      = scores_np >= self.opt.conf_thres
+                boxes_np  = boxes_np[keep]
+                scores_np = scores_np[keep]
+                labels_np = labels_np[keep]
 
-                # gather feats for each object class
-                cls_id_feature = _tranpose_and_gather_feat(id_feature, cls_inds)  # inds: 1×128
-                cls_id_feature = cls_id_feature.squeeze(0)  # n × FeatDim
-                cls_id_feature = cls_id_feature.cpu().numpy()
-                cls_id_feats.append(cls_id_feature)
+                # Convert normalized cxcywh → per-class xyxy in original image coords
+                dets = HybridMCJDETracker._detr_to_orig(
+                    boxes_np, scores_np, labels_np,
+                    net_height, net_width, height, width,
+                )
 
-        # translate and scale
-        dets = map2orig(dets, h_out, w_out, height, width, self.opt.num_classes)
+                # Reid: use stage2.reid if available, else constant unit vectors
+                _reid_dim = 256
+                dummy = np.ones(_reid_dim, dtype=np.float32) / (_reid_dim ** 0.5)
+                if stage2.reid is not None:
+                    reid_np   = stage2.reid[0].cpu().numpy()   # (K_all, reid_dim)
+                    reid_keep = reid_np[keep]                  # filter same as boxes
+                else:
+                    reid_np   = None
+                    reid_keep = None
+
+                cls_id_feats = []
+                for cls_id in range(self.opt.num_classes):
+                    cls_d = dets.get(cls_id, np.zeros((0, 5), dtype=np.float32))
+                    if reid_keep is not None:
+                        cls_mask = labels_np == cls_id
+                        cls_id_feats.append(reid_keep[cls_mask])
+                    else:
+                        cls_id_feats.append(
+                            np.tile(dummy, (len(cls_d), 1))
+                        )
+
+                # Dummy past feature maps so reid_motion helpers don't crash
+                cn_out    = raw_output['stage1']
+                B, _, H, W = cn_out.hm.shape
+                _id_map   = cn_out.hm.new_ones(B, _reid_dim, H, W) / (_reid_dim ** 0.5)
+                _reg_map  = cn_out.reg if self.opt.reg_offset else None
+                self.past_id_feature.append(_id_map)
+                self.past_reg.append(_reg_map)
+
+            else:
+                # ── Non-hybrid model: standard CenterNet JDE path
+                output     = raw_output[-1]
+                hm         = output['hm'].sigmoid_()
+                wh         = output['wh']
+                reg        = output['reg'] if self.opt.reg_offset else None
+                id_feature = F.normalize(output['id'], dim=1)
+
+                self.past_id_feature.append(id_feature)
+                self.past_reg.append(reg)
+
+                det_raw, inds, cls_inds_mask = mot_decode(
+                    heatmap=hm, wh=wh, reg=reg,
+                    num_classes=self.opt.num_classes,
+                    cat_spec_wh=self.opt.cat_spec_wh,
+                    K=self.opt.K,
+                )
+
+                cls_id_feats = []
+                for cls_id in range(self.opt.num_classes):
+                    cls_inds       = inds[:, cls_inds_mask[cls_id]]
+                    cls_id_feature = _tranpose_and_gather_feat(id_feature, cls_inds)
+                    cls_id_feature = cls_id_feature.squeeze(0).cpu().numpy()
+                    cls_id_feats.append(cls_id_feature)
+
+                dets = map2orig(det_raw, h_out, w_out, height, width, self.opt.num_classes)
         # ----- parse each object class
         for cls_id in range(self.opt.num_classes):
             cls_dets = dets[cls_id]
