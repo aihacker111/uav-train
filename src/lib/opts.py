@@ -936,7 +936,7 @@ class opts(object):
 
         self.parser.add_argument('--reid_dim',
                                  type=int,
-                                 default=256,
+                                 default=128,
                                  # KPI: track re-acquisition ≤ 3s after 5s occlusion + retention ≥ 80%
                                  # after appearance change (jacket removal, direction reversal).
                                  # 128-d embedding has insufficient cosine separation for these constraints.

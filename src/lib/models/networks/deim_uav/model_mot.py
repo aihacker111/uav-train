@@ -44,7 +44,7 @@ class DEIMMotNet(nn.Module):
         hidden_dim : Encoder output channels — must match HybridEncoder.hidden_dim
                      in the YAML config (typically 256).
         head_conv  : Intermediate channels for all conv heads (64 is a good default).
-        reid_dim   : ReID embedding dimension (256 to match AMOT).
+        reid_dim   : ReID embedding dimension.
     """
 
     def __init__(
@@ -53,22 +53,19 @@ class DEIMMotNet(nn.Module):
         num_classes: int,
         hidden_dim: int = 256,
         head_conv: int = 64,
-        reid_dim: int = 256,
+        reid_dim: int = 128,
     ) -> None:
         super().__init__()
         self.deim = deim
 
-        # S8 → S4 upsample with an extra refinement conv.
-        # DLA-34 uses IDAUp (deformable conv, progressive multi-scale fusion) to
-        # build its stride-4 feature map.  We compensate with an extra 3×3 conv
-        # after ConvTranspose2d to let the network learn local corrections.
+        # S8 → S4 upsample
+        # self.cn_upsample = nn.Sequential(
+        #     nn.ConvTranspose2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False),
+        #     nn.GroupNorm(32, hidden_dim),
+        #     nn.ReLU(inplace=True),
+        # )
         self.cn_upsample = nn.Sequential(
-            nn.ConvTranspose2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False),
-            nn.GroupNorm(32, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(32, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(hidden_dim, hidden_dim, kernel_size=2, stride=2, bias=False)
         )
 
         # Prediction heads — all output raw logits (sigmoid applied in the loss)
