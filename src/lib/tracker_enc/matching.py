@@ -130,13 +130,13 @@ def ious(atlbrs, btlbrs):
 
     :rtype ious np.ndarray
     """
-    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float)
+    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float64)
     if ious.size == 0:
         return ious
 
     ious = bbox_ious(
-        np.ascontiguousarray(atlbrs, dtype=np.float),
-        np.ascontiguousarray(btlbrs, dtype=np.float)
+        np.ascontiguousarray(atlbrs, dtype=np.float64),
+        np.ascontiguousarray(btlbrs, dtype=np.float64)
     )
 
     return ious
@@ -294,7 +294,7 @@ def reid_attention(prev_feat, curr_feat_map, temperature=0.07):
 
 def reid_motion_vis(img, tracks, dets, past_id_feature, curr_id_feature, past_reg, curr_reg,
                 h_out, w_out, height, width, save_frame):
-    cost_matrix = np.zeros((len(tracks), len(dets)), dtype=np.float)
+    cost_matrix = np.zeros((len(tracks), len(dets)), dtype=np.float64)
 
     save_path = '/media/jianbo/ioe/Lun_6/vis/reid_off_curr/' + str(save_frame) + '.jpg'
     img_vis = img.copy()
@@ -444,7 +444,7 @@ def reid_motion_vis(img, tracks, dets, past_id_feature, curr_id_feature, past_re
 
 def reid_motion_unconfirmed(tracks, dets, id_feature, reg,
                 h_out, w_out, height, width):
-    cost_matrix = np.zeros((len(tracks), len(dets)), dtype=np.float)
+    cost_matrix = np.zeros((len(tracks), len(dets)), dtype=np.float64)
     if cost_matrix.size == 0:
         return cost_matrix
     else:
@@ -485,7 +485,7 @@ def reid_motion_unconfirmed(tracks, dets, id_feature, reg,
 
 def reid_motion(tracks, dets, id_feature, reg,
                 h_out, w_out, height, width):
-    cost_matrix = np.zeros((len(tracks), len(dets)), dtype=np.float)
+    cost_matrix = np.zeros((len(tracks), len(dets)), dtype=np.float64)
     if cost_matrix.size == 0:
         return cost_matrix
     else:
@@ -533,14 +533,14 @@ def embedding_distance(tracks, detections, metric='cosine'):
     :param metric:
     :return: cost_matrix np.ndarray
     """
-    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float)
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float64)
     if cost_matrix.size == 0:
         return cost_matrix
 
-    det_features = np.asarray([track.curr_feat for track in detections], dtype=np.float)
+    det_features = np.asarray([track.curr_feat for track in detections], dtype=np.float64)
     # for i, track in enumerate(tracks):
     # cost_matrix[i, :] = np.maximum(0.0, cdist(track.smooth_feat.reshape(1,-1), det_features, metric))
-    track_features = np.asarray([track.smooth_feat for track in tracks], dtype=np.float)
+    track_features = np.asarray([track.smooth_feat for track in tracks], dtype=np.float64)
 
     # 默认计算两个特征向量之间的夹角余弦
     # Nomalized features
