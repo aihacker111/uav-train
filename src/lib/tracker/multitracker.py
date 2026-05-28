@@ -364,6 +364,38 @@ class MCJDETracker(object):
 
         self.gmc = GMC(method='sparseOptFlow', verbose=[None, False])
 
+    @staticmethod
+    def _detr_to_orig(boxes_np, scores_np, labels_np, net_h, net_w, h_orig, w_orig):
+        """Convert DETR normalized cxcywh [0,1] → per-class xyxy in original image coords."""
+        ratio_x = float(net_w) / w_orig
+        ratio_y = float(net_h) / h_orig
+        ratio   = min(ratio_x, ratio_y)
+        new_w   = round(w_orig * ratio)
+        new_h   = round(h_orig * ratio)
+        pad_x   = (net_w - new_w) * 0.5
+        pad_y   = (net_h - new_h) * 0.5
+        pad_type = 'pad_y' if ratio == ratio_x else 'pad_x'
+
+        cx = boxes_np[:, 0] * net_w;  bw = boxes_np[:, 2] * net_w
+        cy = boxes_np[:, 1] * net_h;  bh = boxes_np[:, 3] * net_h
+        x1 = cx - bw / 2;  x2 = cx + bw / 2
+        y1 = cy - bh / 2;  y2 = cy + bh / 2
+
+        if pad_type == 'pad_x':
+            x1 = np.clip((x1 - pad_x) / new_w * w_orig, 0, w_orig)
+            x2 = np.clip((x2 - pad_x) / new_w * w_orig, 0, w_orig)
+            y1 = np.clip(y1 / net_h * h_orig, 0, h_orig)
+            y2 = np.clip(y2 / net_h * h_orig, 0, h_orig)
+        else:
+            x1 = np.clip(x1 / net_w * w_orig, 0, w_orig)
+            x2 = np.clip(x2 / net_w * w_orig, 0, w_orig)
+            y1 = np.clip((y1 - pad_y) / new_h * h_orig, 0, h_orig)
+            y2 = np.clip((y2 - pad_y) / new_h * h_orig, 0, h_orig)
+
+        dets = np.stack([x1, y1, x2, y2, scores_np], axis=1).astype(np.float32)
+        n_cls = int(labels_np.max()) + 1 if len(labels_np) > 0 else 0
+        return {cls_id: dets[labels_np == cls_id] for cls_id in range(n_cls)}
+
     def reset(self):
         """
         :return:
@@ -472,7 +504,7 @@ class MCJDETracker(object):
                 labels_np = labels_np[keep]
 
                 # Convert normalized cxcywh → per-class xyxy in original image coords
-                dets = HybridMCJDETracker._detr_to_orig(
+                dets = MCJDETracker._detr_to_orig(
                     boxes_np, scores_np, labels_np,
                     net_height, net_width, height, width,
                 )
