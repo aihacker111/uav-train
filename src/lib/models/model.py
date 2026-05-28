@@ -34,7 +34,7 @@ def create_model(arch: str, heads: dict, head_conv: int,
     if not deim_config:
         raise ValueError(
             "--deim_config is required for DEIM-based architectures. "
-            "Example: --deim_config configs/deim-uav/deimv2_hgnetv2_s_coco.yml"
+            "Example: --deim_config src/lib/models/configs/deim-uav/deimv2_hgnetv2_s_coco.yml"
         )
 
     # Ensure src/lib/models/ is on sys.path so `import engine` resolves correctly
