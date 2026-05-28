@@ -14,26 +14,26 @@ def create_model(arch: str, heads: dict, head_conv: int,
     """
     Instantiate a model by architecture string.
 
-    For hybrid architectures, pass --deim_config pointing to a DEIM-UAV YAML
-    (e.g. configs/deim-uav/deimv2_hgnetv2_s_coco.yml).  The factory:
-      1. Loads the YAML via DEIMv2's YAMLConfig / registry system.
-      2. Overrides num_classes in the decoder to match the dataset.
-      3. Wraps the resulting DEIM model in HybridDEIM.
+    Supported architectures:
+      'hybrid*'   — HybridDEIM: DEIMv2 backbone/encoder + DETR decoder + CenterNet aux head.
+                    Pass --deim_config pointing to a DEIM-UAV YAML.
+      'deim_mot*' — DEIMMotNet: DEIMv2 backbone/encoder + CenterNet + ReID heads only.
+                    No DETR decoder. Same output format as AMOT (DLA-34).
+                    Pass --deim_config pointing to the same YAML.
 
-    opt can be supplied either via heads['__opt__'] (train.py convention) or
-    directly as the opt= keyword argument (tracker / inference callers).
+    opt can be supplied via heads['__opt__'] (train.py convention) or the opt= kwarg.
     """
-    if 'hybrid' not in arch:
+    if 'hybrid' not in arch and 'deim_mot' not in arch:
         raise NotImplementedError(
             f"create_model: arch={arch!r} is not registered. "
-            "Only 'hybrid*' architectures are supported."
+            "Supported: 'hybrid*' or 'deim_mot*'."
         )
 
     opt = (heads.get('__opt__') if isinstance(heads, dict) else None) or opt
     deim_config = getattr(opt, 'deim_config', '') if opt else ''
     if not deim_config:
         raise ValueError(
-            "--deim_config is required for hybrid architectures. "
+            "--deim_config is required for DEIM-based architectures. "
             "Example: --deim_config configs/deim-uav/deimv2_hgnetv2_s_coco.yml"
         )
 
@@ -59,6 +59,16 @@ def create_model(arch: str, heads: dict, head_conv: int,
         (k for k in ('HybridEncoder', 'LiteEncoder') if k in cfg.yaml_cfg), None
     )
     hidden_dim = cfg.yaml_cfg[enc_key].get('hidden_dim', 256) if enc_key else 256
+
+    if 'deim_mot' in arch:
+        from lib.models.networks.deim_uav.model_mot import DEIMMotNet
+        return DEIMMotNet(
+            deim=deim_model,
+            num_classes=num_classes,
+            hidden_dim=hidden_dim,
+            head_conv=head_conv,
+            reid_dim=reid_dim,
+        )
 
     from lib.models.networks.deim_uav.model import HybridDEIM
     return HybridDEIM(

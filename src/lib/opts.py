@@ -1100,6 +1100,16 @@ class opts(object):
             if opt.id_weight > 0:
                 opt.nID_dict = dataset.nID_dict
 
+        elif opt.task == 'deim_mot':
+            # DEIMMotNet builds its own heads from model_mot.py;
+            # heads dict is unused but populated to keep the pipeline uniform.
+            opt.heads = {'hm': opt.num_classes,
+                         'wh': 2,
+                         'reg': 2,
+                         'id': opt.reid_dim}
+            if opt.id_weight > 0:
+                opt.nID_dict = dataset.nID_dict
+
         elif opt.task == 'hybrid':
             # HybridCenterNetDETR builds its own heads from HybridModelConfig;
             # heads dict is unused but populated to keep the pipeline uniform.
@@ -1108,7 +1118,7 @@ class opts(object):
                 opt.nID_dict = dataset.nID_dict
 
         else:
-            raise ValueError(f'Unknown task: {opt.task!r}. Supported: mot | hybrid')
+            raise ValueError(f'Unknown task: {opt.task!r}. Supported: mot | deim_mot | hybrid')
 
         print('heads: ', opt.heads)
         return opt
@@ -1116,7 +1126,8 @@ class opts(object):
     def init(self, args=''):
         opt = self.parse(args)
 
-        use_imagenet_norm = 'hybrid' in opt.arch
+        # deim_mot and hybrid both use a DEIM/ViT backbone → ImageNet normalisation
+        use_imagenet_norm = 'hybrid' in opt.arch or 'deim' in opt.arch
         _common = {
             'default_input_wh': [opt.input_wh[1], opt.input_wh[0]],
             'num_classes': len(opt.reid_cls_ids.split(',')),
@@ -1127,8 +1138,9 @@ class opts(object):
             'nID_dict': {},
         }
         default_dataset_info = {
-            'mot':    _common,
-            'hybrid': _common,
+            'mot':      _common,
+            'hybrid':   _common,
+            'deim_mot': _common,
         }
 
         class Struct:
