@@ -649,38 +649,30 @@ def _paired_iou(b1: Tensor, b2: Tensor) -> Tensor:
     return inter / (union + 1e-7)
 
 
-def ciou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor,
-              iou: Tensor | None = None) -> Tensor:
+def giou_loss(pred_xyxy: Tensor, tgt_xyxy: Tensor) -> Tensor:
     """
-    CIoU loss for N matched pairs (Complete-IoU).
+    GIoU loss for N matched pairs — matches the GIoU cost used by HungarianMatcher.
     pred_xyxy, tgt_xyxy : (N, 4) in xyxy format.
-    Returns scalar mean CIoU loss.
+    Returns scalar mean GIoU loss.
     """
-    if iou is None:
-        iou = _paired_iou(pred_xyxy, tgt_xyxy)
+    inter_x1 = torch.max(pred_xyxy[:, 0], tgt_xyxy[:, 0])
+    inter_y1 = torch.max(pred_xyxy[:, 1], tgt_xyxy[:, 1])
+    inter_x2 = torch.min(pred_xyxy[:, 2], tgt_xyxy[:, 2])
+    inter_y2 = torch.min(pred_xyxy[:, 3], tgt_xyxy[:, 3])
+    inter  = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
+
+    area1  = (pred_xyxy[:, 2] - pred_xyxy[:, 0]).clamp(0) * (pred_xyxy[:, 3] - pred_xyxy[:, 1]).clamp(0)
+    area2  = (tgt_xyxy[:, 2]  - tgt_xyxy[:, 0]).clamp(0)  * (tgt_xyxy[:, 3]  - tgt_xyxy[:, 1]).clamp(0)
+    union  = area1 + area2 - inter
+    iou    = inter / (union + 1e-7)
 
     enc_x1 = torch.min(pred_xyxy[:, 0], tgt_xyxy[:, 0])
     enc_y1 = torch.min(pred_xyxy[:, 1], tgt_xyxy[:, 1])
     enc_x2 = torch.max(pred_xyxy[:, 2], tgt_xyxy[:, 2])
     enc_y2 = torch.max(pred_xyxy[:, 3], tgt_xyxy[:, 3])
-    c2 = (enc_x2 - enc_x1).pow(2) + (enc_y2 - enc_y1).pow(2) + 1e-7
+    enc    = (enc_x2 - enc_x1).clamp(0) * (enc_y2 - enc_y1).clamp(0) + 1e-7
 
-    pred_cx = (pred_xyxy[:, 0] + pred_xyxy[:, 2]) / 2
-    pred_cy = (pred_xyxy[:, 1] + pred_xyxy[:, 3]) / 2
-    tgt_cx  = (tgt_xyxy[:, 0]  + tgt_xyxy[:, 2])  / 2
-    tgt_cy  = (tgt_xyxy[:, 1]  + tgt_xyxy[:, 3])  / 2
-    rho2    = (pred_cx - tgt_cx).pow(2) + (pred_cy - tgt_cy).pow(2)
-
-    pred_w = (pred_xyxy[:, 2] - pred_xyxy[:, 0]).clamp(1e-7)
-    pred_h = (pred_xyxy[:, 3] - pred_xyxy[:, 1]).clamp(1e-7)
-    tgt_w  = (tgt_xyxy[:, 2]  - tgt_xyxy[:, 0]).clamp(1e-7)
-    tgt_h  = (tgt_xyxy[:, 3]  - tgt_xyxy[:, 1]).clamp(1e-7)
-    v      = (2 / math.pi) ** 2 * (torch.atan(tgt_w / tgt_h) - torch.atan(pred_w / pred_h)).pow(2)
-
-    with torch.no_grad():
-        alpha_c = v / (1 - iou + v + 1e-7)
-
-    return (1 - iou + rho2 / c2 + alpha_c * v).mean()
+    return (1 - (iou - (enc - union) / enc)).mean()
 
 
 def _gather_at_ind(feat: Tensor, ind: Tensor) -> Tensor:
@@ -761,14 +753,16 @@ class HybridLoss(nn.Module):
         gt_reg   = batch['reg'].to(dev,      non_blocking=True)
 
         loss_hm  = centernet_focal_loss(cn_out.hm, hm)
-        n        = reg_mask.sum().clamp(min=1).float()
 
-        pred_wh  = _gather_at_ind(cn_out.wh,  ind)
-        pred_reg = _gather_at_ind(cn_out.reg, ind)
+        pred_wh  = _gather_at_ind(cn_out.wh,  ind)   # (B, max_obj, 2)
+        pred_reg = _gather_at_ind(cn_out.reg, ind)   # (B, max_obj, 2)
 
-        mask     = reg_mask.unsqueeze(-1).float()
-        loss_wh  = (F.smooth_l1_loss(pred_wh,  gt_wh,  beta=1.0, reduction='none') * mask).sum() / n
-        loss_reg = (F.smooth_l1_loss(pred_reg, gt_reg, beta=0.5, reduction='none') * mask).sum() / n
+        # Expand mask to (B, max_obj, 2) — normalize by total valid dimensions,
+        # matching AMOT's RegL1Loss: F.l1_loss(pred*mask, tgt*mask) / mask.sum()
+        mask_wh  = reg_mask.unsqueeze(-1).expand_as(pred_wh).float()
+        mask_reg = reg_mask.unsqueeze(-1).expand_as(pred_reg).float()
+        loss_wh  = F.l1_loss(pred_wh  * mask_wh,  gt_wh  * mask_wh,  reduction='sum') / (mask_wh.sum()  + 1e-4)
+        loss_reg = F.l1_loss(pred_reg * mask_reg, gt_reg * mask_reg, reduction='sum') / (mask_reg.sum() + 1e-4)
 
         total = loss_hm + self.lambda_wh * loss_wh + self.lambda_reg * loss_reg
         return {'total': total, 'hm': loss_hm, 'wh': loss_wh, 'reg': loss_reg}
@@ -784,9 +778,9 @@ class HybridLoss(nn.Module):
     ) -> Dict[str, Tensor]:
         dev = logits.device
 
-        Q_MIN = 0.1
+        Q_MIN = 0.05
         tgt_cls    = torch.zeros_like(logits)
-        src_b_list, tgt_b_list, iou_list = [], [], []
+        src_b_list, tgt_b_list = [], []
 
         for b, m in enumerate(indices):
             src_i, tgt_i, iou_cached = m['src_i'], m['tgt_i'], m['iou']
@@ -800,26 +794,24 @@ class HybridLoss(nn.Module):
 
             src_b_list.append(boxes[b][si])
             tgt_b_list.append(targets[b]['boxes'][ti])
-            iou_list.append(iou)
 
         loss_cls = varifocal_loss(logits, tgt_cls)
 
         if src_b_list:
-            src_b   = torch.cat(src_b_list)
-            tgt_b   = torch.cat(tgt_b_list)
-            iou_all = torch.cat(iou_list)
-            n_m     = src_b.shape[0]
-            loss_bbox = F.smooth_l1_loss(src_b, tgt_b, beta=0.05, reduction='sum') / n_m
-            loss_ciou = ciou_loss(
+            src_b = torch.cat(src_b_list)
+            tgt_b = torch.cat(tgt_b_list)
+            # L1 box cost matches HungarianMatcher's cost_bbox (torch.cdist p=1)
+            loss_bbox = F.l1_loss(src_b, tgt_b, reduction='mean')
+            # GIoU loss matches HungarianMatcher's cost_giou (generalized_box_iou)
+            loss_giou = giou_loss(
                 box_cxcywh_to_xyxy(src_b),
                 box_cxcywh_to_xyxy(tgt_b),
-                iou=iou_all,
             )
         else:
-            loss_bbox = loss_ciou = logits.sum() * 0.0
+            loss_bbox = loss_giou = logits.sum() * 0.0
 
-        total = loss_cls + self.lambda_bbox * loss_bbox + self.lambda_ciou * loss_ciou
-        return {'total': total, 'cls': loss_cls, 'bbox': loss_bbox, 'ciou': loss_ciou}
+        total = loss_cls + self.lambda_bbox * loss_bbox + self.lambda_ciou * loss_giou
+        return {'total': total, 'cls': loss_cls, 'bbox': loss_bbox, 'giou': loss_giou}
 
     def _stage2_loss(
         self,
@@ -840,7 +832,7 @@ class HybridLoss(nn.Module):
                 aux_w = 0.25 + 0.25 * (layer / max(n_aux - 1, 1))
                 total = total + aux_w * aux['total']
 
-        return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'], 'ciou': d['ciou'],
+        return {'total': total, 'cls': d['cls'], 'bbox': d['bbox'], 'giou': d['giou'],
                 'indices': indices}
 
     def _reid_loss(
@@ -876,19 +868,29 @@ class HybridLoss(nn.Module):
         if not valid_emb:
             return detr_out.reid.sum() * 0.0
 
-        emb    = torch.cat(valid_emb)
-        ids_t  = torch.cat(valid_ids).to(emb.device)
-        logits = self.reid_classifier(emb)
+        emb    = torch.cat(valid_emb)                  # (N, reid_dim) — L2-normalised from DETRHead
+        ids_t  = torch.cat(valid_ids).to(emb.device)  # (N,)
+        n      = emb.shape[0]
 
+        # Embedding scale normalization matching AMOT's emb_scale_dict:
+        #   emb_scale = sqrt(2) * log(nID - 1)
+        #   emb_normed = emb_scale * F.normalize(emb)
+        # DETRHead already L2-normalises; F.normalize is kept for AMP safety.
+        n_ids      = self.reid_classifier.out_features
+        emb_scale  = math.sqrt(2) * math.log(max(n_ids - 1, 1))
+        emb_normed = emb_scale * F.normalize(emb, p=2, dim=-1)
+
+        logits  = self.reid_classifier(emb_normed)
         loss_ce = F.cross_entropy(logits, ids_t)
 
         unique_ids = ids_t.unique()
-        if unique_ids.numel() >= 2 and emb.shape[0] >= 2:
-            loss_tri = self.triplet_loss(emb, ids_t)
+        if unique_ids.numel() >= 2 and n >= 2:
+            loss_tri = self.triplet_loss(emb_normed, ids_t)
         else:
-            loss_tri = emb.sum() * 0.0
+            loss_tri = emb_normed.sum() * 0.0
 
-        return loss_ce + self.lambda_triplet * loss_tri
+        # Normalise by element count — matching AMOT: / float(cls_id_target.nelement())
+        return (loss_ce + self.lambda_triplet * loss_tri) / n
 
     # ── Forward ────────────────────────────────────────────────────────────────
 
@@ -919,7 +921,7 @@ class HybridLoss(nn.Module):
             'loss_s2':   s2['total'],
             'loss_cls':  s2['cls'],
             'loss_bbox': s2['bbox'],
-            'loss_ciou': s2['ciou'],
+            'loss_giou': s2['giou'],
         }
 
         if self.reid_classifier is not None and 'ids' in targets[0]:

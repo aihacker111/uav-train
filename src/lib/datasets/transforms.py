@@ -911,7 +911,7 @@ def build_aerial_mot_transforms():
         RandomJPEGCompression(quality_range=(45, 90), p=0.25),
         RandomSensorNoise(gaussian_std_range=(3.0, 15.0), poisson_scale=0.05, p=0.2),
         # ── re-id occlusion difficulty ─────────────────────────────────────────
-        RandomOcclusionPatch(patch_scale_range=(0.04, 0.15), num_patches=2, p=0.25),
+        RandomOcclusionPatch(patch_scale_range=(0.04, 0.15), num_patches=2, p=0.10),
         # ── multi-scale resize around 512-height / 892-width ───────────────────
         RandomResize([448, 480, 512, 544, 576], max_size=1024),
     ])

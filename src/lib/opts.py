@@ -794,9 +794,9 @@ class opts(object):
                                       'frames are 1.5-3x faster. Requires PyTorch >= 2.0.')
         self.parser.add_argument('--grad_clip',
                                  type=float,
-                                 default=0.1,
+                                 default=0.5,
                                  help='Max gradient norm for gradient clipping. '
-                                      '0.1 protects ViT backbone from gradient explosion. '
+                                      '0.5 allows heads adequate gradient while protecting backbone. '
                                       'Set to 0.0 to disable.')
         self.parser.add_argument('--val_intervals', type=int, default=5,
                                  help='number of epochs to run validation.')

@@ -19,6 +19,7 @@ from lib.logger import Logger
 from lib.datasets.dataset_factory import get_dataset
 from lib.trains.train_factory import train_factory
 from lib.datasets.transforms import build_aerial_mot_transforms
+from lib.models.engine.optim.ema import ModelEMA
 
 
 def build_cosine_scheduler(optimizer, warmup_iters: int, total_iters: int,
@@ -254,6 +255,12 @@ def run(opt):
 
     trainer.set_device(opt.gpus, opt.chunk_sizes, opt.device)
 
+    # ── ModelEMA (decay=0.9999, warmup=2000 steps) ───────────────────────────────
+    if rank == 0:
+        trainer.ema = ModelEMA(model, decay=0.9999, warmups=2000)
+        trainer.ema.to(opt.device)
+        print('[EMA] ModelEMA enabled (decay=0.9999, warmups=2000)')
+
     # ── Cosine LR scheduler with linear warmup ───────────────────────────────────
     # IMPORTANT: scheduler.step() is called once per optimizer step, not per
     # DataLoader batch.  With grad_accum=N, there are len(loader)/N optimizer
@@ -333,6 +340,16 @@ def run(opt):
         if hasattr(trainer.loss, 'set_epoch'):
             trainer.loss.set_epoch(epoch)
 
+        # ── Close mosaic: disable heavy augmentation for the last N epochs ───────
+        _close_mosaic = getattr(opt, 'close_mosaic_epochs', 0)
+        if _close_mosaic > 0 and epoch == opt.num_epochs - _close_mosaic + 1:
+            train_dataset.augment      = False
+            train_dataset.pil_transform = None
+            train_dataset._erasing     = None
+            if rank == 0:
+                print(f'Epoch {epoch}: close_mosaic — strong augmentation disabled '
+                      f'for the final {_close_mosaic} epochs')
+
         # ── Train ────────────────────────────────────────────────────────────────
         # Inject scheduler so base_trainer can call .step() after each batch
         if scheduler is not None:
@@ -360,8 +377,9 @@ def run(opt):
                 cur_map = val_stats.get('mAP50', val_stats.get('AP50', 0.0))
                 if cur_map > best_map:
                     best_map = cur_map
+                    _best_model = trainer.ema.module if trainer.ema is not None else model
                     save_model(os.path.join(opt.save_dir, 'model_best.pth'),
-                               epoch, model, optimizer, loss=trainer.loss)
+                               epoch, _best_model, optimizer, loss=trainer.loss)
                     logger.write(f'  ** new best mAP50={best_map:.4f} -> model_best.pth\n')
 
         # ── Checkpointing (rank 0 only) ──────────────────────────────────────────

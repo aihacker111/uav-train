@@ -200,7 +200,7 @@ class LoadImagesAndLabels:  # for training
         self.augment = augment
         self.use_imagenet_norm = use_imagenet_norm
         self.pil_transform = pil_transform  # PIL-based pre-letterbox transforms
-        self._erasing = _RandomErasing(p=0.3, scale=(0.05, 0.20), ratio=(0.3, 3.3), value=0) if augment else None
+        self._erasing = _RandomErasing(p=0.1, scale=(0.05, 0.20), ratio=(0.3, 3.3), value=0) if augment else None
 
     def __getitem__(self, files_index):
         img_path = self.img_files[files_index]
@@ -576,7 +576,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
         self.augment = augment
         self.pil_transform = pil_transform
         self.use_imagenet_norm = getattr(opt, 'use_imagenet_norm', False)
-        self._erasing = _RandomErasing(p=0.3, scale=(0.05, 0.20), ratio=(0.3, 3.3), value=0) if augment else None
+        self._erasing = _RandomErasing(p=0.1, scale=(0.05, 0.20), ratio=(0.3, 3.3), value=0) if augment else None
         self.mean = [0.485, 0.456, 0.406] if self.use_imagenet_norm else [0.0, 0.0, 0.0]
         self.std  = [0.229, 0.224, 0.225] if self.use_imagenet_norm else [1.0, 1.0, 1.0]
 

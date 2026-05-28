@@ -37,6 +37,7 @@ class BaseTrainer:
         self.loss_stats, self.loss = self._get_losses(opt)
         self.model_with_loss       = ModelWithLoss(model, self.loss)
         self.scheduler  = None   # set externally by train.py when cosine LR is used
+        self.ema        = None   # set externally by train.py when EMA is enabled
 
         # AMP scaler — only active when --use_amp is set and CUDA is available.
         # GradScaler tracks the loss scale and skips optimizer steps when inf/nan
@@ -174,6 +175,10 @@ class BaseTrainer:
                     self.optimizer.zero_grad()
                     if self.scheduler is not None:
                         self.scheduler.step()
+                    if self.ema is not None:
+                        _raw_mwl = model_with_loss.module if hasattr(model_with_loss, 'module') \
+                                   else model_with_loss
+                        self.ema.update(_raw_mwl.model)
 
             elapsed = time.time() - end
             batch_time.update(elapsed)

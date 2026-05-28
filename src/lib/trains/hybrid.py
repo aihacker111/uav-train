@@ -212,7 +212,7 @@ class HybridTrainer(BaseTrainer):
         loss_stats = [
             'loss',
             'loss_s1', 'loss_hm', 'loss_wh', 'loss_reg',
-            'loss_s2', 'loss_cls', 'loss_bbox', 'loss_ciou',
+            'loss_s2', 'loss_cls', 'loss_bbox', 'loss_giou',
         ]
 
         reid_classifier = None
@@ -266,7 +266,10 @@ class HybridTrainer(BaseTrainer):
         """
         opt = self.opt
         mwl = self.model_with_loss
-        model = mwl.module.model if hasattr(mwl, 'module') else mwl.model
+        if self.ema is not None:
+            model = self.ema.module
+        else:
+            model = mwl.module.model if hasattr(mwl, 'module') else mwl.model
         model.eval()
 
         ev = COCOEvaluator(num_classes=opt.num_classes,
@@ -327,5 +330,6 @@ class HybridTrainer(BaseTrainer):
             for k, v in stats.items():
                 logger.scalar_summary(f'val_{k}', v, epoch)
 
-        model.train()
+        if self.ema is None:
+            model.train()
         return stats
