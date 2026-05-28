@@ -565,8 +565,9 @@ class MCJDETracker(object):
 
                 dets = map2orig(det_raw, h_out, w_out, height, width, self.opt.num_classes)
         # ----- parse each object class
+        _empty = np.zeros((0, 5), dtype=np.float32)
         for cls_id in range(self.opt.num_classes):
-            cls_dets = dets[cls_id]
+            cls_dets = dets.get(cls_id, _empty) if isinstance(dets, dict) else dets[cls_id]
 
             # filter out low confidence detections
             remain_inds = cls_dets[:, 4] > self.opt.conf_thres
