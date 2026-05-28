@@ -739,6 +739,13 @@ class HybridLoss(nn.Module):
         self.reid_classifier = reid_classifier
         self.triplet_loss    = TripletLoss(margin=0.3)
 
+        # Learnable uncertainty weight for ReID (Kendall et al. 2018).
+        # Initialised to -1.05 matching AMOT's s_id — gives exp(-s_id) ≈ 2.86 at start.
+        # Only created when reid_classifier is provided; registered as nn.Parameter so
+        # base_trainer automatically adds it to the optimizer param group.
+        if reid_classifier is not None:
+            self.s_id = nn.Parameter(-1.05 * torch.ones(1))
+
         self.matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
 
     # ── Stage-1 ────────────────────────────────────────────────────────────────
@@ -868,9 +875,8 @@ class HybridLoss(nn.Module):
         if not valid_emb:
             return detr_out.reid.sum() * 0.0
 
-        emb    = torch.cat(valid_emb)                  # (N, reid_dim) — L2-normalised from DETRHead
-        ids_t  = torch.cat(valid_ids).to(emb.device)  # (N,)
-        n      = emb.shape[0]
+        emb   = torch.cat(valid_emb)                  # (N, reid_dim) — L2-normalised from DETRHead
+        ids_t = torch.cat(valid_ids).to(emb.device)  # (N,)
 
         # Embedding scale normalization matching AMOT's emb_scale_dict:
         #   emb_scale = sqrt(2) * log(nID - 1)
@@ -884,13 +890,12 @@ class HybridLoss(nn.Module):
         loss_ce = F.cross_entropy(logits, ids_t)
 
         unique_ids = ids_t.unique()
-        if unique_ids.numel() >= 2 and n >= 2:
+        if unique_ids.numel() >= 2 and ids_t.numel() >= 2:
             loss_tri = self.triplet_loss(emb_normed, ids_t)
         else:
             loss_tri = emb_normed.sum() * 0.0
 
-        # Normalise by element count — matching AMOT: / float(cls_id_target.nelement())
-        return (loss_ce + self.lambda_triplet * loss_tri) / n
+        return loss_ce + self.lambda_triplet * loss_tri
 
     # ── Forward ────────────────────────────────────────────────────────────────
 
@@ -926,8 +931,13 @@ class HybridLoss(nn.Module):
 
         if self.reid_classifier is not None and 'ids' in targets[0]:
             l_reid = self._reid_loss(outputs['stage2'], targets, s2['indices'])
-            total  = total + self.lambda_reid * l_reid
+            # Homoscedastic uncertainty weighting (AMOT / Kendall et al. 2018):
+            #   L_reid_weighted = exp(-s_id) * L_reid + s_id
+            # s_id is learned: when L_reid is small → s_id decreases → exp(-s_id) grows
+            # to compensate, without manual tuning of lambda_reid.
+            total  = total + torch.exp(-self.s_id) * l_reid + self.s_id
             loss_stats['loss_reid'] = l_reid
+            loss_stats['s_id']      = self.s_id.detach()
             loss_stats['loss']      = total
 
         return total, loss_stats

@@ -220,7 +220,7 @@ class HybridTrainer(BaseTrainer):
             total_ids = sum(opt.nID_dict.values())
             reid_dim  = getattr(opt, 'reid_dim', 256)
             reid_classifier = nn.Linear(reid_dim, total_ids)
-            loss_stats.append('loss_reid')
+            loss_stats.extend(['loss_reid', 's_id'])
 
         loss = HybridLoss(
             num_classes     = opt.num_classes,
