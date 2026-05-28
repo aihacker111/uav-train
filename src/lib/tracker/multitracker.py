@@ -743,7 +743,8 @@ class HybridMCJDETracker(object):
         self.opt = opt
 
         print('Creating model...')
-        self.model = create_model(opt.arch, opt.heads, opt.head_conv)
+        self.model = create_model(opt.arch, opt.heads, opt.head_conv,
+                                  num_classes=opt.num_classes, opt=opt)
         self.model = load_model(self.model, opt.load_model)
         self.model = self.model.to(opt.device)
         self.model.eval()
