@@ -69,54 +69,46 @@ class HybridDEIM(nn.Module):
 
     # ── Heatmap → reference points ─────────────────────────────────────────────
 
-    def _heatmap_to_ref_points(self, hm: Tensor, k: int) -> Tensor:
+    def _heatmap_to_ref_points(self, hm: Tensor, wh_map: Tensor, k: int) -> Tensor:
         """
         Extract top-K peaks from the CenterNet heatmap and convert to DETR
         reference points in logit (inverse-sigmoid) space.
 
         Args:
-            hm : (B, C, H, W) — sigmoid heatmap, values in (0, 1)
-            k  : number of reference points to produce (= num_queries)
+            hm     : (B, C, H, W) — sigmoid heatmap, values in (0, 1)
+            wh_map : (B, 2, H, W) — predicted WH in heatmap-pixel scale (cn_head output)
+            k      : number of reference points to produce (= num_queries)
 
         Returns:
             (B, k, 4) — cxcywh reference points in logit space, same format
             as DEIMTransformer's enc_topk_bbox_unact so they can be dropped in
             as a direct replacement.
-
-        Steps:
-          1. Flatten all classes × spatial locations → score per pixel
-          2. top-K over the flattened space (avoids per-class NMS, fast on GPU)
-          3. Convert flat index → (cx, cy) normalised [0, 1]
-          4. Append a fixed default wh (small prior for UAV objects)
-          5. Apply inverse sigmoid (logit) to match the decoder's expected format
         """
         B, C, H, W = hm.shape
 
-        # Flatten C×H×W and pick the K highest-scoring pixels globally.
-        # Using max-score across classes per pixel first to avoid class-heavy peaks
-        # dominating all K slots (e.g. one dominant class taking all K positions).
-        score_map = hm.max(dim=1).values          # (B, H, W) — max class score per pixel
+        score_map = hm.max(dim=1).values          # (B, H, W)
         flat      = score_map.reshape(B, H * W)   # (B, H*W)
 
         _, topk_idx = flat.topk(k, dim=-1)        # (B, k)
 
-        # Flat index → 2D grid coordinates
-        y_idx = (topk_idx // W).float()           # row index
-        x_idx = (topk_idx  % W).float()           # col index
+        y_idx = (topk_idx // W).float()
+        x_idx = (topk_idx  % W).float()
 
-        # Normalize to [0, 1] (pixel centres: +0.5 / size)
         cx = (x_idx + 0.5) / W
         cy = (y_idx + 0.5) / H
 
-        # Fixed small wh: UAV objects are tiny; 0.05 ≈ 64px at 1280px width.
-        # Using a constant avoids the chicken-and-egg problem of estimating sizes
-        # from an early, potentially noisy cn_head.wh output.
-        wh = torch.full_like(cx, self.default_wh)
+        # Gather predicted WH at peak locations and normalise to [0, 1].
+        # wh_map is in heatmap-pixel scale; dividing by (W, H) gives the same
+        # normalised ratio as the input image (output_pixels / output_size ==
+        # input_pixels / input_size since stride cancels).
+        flat_w = wh_map[:, 0].reshape(B, H * W)  # (B, H*W)
+        flat_h = wh_map[:, 1].reshape(B, H * W)
+        pred_w = flat_w.gather(1, topk_idx).float() / W   # (B, k)
+        pred_h = flat_h.gather(1, topk_idx).float() / H
 
         # cxcywh in [0, 1] — clamp away from boundaries before logit
-        boxes = torch.stack([cx, cy, wh, wh], dim=-1).clamp(1e-4, 1.0 - 1e-4)
+        boxes = torch.stack([cx, cy, pred_w, pred_h], dim=-1).clamp(1e-4, 1.0 - 1e-4)
 
-        # Inverse sigmoid → logit space, matching enc_topk_bbox_unact format
         return torch.log(boxes / (1.0 - boxes))   # (B, k, 4)
 
     # ── Forward ────────────────────────────────────────────────────────────────
@@ -137,10 +129,10 @@ class HybridDEIM(nn.Module):
         cn_out  = self.cn_head(cn_feat)
 
         # ── Heatmap peaks → DETR reference points ─────────────────────────────
-        # Detach heatmap so Stage-2 loss does not backprop through peak extraction.
+        # Detach both hm and wh so Stage-2 loss does not backprop through here.
         num_queries = self.deim.decoder.num_queries
         heatmap_ref = self._heatmap_to_ref_points(
-            cn_out.hm.detach(), k=num_queries,
+            cn_out.hm.detach(), cn_out.wh.detach(), k=num_queries,
         )   # (B, num_queries, 4) in logit space
 
         # ── Branch 2: DETR decoder seeded with heatmap proposals ──────────────
