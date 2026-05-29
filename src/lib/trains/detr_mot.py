@@ -185,12 +185,11 @@ class DetrMotLoss(nn.Module):
         _CLS_KEYS = frozenset(('loss_focal', 'loss_vfl', 'loss_mal'))
         _BOX_KEYS = frozenset(('loss_bbox', 'loss_giou'))
         for k, v in det_losses.items():
-            # strip layer suffix: _aux_0, _dn_1, _enc_0, _pre
             base_key = k.split('_aux_')[0].split('_dn_')[0].split('_enc_')[0].split('_pre')[0]
             if base_key in _CLS_KEYS:
-                loss_stats['loss_cls'] = loss_stats['loss_cls'] + _t(v)
+                loss_stats['loss_cls'] = loss_stats['loss_cls'] + _t(v) / n_groups
             elif base_key in _BOX_KEYS:
-                loss_stats[base_key] = loss_stats[base_key] + _t(v)
+                loss_stats[base_key] = loss_stats[base_key] + _t(v) / n_groups
 
         return loss, loss_stats
 
