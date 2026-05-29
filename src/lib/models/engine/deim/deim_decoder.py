@@ -1178,7 +1178,17 @@ class DEIMTransformer(nn.Module):
                 init_ref_points_unact = torch.cat([denoising_bbox_unact, init_ref_points_unact], dim=1)
                 content = torch.cat([denoising_logits, content], dim=1)
                 dn_meta = dict(dn_meta)
-                dn_meta['dn_num_split'] = [dn_meta['dn_num_split'][0], N_grid]
+                num_dn = dn_meta['dn_num_split'][0]
+                dn_meta['dn_num_split'] = [num_dn, N_grid]
+                # Rebuild attn_mask for (num_dn + N_grid) total queries.
+                # The original mask was sized for (num_dn + self.num_queries); we keep
+                # the DN×DN isolation block and extend with fresh rows/cols for grid
+                # queries (grid queries cannot see DN; DN can see grid; grid sees grid).
+                if attn_mask is not None:
+                    new_mask = attn_mask.new_zeros(num_dn + N_grid, num_dn + N_grid)
+                    new_mask[:num_dn, :num_dn] = attn_mask[:num_dn, :num_dn]
+                    new_mask[num_dn:, :num_dn] = True  # grid cannot see DN
+                    attn_mask = new_mask
         else:
             init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
                 self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
