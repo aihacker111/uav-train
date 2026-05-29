@@ -4,23 +4,21 @@ DEIMMotNet: DEIMv2 backbone/encoder + CenterNet detection + ReID heads.
 Output format (compatible with AMOT tracking pipeline):
     [{'hm': (B,C,H,W), 'wh': (B,2,H,W), 'reg': (B,2,H,W), 'id': (B,D,H,W)}]
 
-S4 strategy (DINOv3STAs backbone)
-----------------------------------
-DINOv3STAs contains a SpatialPriorModulev2 (STA) that computes:
+Feature pyramid
+---------------
+HybridEncoder produces three outputs [enc_S8, enc_S16, enc_S32] (each
+hidden_dim channels).  All three are fused via a lightweight FPN top-down
+path so no encoder compute is wasted:
 
-    stem(x) → S4 (16ch, H/4×W/4)   ← computed, never returned
-    conv2   → S8 (32ch)
-    conv3   → S16 (64ch)
-    conv4   → S32 (64ch)
-
-We register a forward hook on sta.stem to capture the S4 tensor as a
-side-effect — zero extra compute, backbone/encoder interface unchanged.
-
-Final S4 feature map:
-    enc_S8 ─[bilinear ×2]──→ ⊕ → heads (H/4, W/4)
-    sta_S4 ─[lateral 1×1]──┘
-
-    lateral proj: Conv2d(16, hidden_dim, 1) = ~3 K params only
+    enc_S32 ─ proj_s32 ──────────────────────────────► p32
+    enc_S16 ─ proj_s16 ─ + nearest_up(p32, ×2) ──────► p16
+    enc_S8  ─ proj_s8  ─ + nearest_up(p16, ×2) ──────► p8
+                               bilinear ×2
+                                    ↓
+                          + lateral_s4(sta.stem hook)   ← 16ch, ~3 K params
+                               DilatedContext
+                                    ↓
+                                 heads  (H/4 × W/4)
 """
 from __future__ import annotations
 
