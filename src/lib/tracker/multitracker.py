@@ -488,7 +488,44 @@ class MCJDETracker(object):
         with torch.no_grad():
             raw_output = self.model.forward(im_blob)
 
-            if isinstance(raw_output, dict) and 'stage2' in raw_output:
+            if isinstance(raw_output, dict) and 'pred_reid' in raw_output:
+                # ── DEIMv2JDE: full DETR with per-query ReID (grid-query mode).
+                # pred_boxes / pred_logits / pred_reid come directly from the decoder.
+                boxes_t  = raw_output['pred_boxes'][0]          # (N, 4) cxcywh [0,1]
+                probs    = raw_output['pred_logits'][0].sigmoid()  # (N, C)
+                scores_t, labels_t = probs.max(dim=-1)
+
+                boxes_np  = boxes_t.cpu().numpy()
+                scores_np = scores_t.cpu().numpy().astype(np.float32)
+                labels_np = labels_t.cpu().numpy().astype(int)
+
+                keep      = scores_np >= self.opt.conf_thres
+                boxes_np  = boxes_np[keep]
+                scores_np = scores_np[keep]
+                labels_np = labels_np[keep]
+
+                dets = MCJDETracker._detr_to_orig(
+                    boxes_np, scores_np, labels_np,
+                    net_height, net_width, height, width,
+                )
+
+                _reid_dim  = raw_output['pred_reid'].shape[-1]
+                reid_np    = raw_output['pred_reid'][0].cpu().numpy()  # (N, reid_dim)
+                reid_keep  = reid_np[keep]
+
+                cls_id_feats = []
+                for cls_id in range(self.opt.num_classes):
+                    cls_mask = labels_np == cls_id
+                    cls_id_feats.append(reid_keep[cls_mask])
+
+                # Dummy past feature maps — reid_motion helpers expect them
+                dummy_map = raw_output['pred_logits'].new_ones(
+                    1, _reid_dim, net_height // 4, net_width // 4,
+                ) / (_reid_dim ** 0.5)
+                self.past_id_feature.append(dummy_map)
+                self.past_reg.append(None)
+
+            elif isinstance(raw_output, dict) and 'stage2' in raw_output:
                 # ── Hybrid model: stage-1 seeds ref points for stage-2.
                 # Use stage-2 (DETR) as the final refined detections.
                 stage2 = raw_output['stage2']

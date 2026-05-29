@@ -719,7 +719,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
         num_objs = labels.shape[0]
 
         # --- DETR-format targets (normalized cxcywh, kept before feature-map scaling)
-        _is_hybrid = getattr(self.opt, 'task', '') == 'hybrid'
+        _is_hybrid = getattr(self.opt, 'task', '') in ('hybrid', 'deimv2_jde')
         if _is_hybrid:
             if num_objs > 0:
                 _valid_mask   = (labels[:, 0] >= 0) & (labels[:, 0] < self.num_classes)

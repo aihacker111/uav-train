@@ -1134,16 +1134,19 @@ class DEIMTransformer(nn.Module):
 
         return topk_memory, topk_logits, topk_anchors
 
-    def forward(self, feats, targets=None, heatmap_ref_points=None):
+    def forward(self, feats, targets=None, heatmap_ref_points=None, query_content=None):
         """
         Args:
             feats             : encoder output feature maps
             targets           : training targets (for denoising)
-            heatmap_ref_points: optional (B, num_queries, 4) reference points in logit
-                                space derived from CenterNet heatmap peaks. When provided,
-                                replaces the encoder-selected top-K reference points so
-                                the decoder starts cross-attention at heatmap-predicted
-                                object locations instead of generic anchor positions.
+            heatmap_ref_points: optional (B, N, 4) reference points in logit space.
+                                When provided alone (query_content=None): replaces the
+                                encoder top-K positions (HybridDEIM heatmap-seeding mode).
+                                When provided with query_content: both content AND reference
+                                points are injected directly, bypassing topK selection
+                                entirely (grid-query mode for DEIMv2JDE).
+            query_content     : optional (B, N, C) content embeddings for grid-query mode.
+                                Must be provided together with heatmap_ref_points.
         """
         # input projection and embedding
         memory, spatial_shapes = self._get_encoder_input(feats)
@@ -1162,26 +1165,39 @@ class DEIMTransformer(nn.Module):
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
-        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
-            self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
-
-        # Inject heatmap-derived reference points: replace encoder top-K positions with
-        # CenterNet peaks. Denoising queries (prepended during training) are preserved.
-        # Content embeddings stay as encoder-selected (they carry feature information).
-        if heatmap_ref_points is not None:
+        # ── Query selection ──────────────────────────────────────────────────────
+        if query_content is not None and heatmap_ref_points is not None:
+            # Grid-query mode: bypass topK encoder selection entirely.
+            # Content and reference points come from the grid generator.
+            enc_topk_bboxes_list, enc_topk_logits_list = [], []
+            content = query_content.detach()
+            init_ref_points_unact = heatmap_ref_points
+            N_grid = query_content.shape[1]  # actual grid query count
             if denoising_bbox_unact is not None:
-                # Layout: [dn_queries | topk_queries] — keep denoising prefix intact
-                dn_len = denoising_bbox_unact.shape[1]
-                init_ref_points_unact = torch.cat([
-                    init_ref_points_unact[:, :dn_len],   # denoising refs unchanged
-                    heatmap_ref_points,                   # heatmap peaks replace topk
-                ], dim=1)
-            else:
-                init_ref_points_unact = heatmap_ref_points
+                # Prepend DN queries; fix dn_num_split to use actual N_grid
+                init_ref_points_unact = torch.cat([denoising_bbox_unact, init_ref_points_unact], dim=1)
+                content = torch.cat([denoising_logits, content], dim=1)
+                dn_meta = dict(dn_meta)
+                dn_meta['dn_num_split'] = [dn_meta['dn_num_split'][0], N_grid]
+        else:
+            init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
+                self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
+            content = init_ref_contents
+
+            # Heatmap-only injection (HybridDEIM): replace ref points, keep content.
+            if heatmap_ref_points is not None:
+                if denoising_bbox_unact is not None:
+                    dn_len = denoising_bbox_unact.shape[1]
+                    init_ref_points_unact = torch.cat([
+                        init_ref_points_unact[:, :dn_len],
+                        heatmap_ref_points,
+                    ], dim=1)
+                else:
+                    init_ref_points_unact = heatmap_ref_points
 
         # decoder
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, hs = self.decoder(
-            init_ref_contents,
+            content,
             init_ref_points_unact,
             memory,
             spatial_shapes,
@@ -1217,6 +1233,8 @@ class DEIMTransformer(nn.Module):
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
                                                      out_corners[-1], out_logits[-1])
+            # enc_topk_bboxes_list is empty in grid-query mode — provide empty lists so
+            # DEIMCriterion can still iterate without KeyError.
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}

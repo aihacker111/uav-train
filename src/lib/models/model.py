@@ -15,18 +15,21 @@ def create_model(arch: str, heads: dict, head_conv: int,
     Instantiate a model by architecture string.
 
     Supported architectures:
-      'hybrid*'   — HybridDEIM: DEIMv2 backbone/encoder + DETR decoder + CenterNet aux head.
-                    Pass --deim_config pointing to a DEIM-UAV YAML.
-      'deim_mot*' — DEIMMotNet: DEIMv2 backbone/encoder + CenterNet + ReID heads only.
-                    No DETR decoder. Same output format as AMOT (DLA-34).
-                    Pass --deim_config pointing to the same YAML.
+      'hybrid*'     — HybridDEIM: DEIMv2 backbone/encoder + DETR decoder + CenterNet aux head.
+                      Pass --deim_config pointing to a DEIM-UAV YAML.
+      'deim_mot*'   — DEIMMotNet: DEIMv2 backbone/encoder + CenterNet + ReID heads only.
+                      No DETR decoder. Same output format as AMOT (DLA-34).
+                      Pass --deim_config pointing to the same YAML.
+      'deimv2_jde*' — DEIMv2JDE: Full DETR (backbone+encoder+decoder) + grid queries +
+                      per-query ReID head. Not limited by fixed query count.
+                      Pass --deim_config pointing to the same YAML.
 
     opt can be supplied via heads['__opt__'] (train.py convention) or the opt= kwarg.
     """
-    if 'hybrid' not in arch and 'deim_mot' not in arch:
+    if 'hybrid' not in arch and 'deim_mot' not in arch and 'deimv2_jde' not in arch:
         raise NotImplementedError(
             f"create_model: arch={arch!r} is not registered. "
-            "Supported: 'hybrid*' or 'deim_mot*'."
+            "Supported: 'hybrid*', 'deim_mot*', or 'deimv2_jde*'."
         )
 
     opt = (heads.get('__opt__') if isinstance(heads, dict) else None) or opt
@@ -59,6 +62,17 @@ def create_model(arch: str, heads: dict, head_conv: int,
         (k for k in ('HybridEncoder', 'LiteEncoder') if k in cfg.yaml_cfg), None
     )
     hidden_dim = cfg.yaml_cfg[enc_key].get('hidden_dim', 256) if enc_key else 256
+
+    if 'deimv2_jde' in arch:
+        from lib.models.networks.deim_uav.model_detr_jde import DEIMv2JDE
+        _grid_strides = tuple(getattr(opt, 'grid_strides', (16, 32))) if opt else (16, 32)
+        return DEIMv2JDE(
+            deim=deim_model,
+            num_classes=num_classes,
+            hidden_dim=hidden_dim,
+            reid_dim=reid_dim,
+            grid_strides=_grid_strides,
+        )
 
     if 'deim_mot' in arch:
         from lib.models.networks.deim_uav.model_mot import DEIMMotNet

@@ -109,9 +109,9 @@ def run(opt):
 
     pil_transform = build_aerial_mot_transforms()
 
-    # ── Collate function (hybrid task needs variable-length DETR targets) ────────
+    # ── Collate function (hybrid / deimv2_jde tasks need variable-length DETR targets) ─
     collate_fn = None
-    if opt.task == 'hybrid':
+    if opt.task in ('hybrid', 'deimv2_jde'):
         from lib.datasets.dataset.jde import hybrid_collate_fn
         collate_fn = hybrid_collate_fn
 
