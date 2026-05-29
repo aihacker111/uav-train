@@ -937,6 +937,14 @@ class opts(object):
                                  action='store_true',
                                  default=False,
                                  help='Supervise WH head in log-space (scale-invariant, better for tiny objects).')
+        self.parser.add_argument('--repul_weight',
+                                 type=float,
+                                 default=0.0,
+                                 help='Repulsion loss weight (0 = disabled).')
+        self.parser.add_argument('--repul_sigma',
+                                 type=float,
+                                 default=0.0,
+                                 help='Smooth threshold for repulsion penalty (0 = plain IoU).')
         self.parser.add_argument('--id_loss',
                                  default='ce',
                                  help='reid loss: ce | triplet')
