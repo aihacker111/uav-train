@@ -275,6 +275,7 @@ class DEIMCriterion(nn.Module):
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets, epoch=epoch)['indices']
+        self._last_indices = indices  # cached for reid loss reuse — avoids a duplicate matcher call
         self._clear_cache()
 
         # Get the matching union set across all decoder layers.

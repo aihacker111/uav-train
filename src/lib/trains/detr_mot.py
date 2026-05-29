@@ -147,8 +147,10 @@ class DetrMotLoss(nn.Module):
         det_loss   = sum(det_losses.values())
 
         # ── ReID loss ──────────────────────────────────────────────────────────
+        # Reuse the final-layer indices already computed inside criterion.forward()
+        # instead of running the Hungarian matcher a second time.
         if opt.id_weight > 0 and 'pred_reid' in outputs:
-            indices   = self._get_matching_indices(outputs, targets, epoch)
+            indices   = self.criterion._last_indices
             reid_loss = self._reid_loss(outputs['pred_reid'], targets, indices)
         else:
             reid_loss = outputs['pred_logits'].new_zeros(())
@@ -171,12 +173,14 @@ class DetrMotLoss(nn.Module):
         }
         # Accumulate per-layer sub-losses across all decoder/DN/encoder layers.
         # 'loss_cls' sums all cls variants; 'loss_bbox'/'loss_giou' also sum all layers.
-        _CLS_KEYS = ('loss_focal', 'loss_vfl', 'loss_mal')
+        _CLS_KEYS = frozenset(('loss_focal', 'loss_vfl', 'loss_mal'))
+        _BOX_KEYS = frozenset(('loss_bbox', 'loss_giou'))
         for k, v in det_losses.items():
+            # strip layer suffix: _aux_0, _dn_1, _enc_0, _pre
             base_key = k.split('_aux_')[0].split('_dn_')[0].split('_enc_')[0].split('_pre')[0]
             if base_key in _CLS_KEYS:
                 loss_stats['loss_cls'] = loss_stats['loss_cls'] + _t(v)
-            elif base_key in ('loss_bbox', 'loss_giou'):
+            elif base_key in _BOX_KEYS:
                 loss_stats[base_key] = loss_stats[base_key] + _t(v)
 
         return loss, loss_stats
