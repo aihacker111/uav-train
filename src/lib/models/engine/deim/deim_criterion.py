@@ -152,6 +152,7 @@ class DEIMCriterion(nn.Module):
         src_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
         losses = {}
+
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
@@ -402,8 +403,6 @@ class DEIMCriterion(nn.Module):
                     l_dict = {k + '_dn_pre': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
-        # For debugging Objects365 pre-train.
-        losses = {k:torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}
         return losses
 
     def get_loss_meta_info(self, loss, outputs, targets, indices):
@@ -411,14 +410,15 @@ class DEIMCriterion(nn.Module):
             return {}
 
         src_boxes = outputs['pred_boxes'][self._get_src_permutation_idx(indices)]
+        src_boxes = src_boxes.detach()
         target_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
 
         if self.boxes_weight_format == 'iou':
-            iou, _ = box_iou(box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes))
+            iou, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
             iou = torch.diag(iou)
         elif self.boxes_weight_format == 'giou':
             iou = torch.diag(generalized_box_iou(\
-                box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes)))
+                box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)))
         else:
             raise AttributeError()
 
