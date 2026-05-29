@@ -252,13 +252,16 @@ def return_position(tensor,regs,
     n,h,w = tensor.size()
     max_values, max_indices = torch.max(tensor.view(n, -1), dim=1)
 
-    regs = regs[0].view(2, -1)
-    extracted_regs = torch.gather(regs, 1, max_indices.unsqueeze(0).expand(2, -1)).t()
-    # 将一维索引转换为二维坐标
-    cycx_coords = torch.stack((max_indices // w, max_indices % w), dim=1)
+    cycx_coords = torch.stack((max_indices // w, max_indices % w), dim=1).float()
 
-    cy = cycx_coords[:,0] + extracted_regs[:, 1]
-    cx = cycx_coords[:,1] + extracted_regs[:, 0]
+    if regs is not None:
+        regs = regs[0].view(2, -1)
+        extracted_regs = torch.gather(regs, 1, max_indices.unsqueeze(0).expand(2, -1)).t()
+        cy = cycx_coords[:, 0] + extracted_regs[:, 1]
+        cx = cycx_coords[:, 1] + extracted_regs[:, 0]
+    else:
+        cy = cycx_coords[:, 0]
+        cx = cycx_coords[:, 1]
 
     dets_center = torch.stack((cx, cy), dim=1)
 

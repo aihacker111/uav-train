@@ -203,7 +203,7 @@ def parse_args():
     p.add_argument('--grid-strides', type=int, nargs='+', default=[16, 32],
                    help='Encoder stride levels for grid queries (deimv2_jde, default: 16 32)')
     p.add_argument('--input-h',     type=int, default=512)
-    p.add_argument('--input-w',     type=int, default=896)
+    p.add_argument('--input-w',     type=int, default=832)
     p.add_argument('--batch-size',  type=int, default=1)
     p.add_argument('--warmup',      type=int, default=20)
     p.add_argument('--runs',        type=int, default=100)
