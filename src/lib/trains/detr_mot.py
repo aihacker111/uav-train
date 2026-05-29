@@ -1,12 +1,13 @@
 """
 DetrMotLoss + DetrMotTrainer — Full-DETR JDE training for DEIMv2JDE.
 
-Loss formula (Kendall et al., CVPR 2018):
-    L = ½ · [ exp(−s_det) · L_det  + s_det
-             + exp(−s_reid) · L_reid + s_reid ]
+Loss formula:
+    L = L_det + id_weight · L_reid
 
-L_det  : DEIMCriterion (Hungarian + focal + GIoU + auxiliary layers)
-L_reid : per-class softmax-CE + Triplet on Hungarian-matched queries
+L_det  : DEIMCriterion weighted sum (loss_bbox×5, loss_giou×2, loss_mal×1 …)
+         averaged over decoder/DN/enc layer groups → single-layer scale (~4-5).
+L_reid : per-class softmax-CE + Triplet on Hungarian-matched queries (~1-2).
+         id_weight=1 (default) gives reid ~25% of total — matches FairMOT convention.
 
 Batch keys required:
     'input'   : (B, 3, H, W)   normalised image tensor
@@ -146,6 +147,15 @@ class DetrMotLoss(nn.Module):
         det_losses = self.criterion(outputs, targets, epoch=epoch)
         det_loss   = sum(det_losses.values())
 
+        # Average over decoder layer groups so det_loss sits at single-layer scale
+        # (~4-5). The weight_dict factors (loss_bbox×5, loss_giou×2, loss_mal×1 …)
+        # are preserved inside the criterion — we only average the repeated layers.
+        # This lets id_weight=1 give reid ~25% contribution, matching FairMOT convention.
+        _AUX_TAGS = ('_aux_', '_dn_', '_enc_', '_pre')
+        n_base   = sum(1 for k in det_losses if not any(t in k for t in _AUX_TAGS))
+        n_groups = max(len(det_losses) / max(n_base, 1), 1)
+        det_loss_avg = det_loss / n_groups
+
         # ── ReID loss ──────────────────────────────────────────────────────────
         # Reuse the final-layer indices already computed inside criterion.forward()
         # instead of running the Hungarian matcher a second time.
@@ -155,8 +165,7 @@ class DetrMotLoss(nn.Module):
         else:
             reid_loss = outputs['pred_logits'].new_zeros(())
 
-        # ── Fixed-weight combination ───────────────────────────────────────────
-        loss = det_loss + opt.id_weight * reid_loss
+        loss = det_loss_avg + opt.id_weight * reid_loss
 
         # ── Stats ──────────────────────────────────────────────────────────────
         def _t(v):
@@ -165,7 +174,7 @@ class DetrMotLoss(nn.Module):
         _zero = loss.new_zeros(())
         loss_stats: Dict[str, Any] = {
             'loss':       loss,
-            'det_loss':   _t(det_loss),
+            'det_loss':   _t(det_loss_avg),
             'reid_loss':  _t(reid_loss),
             'loss_cls':   _zero,
             'loss_bbox':  _zero,
