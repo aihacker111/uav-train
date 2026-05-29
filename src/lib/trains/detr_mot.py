@@ -142,6 +142,11 @@ class DetrMotLoss(nn.Module):
         opt     = self.opt
         targets = batch.get('targets', [])
 
+        # targets come from DataLoader on CPU; move to the same device as outputs
+        device = outputs['pred_logits'].device
+        targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in t.items()} for t in targets]
+
         # ── DETR detection loss ────────────────────────────────────────────────
         epoch   = batch.get('epoch', 0)
         det_losses = self.criterion(outputs, targets, epoch=epoch)

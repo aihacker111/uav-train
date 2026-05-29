@@ -24,7 +24,11 @@ class ModelWithLoss(nn.Module):
         self.loss  = loss
 
     def forward(self, batch: Dict[str, Any]):
-        targets    = batch.get('targets', None)   # DETR-format targets for denoising (hybrid task)
+        targets = batch.get('targets', None)   # DETR-format targets for denoising (hybrid task)
+        if targets is not None:
+            device = batch['input'].device
+            targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v
+                        for k, v in t.items()} for t in targets]
         outputs    = self.model(batch['input'], targets=targets)
         loss, loss_stats = self.loss(outputs=outputs, batch=batch)
         return outputs, loss, loss_stats
