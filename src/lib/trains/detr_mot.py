@@ -70,12 +70,6 @@ class DetrMotLoss(nn.Module):
             self.ce_loss  = nn.CrossEntropyLoss(ignore_index=-1)
             self.TriLoss  = TripletLoss()
 
-        # Kendall uncertainty: s_det and s_reid
-        self.log_vars = nn.ParameterDict({
-            'det':  nn.Parameter(torch.tensor(0.0)),
-            'reid': nn.Parameter(torch.tensor(-1.05)),
-        })
-
     # ── helpers ────────────────────────────────────────────────────────────────
 
     def _get_matching_indices(
@@ -159,13 +153,8 @@ class DetrMotLoss(nn.Module):
         else:
             reid_loss = outputs['pred_logits'].new_zeros(())
 
-        # ── Kendall uncertainty weighting ─────────────────────────────────────
-        s_det  = self.log_vars['det']
-        s_reid = self.log_vars['reid']
-        loss   = 0.5 * (
-            torch.exp(-s_det)  * det_loss  + s_det
-            + torch.exp(-s_reid) * reid_loss + s_reid
-        )
+        # ── Fixed-weight combination ───────────────────────────────────────────
+        loss = det_loss + opt.id_weight * reid_loss
 
         # ── Stats ──────────────────────────────────────────────────────────────
         def _t(v):
@@ -176,20 +165,19 @@ class DetrMotLoss(nn.Module):
             'loss':       loss,
             'det_loss':   _t(det_loss),
             'reid_loss':  _t(reid_loss),
-            'w_det':      torch.exp(-s_det).detach(),
-            'w_reid':     torch.exp(-s_reid).detach(),
             'loss_cls':   _zero,
             'loss_bbox':  _zero,
             'loss_giou':  _zero,
         }
-        # Propagate individual DEIM sub-losses. The cls loss key varies by config:
-        # 'loss_focal' (focal), 'loss_vfl' (varifocal), 'loss_mal' (MAL) — all mapped to 'loss_cls'.
+        # Accumulate per-layer sub-losses across all decoder/DN/encoder layers.
+        # 'loss_cls' sums all cls variants; 'loss_bbox'/'loss_giou' also sum all layers.
         _CLS_KEYS = ('loss_focal', 'loss_vfl', 'loss_mal')
         for k, v in det_losses.items():
-            if k in _CLS_KEYS:
+            base_key = k.split('_aux_')[0].split('_dn_')[0].split('_enc_')[0].split('_pre')[0]
+            if base_key in _CLS_KEYS:
                 loss_stats['loss_cls'] = loss_stats['loss_cls'] + _t(v)
-            elif k in ('loss_bbox', 'loss_giou'):
-                loss_stats[k] = _t(v)
+            elif base_key in ('loss_bbox', 'loss_giou'):
+                loss_stats[base_key] = loss_stats[base_key] + _t(v)
 
         return loss, loss_stats
 
@@ -224,7 +212,6 @@ class DetrMotTrainer(BaseTrainer):
 
         loss_states = [
             'loss', 'det_loss', 'reid_loss',
-            'w_det', 'w_reid',
             'loss_cls', 'loss_bbox', 'loss_giou',
         ]
         return loss_states, DetrMotLoss(opt, criterion, matcher)

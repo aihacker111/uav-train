@@ -311,7 +311,7 @@ class DEIMCriterion(nn.Module):
         # Compute all the requested losses, main loss
         losses = {}
         for loss in self.losses:
-            use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
+            use_uni_set = self.use_uni_set
             indices_in = indices_go if use_uni_set else indices
             num_boxes_in = num_boxes_go if use_uni_set else num_boxes
             meta = self.get_loss_meta_info(loss, outputs, targets, indices_in)
@@ -325,7 +325,7 @@ class DEIMCriterion(nn.Module):
                 if 'local' in self.losses:      # only work for local loss
                     aux_outputs['up'], aux_outputs['reg_scale'] = outputs['up'], outputs['reg_scale']
                 for loss in self.losses:
-                    use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
+                    use_uni_set = self.use_uni_set
                     indices_in = indices_go if use_uni_set else cached_indices[i]
                     num_boxes_in = num_boxes_go if use_uni_set else num_boxes
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
@@ -339,7 +339,7 @@ class DEIMCriterion(nn.Module):
         if 'pre_outputs' in outputs:
             aux_outputs = outputs['pre_outputs']
             for loss in self.losses:
-                use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
+                use_uni_set = self.use_uni_set
                 indices_in = indices_go if use_uni_set else cached_indices[-1]
                 num_boxes_in = num_boxes_go if use_uni_set else num_boxes
                 meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
