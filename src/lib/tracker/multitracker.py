@@ -543,12 +543,17 @@ class MCJDETracker(object):
                 self.past_reg.append(_reg_map)
 
             else:
-                # ── Non-hybrid model: standard CenterNet JDE path
-                output     = raw_output[-1]
-                hm         = output['hm'].sigmoid_()
+                # ── DEIMMotNet / standard CenterNet JDE path
+                # forward returns [{'hm':logits, 'wh', 'reg', 'id'}]
+                output = raw_output[-1]
+
+                # non-in-place sigmoid: preserves original tensor for potential reuse
+                hm         = output['hm'].sigmoid()
                 wh         = output['wh']
                 reg        = output['reg'] if self.opt.reg_offset else None
-                id_feature = F.normalize(output['id'], dim=1)
+
+                # normalize reid embeddings along channel dim (B, reid_dim, H/4, W/4)
+                id_feature = F.normalize(output['id'].detach(), dim=1)
 
                 self.past_id_feature.append(id_feature)
                 self.past_reg.append(reg)

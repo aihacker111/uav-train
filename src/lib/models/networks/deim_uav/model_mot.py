@@ -98,9 +98,14 @@ class DEIMMotNet(nn.Module):
 
         s4_ch = self._register_s4_hook(deim)
 
-        # proj_enc: 1×1 to stabilise enc_S8 before bilinear upsample
-        self.proj_enc = nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False)
-        nn.init.kaiming_normal_(self.proj_enc.weight, mode='fan_out')
+        # FPN top-down projections: 1×1 per encoder scale (replaces old proj_enc)
+        self.proj_s32 = nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False)
+        self.proj_s16 = nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False)
+        self.proj_s8  = nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False)
+        for proj in (self.proj_s32, self.proj_s16, self.proj_s8):
+            nn.init.kaiming_normal_(proj.weight, mode='fan_out')
+        print(f'[DEIMMotNet] FPN top-down: S32→S16→S8→S4 '
+              f'(3×{hidden_dim}×{hidden_dim} = {3*hidden_dim*hidden_dim:,} params)')
 
         if s4_ch is not None:
             self.lateral_s4 = nn.Conv2d(s4_ch, hidden_dim, 1, bias=False)
@@ -186,14 +191,18 @@ class DEIMMotNet(nn.Module):
         # Reset cache; hook fills it during backbone forward
         self._s4_cache = None
 
-        feats     = self.deim.backbone(x)          # [S8, S16, S32] unchanged
+        feats     = self.deim.backbone(x)          # [S8, S16, S32]
         enc_feats = self.deim.encoder(feats)        # [enc_S8, enc_S16, enc_S32]
 
-        # Bilinear upsample enc_S8 → S4 resolution (no learnable kernel)
-        s4 = F.interpolate(
-            self.proj_enc(enc_feats[0]),
-            scale_factor=2, mode='bilinear', align_corners=False,
-        )
+        # FPN top-down: S32 → S16 → S8 → S4
+        # enc_S32 carries global context; fuse down to preserve detail at S4
+        p32 = self.proj_s32(enc_feats[2])                                    # (B, C, H/32, W/32)
+        p16 = self.proj_s16(enc_feats[1]) + F.interpolate(
+            p32, scale_factor=2, mode='nearest')                             # (B, C, H/16, W/16)
+        p8  = self.proj_s8(enc_feats[0])  + F.interpolate(
+            p16, scale_factor=2, mode='nearest')                             # (B, C, H/8,  W/8 )
+        s4  = F.interpolate(p8, scale_factor=2, mode='bilinear',
+                            align_corners=False)                             # (B, C, H/4,  W/4 )
 
         # Fuse with STA S4: fine-grained spatial details captured by hook
         if self.lateral_s4 is not None and self._s4_cache is not None:

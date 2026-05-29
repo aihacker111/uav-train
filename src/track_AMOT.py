@@ -26,6 +26,63 @@ from lib.tracking_utils.utils import mkdir_if_missing
 from lib.opts import opts
 
 
+# ── Benchmark ─────────────────────────────────────────────────────────────────
+
+def benchmark_model(opt, warmup: int = 30, runs: int = 200):
+    """
+    Measure pure model inference FPS — no tracker, no Kalman, no matching.
+    Prints latency and FPS for FP32 and (optionally) FP16.
+    """
+    from lib.models.model import create_model, load_model
+
+    print('\n' + '─' * 55)
+    print('  Benchmark: DEIMMotNet pure inference')
+    print(f'  arch={opt.arch}  input={opt.input_wh}  device={opt.device}')
+    print('─' * 55)
+
+    model = create_model(opt.arch, opt.heads, opt.head_conv,
+                         num_classes=opt.num_classes, opt=opt)
+    model = load_model(model, opt.load_model)
+    model = model.to(opt.device).eval()
+
+    W, H  = opt.input_wh                              # (W, H) tuple
+    dummy = torch.zeros(1, 3, H, W, device=opt.device)
+
+    device = torch.device(opt.device)
+    use_cuda = device.type == 'cuda'
+
+    for half in ([False, True] if use_cuda else [False]):
+        m = model.half() if half else model
+        d = dummy.half() if half else dummy
+        dtype_str = 'FP16' if half else 'FP32'
+
+        with torch.no_grad():
+            # warmup
+            for _ in range(warmup):
+                _ = m(d)
+
+            if use_cuda:
+                torch.cuda.synchronize()
+                t0 = torch.cuda.Event(enable_timing=True)
+                t1 = torch.cuda.Event(enable_timing=True)
+                t0.record()
+                for _ in range(runs):
+                    _ = m(d)
+                t1.record()
+                torch.cuda.synchronize()
+                ms = t0.elapsed_time(t1) / runs
+            else:
+                import time
+                s = time.perf_counter()
+                for _ in range(runs):
+                    _ = m(d)
+                ms = (time.perf_counter() - s) * 1000 / runs
+
+        print(f'  {dtype_str}  latency: {ms:.1f} ms   FPS: {1000/ms:.1f}')
+
+    print('─' * 55 + '\n')
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _tlwh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
@@ -308,6 +365,13 @@ def main(opt,
 
 if __name__ == '__main__':
     opt = opts().init()
+
+    # ── Pure inference benchmark (no tracking) ────────────────────────────────
+    import sys as _sys
+    if '--benchmark' in _sys.argv:
+        opt.device = getattr(opt, 'device', 'cuda:0')
+        benchmark_model(opt)
+        _sys.exit(0)
 
     if opt.test_visdrone:
         seqs_str = '''uav0000009_03358_v

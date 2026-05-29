@@ -34,8 +34,11 @@ COMPONENTS_HYBRID = [
 COMPONENTS_DEIM_MOT = [
     ('deim.backbone', 'Backbone (DINOv3STAs)'),
     ('deim.encoder',  'Encoder (HybridEncoder)'),
-    ('proj_enc',      'Enc proj 1×1'),
+    ('proj_s32',      'FPN proj S32 1×1'),
+    ('proj_s16',      'FPN proj S16 1×1'),
+    ('proj_s8',       'FPN proj S8  1×1'),
     ('lateral_s4',    'S4 lateral 1×1'),
+    ('dilated_ctx',   'DilatedContext'),
     ('hm_head',       'Heatmap Head'),
     ('wh_head',       'WH Head'),
     ('reg_head',      'Offset Head'),
@@ -232,7 +235,9 @@ def main():
     model.eval()
 
     if args.arch == 'deim_mot':
-        s4_on = getattr(model, 'lateral_s4', None) is not None
+        s4_on  = getattr(model, 'lateral_s4', None) is not None
+        fpn_on = all(hasattr(model, k) for k in ('proj_s32', 'proj_s16', 'proj_s8'))
+        print(f"  FPN top-down (S32→S4): {'active' if fpn_on else 'disabled (legacy proj_enc)'}")
         print(f"  STA S4 lateral       : {'active' if s4_on else 'disabled (STA not found)'}")
 
     # Allow arbitrary resolution — clear cached spatial sizes
