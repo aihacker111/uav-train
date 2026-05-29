@@ -228,7 +228,7 @@ def run(opt):
 
     # Load pretrained weights (before any LR scaling or checkpoint resume)
     if opt.backbone_weights:
-        if 'hybrid' in opt.arch and hasattr(model, 'load_pretrained'):
+        if hasattr(model, 'load_pretrained'):
             model.load_pretrained(opt.backbone_weights)
         elif hasattr(model, 'backbone'):
             from lib.models.model import load_pretrained_backbone

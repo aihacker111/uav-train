@@ -954,6 +954,13 @@ class opts(object):
                                  help='loss weight for id')  # ReID feature extraction or not
         
 
+        self.parser.add_argument('--grid_strides',
+                                 type=int,
+                                 nargs='+',
+                                 default=[16, 32],
+                                 help='Encoder stride levels used by GridQueryGen in deimv2_jde. '
+                                      'For 640×640: S16(40×40=1600)+S32(20×20=400)=2000 queries. '
+                                      'Add S8 for denser small-object coverage (costs more memory).')
         self.parser.add_argument('--reid_dim',
                                  type=int,
                                  default=128,
