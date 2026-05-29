@@ -6,7 +6,7 @@ https://github.com/facebookresearch/detr/blob/main/util/box_ops.py
 import torch
 from torch import Tensor
 from torchvision.ops.boxes import box_area
-
+from typing import Tuple
 
 # def box_cxcywh_to_xyxy(x):
 #     x_c, y_c, w, h = x.unbind(-1)
