@@ -178,13 +178,17 @@ class DetrMotLoss(nn.Module):
             'reid_loss':  _t(reid_loss),
             'w_det':      torch.exp(-s_det).detach(),
             'w_reid':     torch.exp(-s_reid).detach(),
-            'loss_focal': _zero,
+            'loss_cls':   _zero,
             'loss_boxes': _zero,
             'loss_giou':  _zero,
         }
-        # Propagate individual DEIM sub-losses for monitoring
+        # Propagate individual DEIM sub-losses. The cls loss key varies by config:
+        # 'loss_focal' (focal), 'loss_vfl' (varifocal), 'loss_mal' (MAL) — all mapped to 'loss_cls'.
+        _CLS_KEYS = ('loss_focal', 'loss_vfl', 'loss_mal')
         for k, v in det_losses.items():
-            if k in ('loss_focal', 'loss_boxes', 'loss_giou', 'loss_vfl'):
+            if k in _CLS_KEYS:
+                loss_stats['loss_cls'] = loss_stats['loss_cls'] + _t(v)
+            elif k in ('loss_boxes', 'loss_giou'):
                 loss_stats[k] = _t(v)
 
         return loss, loss_stats
@@ -221,7 +225,7 @@ class DetrMotTrainer(BaseTrainer):
         loss_states = [
             'loss', 'det_loss', 'reid_loss',
             'w_det', 'w_reid',
-            'loss_focal', 'loss_boxes', 'loss_giou',
+            'loss_cls', 'loss_boxes', 'loss_giou',
         ]
         return loss_states, DetrMotLoss(opt, criterion, matcher)
 
