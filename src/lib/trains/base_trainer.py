@@ -207,6 +207,8 @@ class BaseTrainer:
                     total=bar.elapsed_td, eta=_eta_str)
 
                 for l in avg_loss_stats:
+                    if l not in loss_stats:
+                        continue
                     avg_loss_stats[l].update(loss_stats[l].mean().item(), batch['input'].size(0))
                     Bar.suffix += '|{} {:.4f} '.format(l, avg_loss_stats[l].avg)
 

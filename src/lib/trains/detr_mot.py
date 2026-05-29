@@ -171,12 +171,16 @@ class DetrMotLoss(nn.Module):
         def _t(v):
             return v if isinstance(v, torch.Tensor) else torch.tensor(float(v))
 
+        _zero = loss.new_zeros(())
         loss_stats: Dict[str, Any] = {
-            'loss':      loss,
-            'det_loss':  _t(det_loss),
-            'reid_loss': _t(reid_loss),
-            'w_det':     torch.exp(-s_det).detach(),
-            'w_reid':    torch.exp(-s_reid).detach(),
+            'loss':       loss,
+            'det_loss':   _t(det_loss),
+            'reid_loss':  _t(reid_loss),
+            'w_det':      torch.exp(-s_det).detach(),
+            'w_reid':     torch.exp(-s_reid).detach(),
+            'loss_focal': _zero,
+            'loss_boxes': _zero,
+            'loss_giou':  _zero,
         }
         # Propagate individual DEIM sub-losses for monitoring
         for k, v in det_losses.items():
