@@ -1144,8 +1144,15 @@ class opts(object):
             if opt.id_weight > 0:
                 opt.nID_dict = dataset.nID_dict
 
+        elif opt.task == 'deimv2_jde':
+            # DEIMv2JDE uses full DETR outputs (pred_boxes, pred_logits, pred_reid);
+            # no CenterNet heads dict needed.
+            opt.heads = {}
+            if opt.id_weight > 0:
+                opt.nID_dict = dataset.nID_dict
+
         else:
-            raise ValueError(f'Unknown task: {opt.task!r}. Supported: mot | deim_mot | hybrid')
+            raise ValueError(f'Unknown task: {opt.task!r}. Supported: mot | deim_mot | hybrid | deimv2_jde')
 
         print('heads: ', opt.heads)
         return opt
@@ -1165,9 +1172,10 @@ class opts(object):
             'nID_dict': {},
         }
         default_dataset_info = {
-            'mot':      _common,
-            'hybrid':   _common,
-            'deim_mot': _common,
+            'mot':        _common,
+            'hybrid':     _common,
+            'deim_mot':   _common,
+            'deimv2_jde': _common,
         }
 
         class Struct:
