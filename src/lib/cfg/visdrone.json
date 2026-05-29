@@ -1,15 +1,15 @@
 {
-    "root": "/workspace/uav-train/VisDrone2019-7cls",
+    "root": "/workspace/VisDrone2019",
     "train": {
-        "visdrone_train": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.train"
+        "visdrone_train": "/workspace/VisDrone2019/VisDrone.train"
     },
     "val": {
-        "visdrone_val": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.val"
+        "visdrone_val": "/workspace/VisDrone2019/VisDrone.val"
     },
     "test_emb": {
-        "visdrone": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.train"
+        "visdrone": "/workspace/VisDrone2019/VisDrone.train"
     },
     "test": {
-        "visdrone": "/workspace/uav-train/VisDrone2019-7cls/VisDrone6cls.train"
+        "visdrone": "/workspace/VisDrone2019/VisDrone.train"
     }
 }
