@@ -358,7 +358,7 @@ def gen_track_dataset(src_root, dst_root, viz_root=None):
 
 if __name__ == '__main__':
     DATASET_ROOT   = '/workspace/visdrone2019'
-    CONVERTED_ROOT = '/workspace/VisDrone2019'
+    CONVERTED_ROOT = '/workspace/uav-train/VisDrone2019'
 
     # Step 1: Convert train set  → CONVERTED_ROOT/train/images/ + labels_with_ids/
     gen_track_dataset(
