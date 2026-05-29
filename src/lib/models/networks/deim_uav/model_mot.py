@@ -120,7 +120,7 @@ class DEIMMotNet(nn.Module):
         self.reg_head = _make_head(hidden_dim, 2,           head_conv)
         self.id_head  = _make_head(hidden_dim, reid_dim,    head_conv)
 
-        self._init_head_weights()
+        self._init_head_weights(log_wh=False)  # caller sets via load_pretrained or opt
 
     # ── Hook setup ─────────────────────────────────────────────────────────────
 
@@ -155,13 +155,19 @@ class DEIMMotNet(nn.Module):
 
     # ── Weight init ────────────────────────────────────────────────────────────
 
-    def _init_head_weights(self) -> None:
+    def _init_head_weights(self, log_wh: bool = False) -> None:
         for head in (self.hm_head, self.wh_head, self.reg_head, self.id_head):
             nn.init.kaiming_normal_(head[0].weight, mode='fan_out', nonlinearity='relu')
             nn.init.constant_(head[0].bias, 0.0)
             nn.init.constant_(head[2].bias, 0.0)
         # heatmap prior: sigmoid(−4.595) ≈ 0.01
         nn.init.constant_(self.hm_head[2].bias, -4.595)
+        # log_wh: init bias to log(typical object size in feature-map coords)
+        # VisDrone cars ~50×30px at stride-4 → log(12.5)≈2.5, log(7.5)≈2.0
+        # Avoids cold-start where exp(0)=1px boxes dominate early training
+        if log_wh:
+            nn.init.constant_(self.wh_head[2].bias[0], 2.5)  # log width
+            nn.init.constant_(self.wh_head[2].bias[1], 2.0)  # log height
 
     # ── Forward ────────────────────────────────────────────────────────────────
 

@@ -62,13 +62,16 @@ def create_model(arch: str, heads: dict, head_conv: int,
 
     if 'deim_mot' in arch:
         from lib.models.networks.deim_uav.model_mot import DEIMMotNet
-        return DEIMMotNet(
+        _log_wh = getattr(opt, 'log_wh', False) if opt else False
+        net = DEIMMotNet(
             deim=deim_model,
             num_classes=num_classes,
             hidden_dim=hidden_dim,
             head_conv=head_conv,
             reid_dim=reid_dim,
         )
+        net._init_head_weights(log_wh=_log_wh)
+        return net
 
     from lib.models.networks.deim_uav.model import HybridDEIM
     return HybridDEIM(
