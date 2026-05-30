@@ -19,7 +19,6 @@ from lib.tracking_utils import visualization as vis
 from lib.tracking_utils.log import logger
 from lib.tracking_utils.timer import Timer
 from lib.tracking_utils.evaluation import Evaluator
-from lib.utils.det_eval import DetectionEvaluator
 import lib.datasets.dataset.jde as datasets
 
 from lib.tracking_utils.utils import mkdir_if_missing
@@ -35,8 +34,14 @@ def benchmark_model(opt, warmup: int = 30, runs: int = 200):
     """
     from lib.models.model import create_model, load_model
 
+    arch_label = {
+        'deimv2_jde': 'DEIMv2JDE (backbone+encoder+decoder+grid queries+ReID)',
+        'deim_mot':   'DEIMMotNet (backbone+encoder+CenterNet/ReID)',
+        'hybrid':     'HybridDEIM (backbone+encoder+decoder+CenterNet aux)',
+    }.get(opt.arch, opt.arch)
+
     print('\n' + '─' * 55)
-    print('  Benchmark: DEIMMotNet pure inference')
+    print(f'  Benchmark: {arch_label}')
     print(f'  arch={opt.arch}  input={opt.input_wh}  device={opt.device}')
     print('─' * 55)
 
@@ -265,8 +270,8 @@ def main(opt,
     use_imagenet_norm = 'deim' in opt.arch or 'hybrid' in opt.arch
 
     accs = []
-    n_frame = 0
     timer_avgs, timer_calls = [], []
+    total_frames = 0
 
     from lib.utils.det_eval import COCOEvaluator, VISDRONE_CLASSES
     det_ev = COCOEvaluator(num_classes=opt.num_classes,
@@ -288,7 +293,7 @@ def main(opt,
             opt, dataloader, data_type, result_filename,
             save_dir=output_dir, show_image=show_image, frame_rate=frame_rate)
 
-        n_frame       += nf
+        total_frames  += nf
         timer_avgs.append(ta)
         timer_calls.append(tc)
 
@@ -340,8 +345,8 @@ def main(opt,
     timer_calls = np.asarray(timer_calls)
     all_time = np.dot(timer_avgs, timer_calls)
     avg_time = all_time / np.sum(timer_calls)
-    logger.info('Time elapsed: {:.2f} seconds, FPS: {:.2f}'.format(
-        all_time, 1.0 / avg_time))
+    logger.info('Frames: {}  |  Time: {:.2f}s  |  FPS: {:.2f}'.format(
+        total_frames, all_time, 1.0 / avg_time))
 
     # ── Tracking metrics (MOTA, MOTP, IDF1, …) ───────────────────────────────
     metrics = mm.metrics.motchallenge_metrics
@@ -368,8 +373,11 @@ if __name__ == '__main__':
 
     # ── Pure inference benchmark (no tracking) ────────────────────────────────
     import sys as _sys
+    # Resolve device from --gpus (opts.py parses gpus as list of ints)
+    _gpus = getattr(opt, 'gpus', [0])
+    opt.device = f'cuda:{_gpus[0]}' if _gpus[0] >= 0 else 'cpu'
+
     if '--benchmark' in _sys.argv:
-        opt.device = getattr(opt, 'device', 'cuda:0')
         benchmark_model(opt)
         _sys.exit(0)
 
@@ -393,13 +401,13 @@ if __name__ == '__main__':
                       uav0000370_00001_v
                       '''
     data_root = os.path.join(opt.data_dir, 'VisDrone2019/test_dev/sequences')
-    seqs = [seq.strip() for seq in seqs_str.split()]
-    print(opt.save_dir_result)
-    opt.device = 'cuda:0'
+    seqs      = [seq.strip() for seq in seqs_str.split()]
+    exp_name  = opt.save_dir_result
+    print(f'Results → {exp_name}  |  device: {opt.device}')
     main(opt,
          data_root=data_root,
          seqs=seqs,
-         exp_name='save_name',
+         exp_name=exp_name,
          show_image=False,
          save_images=True,
          save_videos=False)
