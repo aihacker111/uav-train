@@ -65,13 +65,19 @@ def create_model(arch: str, heads: dict, head_conv: int,
 
     if 'deimv2_jde' in arch:
         from lib.models.networks.deim_uav.model_detr_jde import DEIMv2JDE
-        _grid_strides = tuple(getattr(opt, 'grid_strides', (16, 32))) if opt else (16, 32)
+        _grid_strides      = tuple(getattr(opt, 'grid_strides',      (16, 32))) if opt else (16, 32)
+        _min_queries       = getattr(opt, 'min_queries',       500)  if opt else 500
+        _train_k_headroom  = getattr(opt, 'train_k_headroom',  2.5)  if opt else 2.5
+        _min_train_k       = getattr(opt, 'min_train_k',       200)  if opt else 200
         return DEIMv2JDE(
             deim=deim_model,
             num_classes=num_classes,
             hidden_dim=hidden_dim,
             reid_dim=reid_dim,
             grid_strides=_grid_strides,
+            min_queries=_min_queries,
+            train_k_headroom=_train_k_headroom,
+            min_train_k=_min_train_k,
         )
 
     if 'deim_mot' in arch:

@@ -101,6 +101,8 @@ val_dataloader:
         - {type: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
 
 DEIMCriterion:
+  # Dense UAV: positive/negative ratio ~1:2 (vs COCO ~1:10), lower alpha needed
+  alpha: 0.60
   matcher:
     # change matcher
     change_matcher: True

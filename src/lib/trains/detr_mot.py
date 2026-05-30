@@ -54,9 +54,11 @@ class DetrMotLoss(nn.Module):
 
     def __init__(self, opt, criterion: nn.Module, matcher: nn.Module) -> None:
         super().__init__()
-        self.opt       = opt
-        self.criterion = criterion
-        self.matcher   = matcher
+        self.opt        = opt
+        self.criterion  = criterion
+        self.matcher    = matcher
+        self.obj_weight = getattr(opt, 'obj_weight', 0.5)
+        self.obj_sigma  = getattr(opt, 'obj_sigma',  1.5)
 
         if opt.id_weight > 0:
             self.emb_dim      = opt.reid_dim
@@ -131,6 +133,39 @@ class DetrMotLoss(nn.Module):
 
         return total_loss / max(n_valid, 1)
 
+    # ── objectness loss ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _soft_focal_loss(
+        pred:  Tensor,
+        label: Tensor,
+        alpha: float = 0.75,
+        gamma: float = 2.0,
+    ) -> Tensor:
+        """Soft focal loss between sigmoid prediction and soft Gaussian label."""
+        pred  = pred.clamp(1e-6, 1.0 - 1e-6)
+        pos   = -alpha       * label       * (1.0 - pred).pow(gamma) * pred.log()
+        neg   = -(1.0-alpha) * (1.0-label) * pred.pow(gamma)         * (1.0-pred).log()
+        return (pos + neg).mean()
+
+    def _objectness_loss(
+        self,
+        outputs: Dict[str, Any],
+        targets: List[Dict[str, Any]],
+    ) -> Tensor:
+        obj_scores = outputs.get('obj_scores')
+        if obj_scores is None:
+            return torch.zeros((), device=next(iter(outputs.values())).device)
+
+        from lib.models.networks.deim_uav.model_detr_jde import gaussian_objectness_labels
+        B, _, H, W = obj_scores.shape
+        labels = gaussian_objectness_labels(
+            targets, H, W,
+            sigma=self.obj_sigma,
+            device=obj_scores.device,
+        )
+        return self._soft_focal_loss(obj_scores, labels)
+
     # ── forward ────────────────────────────────────────────────────────────────
 
     def forward(self, outputs: Dict[str, Any], batch: Dict[str, Any]) -> Tuple:
@@ -165,7 +200,13 @@ class DetrMotLoss(nn.Module):
         else:
             reid_loss = outputs['pred_logits'].new_zeros(())
 
-        loss = det_loss_avg + opt.id_weight * reid_loss
+        # ── Objectness loss ────────────────────────────────────────────────────
+        if self.obj_weight > 0:
+            obj_loss = self._objectness_loss(outputs, targets)
+        else:
+            obj_loss = outputs['pred_logits'].new_zeros(())
+
+        loss = det_loss_avg + opt.id_weight * reid_loss + self.obj_weight * obj_loss
 
         # ── Stats ──────────────────────────────────────────────────────────────
         def _t(v):
@@ -176,6 +217,7 @@ class DetrMotLoss(nn.Module):
             'loss':       loss,
             'det_loss':   _t(det_loss_avg),
             'reid_loss':  _t(reid_loss),
+            'loss_obj':   _t(obj_loss),
             'loss_cls':   _zero,
             'loss_bbox':  _zero,
             'loss_giou':  _zero,
@@ -223,7 +265,7 @@ class DetrMotTrainer(BaseTrainer):
         matcher   = criterion.matcher
 
         loss_states = [
-            'loss', 'det_loss', 'reid_loss',
+            'loss', 'det_loss', 'reid_loss', 'loss_obj',
             'loss_cls', 'loss_bbox', 'loss_giou',
         ]
         return loss_states, DetrMotLoss(opt, criterion, matcher)

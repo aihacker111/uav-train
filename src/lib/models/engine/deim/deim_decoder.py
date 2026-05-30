@@ -1170,7 +1170,7 @@ class DEIMTransformer(nn.Module):
             # Grid-query mode: bypass topK encoder selection entirely.
             # Content and reference points come from the grid generator.
             enc_topk_bboxes_list, enc_topk_logits_list = [], []
-            content = query_content.detach()
+            content = query_content  # no detach: GridQueryGen.proj must receive gradients
             init_ref_points_unact = heatmap_ref_points
             N_grid = query_content.shape[1]  # actual grid query count
             if denoising_bbox_unact is not None:
@@ -1181,13 +1181,14 @@ class DEIMTransformer(nn.Module):
                 num_dn = dn_meta['dn_num_split'][0]
                 dn_meta['dn_num_split'] = [num_dn, N_grid]
                 # Rebuild attn_mask for (num_dn + N_grid) total queries.
-                # The original mask was sized for (num_dn + self.num_queries); we keep
-                # the DN×DN isolation block and extend with fresh rows/cols for grid
-                # queries (grid queries cannot see DN; DN can see grid; grid sees grid).
+                # DN×DN isolation is preserved from the original mask.
+                # DN cannot see grid (prevents position leakage into denoising).
+                # Grid cannot see DN (standard DEIM/DINO-DETR convention).
                 if attn_mask is not None:
                     new_mask = attn_mask.new_zeros(num_dn + N_grid, num_dn + N_grid)
                     new_mask[:num_dn, :num_dn] = attn_mask[:num_dn, :num_dn]
-                    new_mask[num_dn:, :num_dn] = True  # grid cannot see DN
+                    new_mask[:num_dn, num_dn:] = True  # DN cannot see grid queries
+                    new_mask[num_dn:, :num_dn] = True  # grid cannot see DN queries
                     attn_mask = new_mask
         else:
             init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
