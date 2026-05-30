@@ -15,6 +15,7 @@ from ...core import register
 
 @register()
 class Mosaic(T.Transform):
+    _needs_dataset = True   # forward() unpacks (image, target, dataset)
     """
     Applies Mosaic augmentation to a batch of images. Combines four randomly selected images
     into a single composite image with randomized transformations.

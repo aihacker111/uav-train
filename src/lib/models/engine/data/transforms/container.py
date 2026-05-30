@@ -60,22 +60,32 @@ class Compose(T.Compose):
         """Apply one transform to (img, target[, dataset]).
 
         Newer torchvision v2 raises NotImplementedError when a non-tensor
-        object (e.g. the dataset reference) is passed through transforms.
-        Strip it before the call and put it back afterwards.
+        object (e.g. the dataset reference) is passed as a transform input.
+
+        Strategy:
+          • transforms with _needs_dataset=True (e.g. Mosaic) receive the full
+            triplet (img, target, dataset) — they intentionally access dataset.
+          • all other transforms (torchvision built-ins) receive only (img, target);
+            the dataset reference is stripped and re-attached after the call.
         """
-        if isinstance(sample, tuple) and len(sample) >= 3:
-            # sample = (img, target, dataset[, ...])
+        if not (isinstance(sample, tuple) and len(sample) >= 3):
+            # 0-2 elements — pass as-is
+            result = transform(*sample) if isinstance(sample, tuple) else transform(sample)
+            return result
+
+        needs_dataset = getattr(transform, '_needs_dataset', False)
+
+        if needs_dataset:
+            # Custom transform (e.g. Mosaic) that explicitly unpacks the dataset
+            return transform(*sample)
+        else:
+            # Standard torchvision transform — strip dataset, transform, re-attach
             core   = sample[:2]     # (img, target_dict)
             extras = sample[2:]     # (dataset, ...)
             result = transform(*core)
             if not isinstance(result, tuple):
                 result = (result,)
             return result + extras
-        elif isinstance(sample, tuple):
-            result = transform(*sample)
-            return result if isinstance(result, tuple) else (result,)
-        else:
-            return transform(sample)
 
     def forward(self, *inputs: Any) -> Any:
         return self.get_forward(self.policy['name'])(*inputs)
