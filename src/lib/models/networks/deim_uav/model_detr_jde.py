@@ -55,8 +55,8 @@ class GridQueryGen(nn.Module):
       - One reference box : grid-centre CX/CY (fixed) + learned WH (per cell,
                             predicted from encoder features via wh_head)
 
-    WH is NOT hardcoded.  wh_head is a lightweight 1×1 conv that predicts
-    log(w) and log(h) per cell.  Its bias is initialised so exp(bias) equals a
+    WH is NOT hardcoded.  wh_head is a lightweight Linear that predicts
+    log(w) and log(h) per token.  Its bias is initialised so exp(bias) equals a
     sensible starting point (0.025 for S16, 0.05 for S32), after which
     gradient from the detection loss (Hungarian GIoU + bbox) refines it toward
     the dataset's actual object-size distribution.
@@ -88,11 +88,11 @@ class GridQueryGen(nn.Module):
         for p in self.proj.values():
             nn.init.xavier_uniform_(p.weight)
 
-        # WH prediction head — one 1×1 Conv2d per stride
-        # Outputs log(w) and log(h) per cell; exp() gives positive WH.
-        # Weight=0 so the initial prediction equals exactly exp(bias).
+        # WH prediction head — one Linear per stride (equivalent to 1×1 Conv2d
+        # but operates on gathered tokens directly, avoiding full-map computation).
+        # Weight=0 so initial prediction equals exactly exp(bias).
         self.wh_head = nn.ModuleDict({
-            str(s): nn.Conv2d(hidden_dim, 2, kernel_size=1, bias=True)
+            str(s): nn.Linear(hidden_dim, 2, bias=True)
             for s in grid_strides
         })
         for s, head in self.wh_head.items():
@@ -104,59 +104,6 @@ class GridQueryGen(nn.Module):
     def _logit(x: Tensor) -> Tensor:
         x = x.clamp(1e-4, 1.0 - 1e-4)
         return torch.log(x / (1.0 - x))
-
-    def forward(
-        self,
-        enc_feats: List[Tensor],
-        stride_map: Optional[Dict[int, int]] = None,
-    ) -> Tuple[Tensor, Tensor]:
-        """
-        Args:
-            enc_feats : list of (B, C, H_i, W_i) encoder spatial feature maps,
-                        ordered [S8, S16, S32] (indices 0, 1, 2).
-            stride_map: optional override mapping stride → enc_feats index.
-                        Defaults to {8:0, 16:1, 32:2}.
-
-        Returns:
-            content : (B, N_grid, C)  projected content queries
-            ref_pts : (B, N_grid, 4)  cxcywh reference boxes in logit space
-        """
-        if stride_map is None:
-            stride_map = {8: 0, 16: 1, 32: 2}
-
-        all_content: List[Tensor] = []
-        all_ref:     List[Tensor] = []
-
-        for stride in self.grid_strides:
-            feat = enc_feats[stride_map[stride]]   # (B, C, H, W)
-            B, C, H, W = feat.shape
-
-            # ── content queries ──────────────────────────────────────────────
-            tokens  = feat.flatten(2).permute(0, 2, 1)    # (B, H*W, C)
-            content = self.proj[str(stride)](tokens)        # (B, H*W, C)
-
-            # ── reference boxes — CX/CY fixed grid, WH learned ──────────────
-            ys = (torch.arange(H, device=feat.device, dtype=torch.float32) + 0.5) / H
-            xs = (torch.arange(W, device=feat.device, dtype=torch.float32) + 0.5) / W
-            gy, gx = torch.meshgrid(ys, xs, indexing='ij')           # (H, W)
-
-            cx = gx.flatten().view(1, -1, 1).expand(B, -1, 1)        # (B, H*W, 1)
-            cy = gy.flatten().view(1, -1, 1).expand(B, -1, 1)        # (B, H*W, 1)
-
-            # wh_head predicts log(w), log(h) per cell → exp → clamp to [0.004, 0.6]
-            # Clamp prevents degenerate boxes during early training while allowing
-            # the model to represent objects from ~3px to ~384px on a 640px image.
-            log_wh = self.wh_head[str(stride)](feat)                  # (B, 2, H, W)
-            wh     = log_wh.exp().clamp(0.004, 0.6)                   # (B, 2, H, W)
-            wh     = wh.flatten(2).permute(0, 2, 1)                   # (B, H*W, 2)
-
-            cxcywh  = torch.cat([cx, cy, wh], dim=-1)                 # (B, H*W, 4)
-            ref_pts = self._logit(cxcywh)                             # (B, H*W, 4)
-
-            all_content.append(content)
-            all_ref.append(ref_pts)
-
-        return torch.cat(all_content, dim=1), torch.cat(all_ref, dim=1)
 
     def forward_selected(
         self,
@@ -194,53 +141,36 @@ class GridQueryGen(nn.Module):
             feat = enc_feats[stride_map[stride]]   # (B, C, H, W)
             B, C, H, W = feat.shape
 
+            ys = (torch.arange(H, device=feat.device, dtype=torch.float32) + 0.5) / H
+            xs = (torch.arange(W, device=feat.device, dtype=torch.float32) + 0.5) / W
+            gy, gx = torch.meshgrid(ys, xs, indexing='ij')   # (H, W)
+
             if stride == 16:
-                # ── Efficient path: only K selected positions ──────────────────
-                K = s16_idx.shape[1]
+                # ── S16: efficient path — only K selected positions ────────────
+                cx_all = gx.flatten()                              # (H*W,)
+                cy_all = gy.flatten()                              # (H*W,)
+                cx = cx_all[s16_idx].unsqueeze(-1)                 # (B, K, 1)
+                cy = cy_all[s16_idx].unsqueeze(-1)                 # (B, K, 1)
 
-                # Grid CX/CY — 1D lookup, no batch dim needed
-                ys = (torch.arange(H, device=feat.device, dtype=torch.float32) + 0.5) / H
-                xs = (torch.arange(W, device=feat.device, dtype=torch.float32) + 0.5) / W
-                gy, gx = torch.meshgrid(ys, xs, indexing='ij')          # (H, W)
-                cx_all  = gx.flatten()   # (H*W,)
-                cy_all  = gy.flatten()   # (H*W,)
-
-                # Gather CX/CY at selected flat indices
-                cx = cx_all[s16_idx].unsqueeze(-1)   # (B, K, 1)
-                cy = cy_all[s16_idx].unsqueeze(-1)   # (B, K, 1)
-
-                # Gather encoder tokens at selected positions, then project
-                # Shape: (B, C, H*W) → gather K → (B, C, K) → (B, K, C)
-                feat_flat  = feat.flatten(2)                                # (B, C, H*W)
-                idx_tokens = s16_idx.unsqueeze(1).expand(-1, C, -1)        # (B, C, K)
-                tokens_sel = feat_flat.gather(2, idx_tokens).permute(0, 2, 1)  # (B, K, C)
-                content    = self.proj[str(stride)](tokens_sel)             # (B, K, C)
-
-                # WH head: full Conv2d on (B, C, H, W) → gather K positions
-                log_wh  = self.wh_head[str(stride)](feat)                  # (B, 2, H, W)
-                wh_flat = log_wh.exp().clamp(0.004, 0.6).flatten(2)       # (B, 2, H*W)
-                idx_wh  = s16_idx.unsqueeze(1).expand(-1, 2, -1)          # (B, 2, K)
-                wh      = wh_flat.gather(2, idx_wh).permute(0, 2, 1)     # (B, K, 2)
-
-                cxcywh  = torch.cat([cx, cy, wh], dim=-1)                 # (B, K, 4)
-                ref_pts = self._logit(cxcywh)                             # (B, K, 4)
+                # Gather K encoder tokens → proj (content) + wh_head (WH)
+                feat_flat  = feat.flatten(2)                               # (B, C, H*W)
+                idx        = s16_idx.unsqueeze(1).expand(-1, C, -1)       # (B, C, K)
+                tokens_sel = feat_flat.gather(2, idx).permute(0, 2, 1)    # (B, K, C)
+                content    = self.proj[str(stride)](tokens_sel)            # (B, K, C)
+                wh         = self.wh_head[str(stride)](tokens_sel)\
+                                 .exp().clamp(0.004, 0.6)                  # (B, K, 2)
 
             else:
-                # ── Full path for S32 and other strides (small cell count) ──────
-                tokens  = feat.flatten(2).permute(0, 2, 1)               # (B, H*W, C)
-                content = self.proj[str(stride)](tokens)                  # (B, H*W, C)
-
-                ys = (torch.arange(H, device=feat.device, dtype=torch.float32) + 0.5) / H
-                xs = (torch.arange(W, device=feat.device, dtype=torch.float32) + 0.5) / W
-                gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+                # ── S32 (and any other stride): full path — small cell count ───
+                tokens  = feat.flatten(2).permute(0, 2, 1)                # (B, H*W, C)
+                content = self.proj[str(stride)](tokens)                   # (B, H*W, C)
+                wh      = self.wh_head[str(stride)](tokens)\
+                              .exp().clamp(0.004, 0.6)                     # (B, H*W, 2)
                 cx = gx.flatten().view(1, -1, 1).expand(B, -1, 1)
                 cy = gy.flatten().view(1, -1, 1).expand(B, -1, 1)
 
-                log_wh  = self.wh_head[str(stride)](feat)
-                wh      = log_wh.exp().clamp(0.004, 0.6).flatten(2).permute(0, 2, 1)
-
-                cxcywh  = torch.cat([cx, cy, wh], dim=-1)
-                ref_pts = self._logit(cxcywh)
+            cxcywh  = torch.cat([cx, cy, wh], dim=-1)
+            ref_pts = self._logit(cxcywh)
 
             all_content.append(content)
             all_ref.append(ref_pts)
@@ -343,8 +273,7 @@ class DEIMv2JDE(nn.Module):
         hidden_dim  : encoder/decoder hidden dimension
         reid_dim    : ReID embedding dimension
         grid_strides      : encoder stride levels for grid queries (default (16, 32))
-        obj_sigma         : Gaussian σ for objectness label generation (default 1.5)
-        min_queries       : minimum total query count guaranteed at inference (default 500)
+min_queries       : minimum total query count guaranteed at inference (default 500)
         train_k_headroom  : K = max_GT_per_image × headroom at training (default 2.5)
         min_train_k       : minimum S16 queries at training even for sparse frames (default 200)
     """
@@ -356,16 +285,13 @@ class DEIMv2JDE(nn.Module):
         hidden_dim: int = 256,
         reid_dim: int = 128,
         grid_strides: Tuple[int, ...] = (16, 32),
-        obj_sigma: float = 1.5,
         min_queries: int = 500,
         train_k_headroom: float = 2.5,
         min_train_k: int = 200,
     ) -> None:
         super().__init__()
         self.deim             = deim
-        self.obj_sigma        = obj_sigma
         self.min_queries      = min_queries
-        # Adaptive training K: K = max_GT_per_image * headroom, clamped to [min_train_k, N_s16]
         self.train_k_headroom = train_k_headroom
         self.min_train_k      = min_train_k
 
@@ -388,7 +314,6 @@ class DEIMv2JDE(nn.Module):
         nn.init.zeros_(self.reid_mlp[0].bias)
         nn.init.zeros_(self.reid_mlp[2].bias)
 
-        self._num_classes = num_classes
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
