@@ -220,6 +220,15 @@ class VisDroneDataset(Dataset):
 
         return img, target
 
+    # ── DEIMv2 epoch tracking (required by DataLoader.set_epoch + Compose policy) ─
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    @property
+    def epoch(self) -> int:
+        return getattr(self, '_epoch', -1)
+
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def __len__(self) -> int:
