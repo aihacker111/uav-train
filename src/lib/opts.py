@@ -959,8 +959,39 @@ class opts(object):
                                  nargs='+',
                                  default=[16, 32],
                                  help='Encoder stride levels used by GridQueryGen in deimv2_jde. '
-                                      'For 640×640: S16(40×40=1600)+S32(20×20=400)=2000 queries. '
-                                      'Add S8 for denser small-object coverage (costs more memory).')
+                                      'For 640×640: S16(40×40=1600)+S32(20×20=400)=2000 max queries.')
+
+        # ── deimv2_jde: objectness head ────────────────────────────────────────
+        self.parser.add_argument('--obj_weight',
+                                 type=float,
+                                 default=0.5,
+                                 help='Weight for objectness head soft-focal loss. '
+                                      'L = L_det + id_weight*L_reid + obj_weight*L_obj. '
+                                      '0.5 gives ~10%% of total loss to obj head.')
+        self.parser.add_argument('--obj_sigma',
+                                 type=float,
+                                 default=1.5,
+                                 help='Gaussian σ for objectness label generation. '
+                                      'Controls spatial spread: σ=1.5 ≈ 1-cell half-width for a '
+                                      'cell-sized object. Insensitive in range [1.0, 2.0].')
+
+        # ── deimv2_jde: adaptive query count ──────────────────────────────────
+        self.parser.add_argument('--min_queries',
+                                 type=int,
+                                 default=500,
+                                 help='Minimum total queries at inference (S16 selected + all S32). '
+                                      'Prevents too-few queries in scenes with very low obj scores.')
+        self.parser.add_argument('--train_k_headroom',
+                                 type=float,
+                                 default=2.5,
+                                 help='K = max_GT_in_batch × headroom at training. '
+                                      '2.5× ensures 2.5 queries per GT object on the densest image. '
+                                      'Raise to 3.0+ for very dense datasets (>400 obj/frame).')
+        self.parser.add_argument('--min_train_k',
+                                 type=int,
+                                 default=200,
+                                 help='Minimum S16 queries at training even for very sparse batches. '
+                                      'Prevents degenerate under-coverage on easy frames.')
         self.parser.add_argument('--reid_dim',
                                  type=int,
                                  default=128,
