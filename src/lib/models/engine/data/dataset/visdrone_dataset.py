@@ -93,15 +93,21 @@ class VisDroneDataset(Dataset):
         super().__init__()
         cfg   = json.load(open(data_cfg))
         root  = cfg['root']
-        paths = cfg[split]          # {dataset_name: image_list_txt}
+        paths = cfg.get(split, {})    # {dataset_name: image_list_txt}; empty if split not in JSON
 
         self.num_classes = num_classes
         self.transforms  = transforms
         self.with_reid   = with_reid
+        self.nID_dict: Dict[int, int] = {}
 
         self._img_files: List[str] = []
         self._lbl_files: List[str] = []
         self._ds_names:  List[str] = []
+
+        if not paths:
+            print(f'[VisDroneDataset] WARNING: split={split!r} not in {data_cfg} — empty dataset')
+            self._len = 0
+            return
 
         for ds, txt_path in paths.items():
             imgs = _load_image_list(txt_path, root)
