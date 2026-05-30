@@ -39,7 +39,8 @@ def get_contrastive_denoising_training_group(targets,
     for i in range(bs):
         num_gt = num_gts[i]
         if num_gt > 0:
-            input_query_class[i, :num_gt] = targets[i]['labels']
+            lbl = targets[i]['labels']
+            input_query_class[i, :num_gt] = lbl[:, 0] if lbl.ndim == 2 else lbl
             input_query_bbox[i, :num_gt] = targets[i]['boxes']
             pad_gt_mask[i, :num_gt] = 1
     # each group has positive and negative queries.
