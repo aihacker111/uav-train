@@ -54,6 +54,29 @@ class Compose(T.Compose):
         self.global_samples = 0
         self.policy = policy
 
+    # ── torchvision v2 compatibility helper ──────────────────────────────────
+    @staticmethod
+    def _apply(transform, sample):
+        """Apply one transform to (img, target[, dataset]).
+
+        Newer torchvision v2 raises NotImplementedError when a non-tensor
+        object (e.g. the dataset reference) is passed through transforms.
+        Strip it before the call and put it back afterwards.
+        """
+        if isinstance(sample, tuple) and len(sample) >= 3:
+            # sample = (img, target, dataset[, ...])
+            core   = sample[:2]     # (img, target_dict)
+            extras = sample[2:]     # (dataset, ...)
+            result = transform(*core)
+            if not isinstance(result, tuple):
+                result = (result,)
+            return result + extras
+        elif isinstance(sample, tuple):
+            result = transform(*sample)
+            return result if isinstance(result, tuple) else (result,)
+        else:
+            return transform(sample)
+
     def forward(self, *inputs: Any) -> Any:
         return self.get_forward(self.policy['name'])(*inputs)
 
@@ -68,7 +91,7 @@ class Compose(T.Compose):
     def default_forward(self, *inputs: Any) -> Any:
         sample = inputs if len(inputs) > 1 else inputs[0]
         for transform in self.transforms:
-            sample = transform(sample)
+            sample = self._apply(transform, sample)
         return sample
 
     def stop_epoch_forward(self, *inputs: Any):
@@ -80,29 +103,28 @@ class Compose(T.Compose):
 
         if isinstance(policy_epoch, list) and len(policy_epoch) == 3:     # 4-stages
             if policy_epoch[0] <= cur_epoch < policy_epoch[1]:
-                with_mosaic = random.random() <= self.mosaic_prob       # Probility for Mosaic
+                with_mosaic = random.random() <= self.mosaic_prob
             else:
                 with_mosaic = False
             for transform in self.transforms:
-                if (type(transform).__name__ in policy_ops and cur_epoch < policy_epoch[0]):   # first stage: NoAug
+                if (type(transform).__name__ in policy_ops and cur_epoch < policy_epoch[0]):
                     pass
-                elif (type(transform).__name__ in policy_ops and cur_epoch >= policy_epoch[-1]):    # last stage: NoAug
+                elif (type(transform).__name__ in policy_ops and cur_epoch >= policy_epoch[-1]):
                     pass
                 else:
-                    # Using Mosaic for [policy_epoch[0], policy_epoch[1]] with probability
-                    if (type(transform).__name__ == 'Mosaic' and not with_mosaic):      
+                    if (type(transform).__name__ == 'Mosaic' and not with_mosaic):
                         pass
-                    # Mosaic and Zoomout/IoUCrop can not be co-existed in the same sample
-                    elif (type(transform).__name__ == 'RandomZoomOut' or type(transform).__name__ == 'RandomIoUCrop') and with_mosaic:      
+                    elif (type(transform).__name__ in ('RandomZoomOut', 'RandomIoUCrop')
+                          and with_mosaic):
                         pass
                     else:
-                        sample = transform(sample)
-        else:   # the default data scheduler
+                        sample = self._apply(transform, sample)
+        else:   # single stop-epoch threshold
             for transform in self.transforms:
                 if type(transform).__name__ in policy_ops and cur_epoch >= policy_epoch:
                     pass
                 else:
-                    sample = transform(sample)
+                    sample = self._apply(transform, sample)
 
         return sample
 
@@ -119,7 +141,7 @@ class Compose(T.Compose):
             if type(transform).__name__ in policy_ops and self.global_samples >= policy_sample:
                 pass
             else:
-                sample = transform(sample)
+                sample = self._apply(transform, sample)
 
         self.global_samples += 1
 
