@@ -36,14 +36,18 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     ema :ModelEMA = kwargs.get('ema', None)
     scaler :GradScaler = kwargs.get('scaler', None)
     lr_warmup_scheduler :Warmup = kwargs.get('lr_warmup_scheduler', None)
+    grad_accum: int = max(1, kwargs.get('grad_accum', 1))
 
     cur_iters = epoch * len(data_loader)
+    n_batches = len(data_loader)
+    optimizer.zero_grad()
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         global_step = epoch * len(data_loader) + i
-        metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
+        metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=n_batches)
+        is_update_step = (i + 1) % grad_accum == 0 or (i + 1) == n_batches
 
         if scaler is not None:
             with torch.autocast(device_type=str(device), cache_enabled=True):
@@ -54,9 +58,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 state = model.state_dict()
                 new_state = {}
                 for key, value in model.state_dict().items():
-                    # Replace 'module' with 'model' in each key
                     new_key = key.replace('module.', '')
-                    # Add the updated key-value pair to the state dictionary
                     state[new_key] = value
                 new_state['model'] = state
                 dist_utils.save_on_master(new_state, "./NaN.pth")
@@ -64,39 +66,40 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             with torch.autocast(device_type=str(device), enabled=False):
                 loss_dict = criterion(outputs, targets, **metas)
 
-            loss = sum(loss_dict.values())
+            loss = sum(loss_dict.values()) / grad_accum
             scaler.scale(loss).backward()
 
-            if max_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
+            if is_update_step:
+                if max_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
         else:
             outputs = model(samples, targets=targets)
             loss_dict = criterion(outputs, targets, **metas)
 
-            loss : torch.Tensor = sum(loss_dict.values())
-            optimizer.zero_grad()
+            loss : torch.Tensor = sum(loss_dict.values()) / grad_accum
             loss.backward()
 
-            if max_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            if is_update_step:
+                if max_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+                optimizer.step()
+                optimizer.zero_grad()
 
-            optimizer.step()
+        if is_update_step:
+            # ema
+            if ema is not None:
+                ema.update(model)
 
-        # ema
-        if ema is not None:
-            ema.update(model)
-
-        if self_lr_scheduler:
-            optimizer = lr_scheduler.step(cur_iters + i, optimizer)
-        else:
-            if lr_warmup_scheduler is not None:
-                lr_warmup_scheduler.step()
+            if self_lr_scheduler:
+                optimizer = lr_scheduler.step(cur_iters + i, optimizer)
+            else:
+                if lr_warmup_scheduler is not None:
+                    lr_warmup_scheduler.step()
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
         loss_value = sum(loss_dict_reduced.values())

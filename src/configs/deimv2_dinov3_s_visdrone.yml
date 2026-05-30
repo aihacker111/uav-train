@@ -202,6 +202,8 @@ flat_epoch: 20
 no_aug_epoch: 5
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
+grad_accum: 4
+
 use_amp: True
 use_ema: True
 ema:

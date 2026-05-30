@@ -34,6 +34,7 @@ import engine  # triggers all @register() decorators (backbone, deim, data, opti
 
 from engine.misc import dist_utils
 from engine.core import YAMLConfig, yaml_utils
+from engine.core.yaml_utils import merge_dict
 from engine.solver import TASKS   # {'detection': DetSolver, 'mot': MotSolver, ...}
 
 
@@ -43,9 +44,15 @@ def main(args) -> None:
     assert not all([args.tuning, args.resume]), \
         'Only one of --tuning / --resume at a time'
 
+    _cli_overrides = {'update', 'num_workers', 'batch_size'}
     update_dict = yaml_utils.parse_cli(args.update)
     update_dict.update({k: v for k, v in args.__dict__.items()
-                        if k not in ['update'] and v is not None})
+                        if k not in _cli_overrides and v is not None})
+
+    if args.num_workers is not None:
+        merge_dict(update_dict, {'train_dataloader': {'num_workers': args.num_workers}})
+    if args.batch_size is not None:
+        merge_dict(update_dict, {'train_dataloader': {'total_batch_size': args.batch_size}})
 
     cfg = YAMLConfig(args.config, **update_dict)
 
@@ -83,6 +90,9 @@ if __name__ == '__main__':
     parser.add_argument('--output-dir',      type=str)
     parser.add_argument('--summary-dir',     type=str)
     parser.add_argument('--test-only',       action='store_true', default=False)
+
+    parser.add_argument('--num-workers', type=int, default=None, help='train_dataloader num_workers')
+    parser.add_argument('--batch-size',  type=int, default=None, help='train_dataloader total_batch_size')
 
     # priority 1 — override any YAML key from CLI
     parser.add_argument('-u', '--update', nargs='+', help='override YAML keys, e.g. epoches=20')

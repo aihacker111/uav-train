@@ -159,6 +159,7 @@ class MotSolver(DetSolver):
                 scaler=self.scaler,
                 lr_warmup_scheduler=self.lr_warmup_scheduler,
                 writer=self.writer,
+                grad_accum=getattr(args, 'grad_accum', 1),
             )
 
             if not self.self_lr_scheduler:
