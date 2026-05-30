@@ -124,12 +124,6 @@ def distance2bbox(points, distance, reg_scale):
     x2 = points[..., 0] + (0.5 * reg_scale + distance[..., 2]) * (points[..., 2] / reg_scale)
     y2 = points[..., 1] + (0.5 * reg_scale + distance[..., 3]) * (points[..., 3] / reg_scale)
 
-    # Clamp to prevent inverted boxes: if predicted distances push x2 < x1 or y2 < y1
-    # (happens early in training when the distribution integral is very negative),
-    # snap to a degenerate box at the reference point rather than an invalid one.
-    x2 = torch.maximum(x2, x1)
-    y2 = torch.maximum(y2, y1)
-
     bboxes = torch.stack([x1, y1, x2, y2], -1)
 
     return box_xyxy_to_cxcywh(bboxes)

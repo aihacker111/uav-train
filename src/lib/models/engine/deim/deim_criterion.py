@@ -152,7 +152,6 @@ class DEIMCriterion(nn.Module):
         src_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
         losses = {}
-
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
@@ -275,7 +274,6 @@ class DEIMCriterion(nn.Module):
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets, epoch=epoch)['indices']
-        self._last_indices = indices  # cached for reid loss reuse — avoids a duplicate matcher call
         self._clear_cache()
 
         # Get the matching union set across all decoder layers.
@@ -312,7 +310,7 @@ class DEIMCriterion(nn.Module):
         # Compute all the requested losses, main loss
         losses = {}
         for loss in self.losses:
-            use_uni_set = self.use_uni_set
+            use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
             indices_in = indices_go if use_uni_set else indices
             num_boxes_in = num_boxes_go if use_uni_set else num_boxes
             meta = self.get_loss_meta_info(loss, outputs, targets, indices_in)
@@ -326,7 +324,7 @@ class DEIMCriterion(nn.Module):
                 if 'local' in self.losses:      # only work for local loss
                     aux_outputs['up'], aux_outputs['reg_scale'] = outputs['up'], outputs['reg_scale']
                 for loss in self.losses:
-                    use_uni_set = self.use_uni_set
+                    use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
                     indices_in = indices_go if use_uni_set else cached_indices[i]
                     num_boxes_in = num_boxes_go if use_uni_set else num_boxes
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
@@ -340,7 +338,7 @@ class DEIMCriterion(nn.Module):
         if 'pre_outputs' in outputs:
             aux_outputs = outputs['pre_outputs']
             for loss in self.losses:
-                use_uni_set = self.use_uni_set
+                use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
                 indices_in = indices_go if use_uni_set else cached_indices[-1]
                 num_boxes_in = num_boxes_go if use_uni_set else num_boxes
                 meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
@@ -404,6 +402,8 @@ class DEIMCriterion(nn.Module):
                     l_dict = {k + '_dn_pre': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
+        # For debugging Objects365 pre-train.
+        losses = {k:torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}
         return losses
 
     def get_loss_meta_info(self, loss, outputs, targets, indices):
@@ -411,15 +411,14 @@ class DEIMCriterion(nn.Module):
             return {}
 
         src_boxes = outputs['pred_boxes'][self._get_src_permutation_idx(indices)]
-        src_boxes = src_boxes.detach()
         target_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
 
         if self.boxes_weight_format == 'iou':
-            iou, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
+            iou, _ = box_iou(box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes))
             iou = torch.diag(iou)
         elif self.boxes_weight_format == 'giou':
             iou = torch.diag(generalized_box_iou(\
-                box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)))
+                box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes)))
         else:
             raise AttributeError()
 

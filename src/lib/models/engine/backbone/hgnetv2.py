@@ -559,12 +559,11 @@ class HGNetv2(nn.Module):
                     print(f"Loaded stage1 {name} HGNetV2 from local file.")
                 else:
                     # If the file doesn't exist locally, download from the URL
-                    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    if torch.distributed.get_rank() == 0:
                         print(GREEN + "If the pretrained HGNetV2 can't be downloaded automatically. Please check your network connection." + RESET)
                         print(GREEN + "Please check your network connection. Or download the model manually from " + RESET + f"{download_url}" + GREEN + " to " + RESET + f"{local_model_dir}." + RESET)
                         state = torch.hub.load_state_dict_from_url(download_url, map_location='cpu', model_dir=local_model_dir)
-                        if torch.distributed.is_initialized():
-                            torch.distributed.barrier()
+                        torch.distributed.barrier()
                     else:
                         torch.distributed.barrier()
                         state = torch.load(local_model_dir)
@@ -581,7 +580,7 @@ class HGNetv2(nn.Module):
                     self.load_state_dict(state)
 
             except (Exception, KeyboardInterrupt) as e:
-                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                if torch.distributed.get_rank() == 0:
                     print(f"{str(e)}")
                     logging.error(RED + "CRITICAL WARNING: Failed to load pretrained HGNetV2 model" + RESET)
                     logging.error(GREEN + "Please check your network connection. Or download the model manually from " \

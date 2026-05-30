@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# ── VisDrone class names (0-indexed, matching gen_dataset_visdrone.py) ─────────
+# ── VisDrone class names (0-indexed) ─────────────────────────────────────────
 VISDRONE_CLASSES = [
     'pedestrian', 'people', 'bicycle', 'car', 'van',
     'truck', 'tricycle', 'awning-tricycle', 'bus', 'motor',
