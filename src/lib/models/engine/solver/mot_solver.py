@@ -107,6 +107,11 @@ class MotSolver(DetSolver):
         if args.lrsheduler is not None:
             iter_per_epoch = len(self.train_dataloader)
             print(f'     ## Using Self-defined Scheduler-{args.lrsheduler} ##')
+            # FlatCosineLRScheduler reads group["initial_lr"] which PyTorch only
+            # sets when a standard lr_scheduler is used first. Set it manually.
+            for pg in self.optimizer.param_groups:
+                if 'initial_lr' not in pg:
+                    pg['initial_lr'] = pg['lr']
             self.lr_scheduler = FlatCosineLRScheduler(
                 self.optimizer, args.lr_gamma, iter_per_epoch,
                 total_epochs=args.epoches,
