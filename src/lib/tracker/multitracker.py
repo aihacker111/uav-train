@@ -414,7 +414,11 @@ class MCJDETracker(object):
         with torch.no_grad():
             output = self.model.forward(im_blob)
             # ECDetJDE postprocessor: returns per-class dets and reid embeddings
-            dets, cls_id_feats_t = self.postprocessor(output, orig_hw=(height, width))
+            dets, cls_id_feats_t = self.postprocessor(
+                output,
+                orig_hw=(height, width),
+                net_hw=(net_height, net_width),
+            )
 
         # Convert tensors to numpy for downstream tracker
         dets_np     = {cls_id: d.cpu().numpy() for cls_id, d in dets.items()}
