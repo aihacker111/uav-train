@@ -56,7 +56,7 @@ class opts(object):
                                  help='number of DETR object queries')
         self.parser.add_argument('--ecdet_hidden_dim', type=int, default=192)
         self.parser.add_argument('--ecdet_num_layers', type=int, default=4)
-        self.parser.add_argument('--ecdet_nhead', type=int, default=3)
+        self.parser.add_argument('--ecdet_nhead', type=int, default=8)
         self.parser.add_argument('--ecdet_dim_ff', type=int, default=512)
         self.parser.add_argument('--eval_spatial_size', type=int, nargs=2,
                                  default=[608, 1088], help='[H, W] for anchor pre-generation')

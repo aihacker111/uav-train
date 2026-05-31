@@ -86,14 +86,17 @@ def build_ecdet_jde(opt) -> ECDetJDE:
     )
 
     # --- Encoder ---
+    # expansion=0.67 → c4=64 (matches ECDet-S checkpoint)
+    # fuse_op='sum'  → c1=hidden_dim=192 (matches ECDet-S checkpoint, not cat which gives 384)
     encoder = HybridEncoder(
-        in_channels   = [hidden_dim] * 3,
-        feat_strides  = [8, 16, 32],
-        hidden_dim    = hidden_dim,
+        in_channels     = [hidden_dim] * 3,
+        feat_strides    = [8, 16, 32],
+        hidden_dim      = hidden_dim,
         use_encoder_idx = [1],
         dim_feedforward = dim_ff,
-        expansion     = 0.34,
-        depth_mult    = 0.5,
+        expansion       = 0.67,
+        depth_mult      = 0.67,
+        fuse_op         = 'sum',
     )
 
     # --- Decoder (ECTransformer with ReID head) ---
