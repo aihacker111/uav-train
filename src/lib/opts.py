@@ -56,8 +56,6 @@ class opts(object):
                                  help='path to full ECDet COCO checkpoint (.pth)')
         self.parser.add_argument('--eval_spatial_size', type=int, nargs=2,
                                  default=[608, 1088], help='[H, W] for anchor pre-generation')
-        self.parser.add_argument('--down_ratio', type=int, default=4,
-                                 help='kept for hm GT generation in dataset')
 
         # input
         self.parser.add_argument('--input_res', type=int, default=-1)
@@ -111,8 +109,6 @@ class opts(object):
         # loss
         self.parser.add_argument('--id_weight', type=float, default=1.0,
                                  help='weight for ReID loss (0 = detection only)')
-        self.parser.add_argument('--mse_loss', action='store_true',
-                                 help='use MSE (MSRA) gaussian for heatmap; default is CornerNet gaussian')
         self.parser.add_argument('--tri', action='store_true',
                                  help='add triplet loss to ReID')
 
@@ -172,12 +168,9 @@ class opts(object):
 
         input_h = opt.input_res if opt.input_res > 0 else input_h
         input_w = opt.input_res if opt.input_res > 0 else input_w
-        opt.input_h  = opt.input_h if opt.input_h > 0 else input_h
-        opt.input_w  = opt.input_w if opt.input_w > 0 else input_w
-        opt.output_h = opt.input_h // opt.down_ratio
-        opt.output_w = opt.input_w // opt.down_ratio
-        opt.input_res  = max(opt.input_h, opt.input_w)
-        opt.output_res = max(opt.output_h, opt.output_w)
+        opt.input_h   = opt.input_h if opt.input_h > 0 else input_h
+        opt.input_w   = opt.input_w if opt.input_w > 0 else input_w
+        opt.input_res = max(opt.input_h, opt.input_w)
 
         if opt.task == 'mot':
             if opt.id_weight > 0:

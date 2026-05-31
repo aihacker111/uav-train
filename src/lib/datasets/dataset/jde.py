@@ -17,7 +17,6 @@ from collections import OrderedDict, defaultdict
 # from torchvision.transforms import transforms as T
 # from cython_bbox import bbox_overlaps as bbox_ious
 # from lib.opts import opts
-from lib.utils.image import gaussian_radius, draw_umich_gaussian, draw_msra_gaussian
 from lib.utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 from lib.tracker.multitracker import id2cls
 
@@ -564,133 +563,31 @@ class JointDataset(LoadImagesAndLabels):  # for training
         imgs, labels, img_path, (input_h, input_w) = self.get_data(img_path, label_path)
         # print('input_h, input_w: %d %d' % (input_h, input_w))
 
-        # 存在多个子训练集时, 为每个子训练集合(视频seq)计算正确的起始index
-        # @even: for MCMOT training
+        # Remap track IDs to global offsets across sub-datasets
         if self.opt.id_weight > 0:
             for i, _ in enumerate(labels):
                 if labels[i, 1] > -1:
-                    cls_id = int(labels[i][0])
+                    cls_id    = int(labels[i][0])
                     start_idx = self.tid_start_idx_of_cls_ids[ds][cls_id]
                     labels[i, 1] += start_idx
 
-        output_h = imgs.shape[1] // self.opt.down_ratio  # 向下取整除法
-        output_w = imgs.shape[2] // self.opt.down_ratio
-        # print('output_h, output_w: %d %d' % (output_h, output_w))
-
-        # num_classes = self.num_classes
-
-        # 图片中实际标注的目标数
         num_objs = labels.shape[0]
 
-        # --- GT of detection
-        hm = np.zeros((self.num_classes, output_h, output_w), dtype=np.float32)  # C×H×W: heat-map通道数即类别数
-        wh = np.zeros((self.max_objs, 2), dtype=np.float32)
-        reg = np.zeros((self.max_objs, 2), dtype=np.float32)
-        ind = np.zeros((self.max_objs,), dtype=np.int64)  # K个object
-        reg_mask = np.zeros((self.max_objs,), dtype=np.uint8)  # 只计算feature map有目标的像素的reg loss
-
-        if self.opt.id_weight > 0:
-            # --- GT of ReID
-            ids = np.zeros((self.max_objs,), dtype=np.int64)  # 一张图最多检测并ReID K个目标, 都初始化id为0
-
-            # @even: 每个目标类别都对应一组track ids
-            cls_tr_ids = np.zeros((self.num_classes, output_h, output_w), dtype=np.int64)
-
-            # @even, class id map: 每个(x, y)处的目标类别, 都初始化为-1
-            cls_id_map = np.full((1, output_h, output_w), -1, dtype=np.int64)  # 1×H×W
-
-        # Gauss function definition
-        draw_gaussian = draw_msra_gaussian if self.opt.mse_loss else draw_umich_gaussian
-
-        # 遍历每一个ground truth检测目标
-        for k in range(num_objs):  # 图片中实际的目标个数
-            label = labels[k]
-
-            # 计算bbox的经过网络的输出GT值
-            #                       0        1        2       3
-            # .copy() breaks the numpy view so that the in-place pixel-scale
-            # conversion below does NOT mutate labels[k], which must stay
-            # normalized [0,1] for the DETR targets read after this loop.
-            bbox = label[2:].copy()  # center_x, center_y, bbox_w, bbox_h
-
-            # 检测目标的类别(索引从0开始, 0代表背景类别)
-            cls_id = int(label[0])
-
-            bbox[[0, 2]] = bbox[[0, 2]] * output_w
-            bbox[[1, 3]] = bbox[[1, 3]] * output_h
-            bbox[0] = np.clip(bbox[0], 0, output_w - 1)
-            bbox[1] = np.clip(bbox[1], 0, output_h - 1)
-
-            w, h = bbox[2], bbox[3]
-
-            if h > 0 and w > 0:
-                # heat-map radius
-                radius = gaussian_radius((math.ceil(h), math.ceil(w)))
-                radius = max(0, int(radius))  # radius >= 0
-                radius = self.opt.hm_gauss if self.opt.mse_loss else radius
-
-                # bbox center coordinate
-                ct = np.array([bbox[0], bbox[1]], dtype=np.float32)
-                ct_int = ct.astype(np.int32)  # floor int
-
-                # draw gauss weight for heat-map
-                draw_gaussian(hm[cls_id], ct_int, radius)  # hm
-
-                # --- GT of detection
-                wh[k] = float(w), float(h)
-
-                # 记录feature map上有目标的坐标索引
-                ind[k] = ct_int[1] * output_w + ct_int[0]  # feature map index:y*w+x
-
-                # offset regression
-                reg[k] = ct - ct_int
-                reg_mask[k] = 1
-
-                # --- GT of ReID
-                if self.opt.id_weight > 0:
-                    # @even: 取output feature map的每个(y, x)处的目标类别
-                    cls_id_map[0][ct_int[1], ct_int[0]] = cls_id  # 1×H×W
-
-                    # @even: 记录该类别对应的track ids
-                    cls_tr_ids[cls_id][ct_int[1]][ct_int[0]] = label[1] - 1  # track id从1开始的, 转换成从0开始
-
-                    ids[k] = label[1] - 1  # 分类的idx: track id - 1
-
-        # --- DETR-format targets (padded to max_objs for DataLoader collation)
-        detr_boxes     = np.zeros((self.max_objs, 4), dtype=np.float32)   # cxcywh normalized
-        detr_labels    = np.full((self.max_objs,), -1, dtype=np.int64)    # class id, -1=pad
-        detr_track_ids = np.full((self.max_objs,), -1, dtype=np.int64)    # global track id
+        # DETR-format targets: cxcywh normalized, padded to max_objs
+        detr_boxes     = np.zeros((self.max_objs, 4), dtype=np.float32)
+        detr_labels    = np.full((self.max_objs,),    -1, dtype=np.int64)
+        detr_track_ids = np.full((self.max_objs,),    -1, dtype=np.int64)
         for k in range(num_objs):
             lb = labels[k]
-            detr_boxes[k]     = lb[2:6]        # already cxcywh normalized
+            detr_boxes[k]     = lb[2:6]   # cxcywh normalized [0,1]
             detr_labels[k]    = int(lb[0])
             detr_track_ids[k] = int(lb[1])
 
-        if self.opt.id_weight > 0:
-            ret = {'input': imgs,
-                   'hm': hm,
-                   'reg': reg,
-                   'wh': wh,
-                   'ind': ind,
-                   'reg_mask': reg_mask,
-                   'ids': ids,
-                   'cls_id_map': cls_id_map,
-                   'cls_tr_ids': cls_tr_ids,
-                   'detr_boxes': detr_boxes,
-                   'detr_labels': detr_labels,
-                   'detr_track_ids': detr_track_ids,
-                   'detr_num_objs': np.array(num_objs, dtype=np.int64)}
-        else:
-            ret = {'input': imgs,
-                   'hm': hm,
-                   'reg': reg,
-                   'wh': wh,
-                   'ind': ind,
-                   'reg_mask': reg_mask,
-                   'detr_boxes': detr_boxes,
-                   'detr_labels': detr_labels,
-                   'detr_track_ids': detr_track_ids,
-                   'detr_num_objs': np.array(num_objs, dtype=np.int64)}
-
-        return ret
+        return {
+            'input':          imgs,
+            'detr_boxes':     detr_boxes,
+            'detr_labels':    detr_labels,
+            'detr_track_ids': detr_track_ids,
+            'detr_num_objs':  np.array(num_objs, dtype=np.int64),
+        }
 
