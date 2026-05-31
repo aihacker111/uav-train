@@ -69,46 +69,13 @@ class opts(object):
                                  help='base learning rate (AdamW)')
         self.parser.add_argument('--weight_decay', type=float, default=1e-4)
         self.parser.add_argument('--lr_step', type=str, default='10,20',
-                                 help='epochs to drop LR by 10x (only used when --lr_scheduler=step)')
-        self.parser.add_argument('--lr_scheduler', default='flatcosine',
-                                 help='flatcosine | step')
-        self.parser.add_argument('--lr_gamma', type=float, default=0.5,
-                                 help='FlatCosine: min_lr = base_lr * lr_gamma')
-        self.parser.add_argument('--warmup_iter', type=int, default=2000,
-                                 help='FlatCosine: linear warmup iterations')
-        self.parser.add_argument('--flat_epoch', type=int, default=-1,
-                                 help='FlatCosine: epochs at peak LR (-1 = use mosaic_epoch from dataset)')
-        self.parser.add_argument('--no_aug_epochs', type=int, default=2,
-                                 help='FlatCosine: trailing epochs at min_lr')
+                                 help='epochs to drop LR by 10x')
 
-        # ---- Augmentation schedule (EdgeCrafter ecdet_s best values) ----
-        # Mosaic
-        self.parser.add_argument('--mosaic_prob',      type=float, default=0.5,
-                                 help='probability of Mosaic per sample (ecdet_s: 0.75)')
-        self.parser.add_argument('--mosaic_epoch',     type=int,   default=25,
-                                 help='epoch to stop Mosaic; ~num_epochs//2')
-        self.parser.add_argument('--mosaic_rotation',  type=float, default=10.0,
-                                 help='Mosaic affine rotation range ±deg')
-        self.parser.add_argument('--mosaic_translate', type=float, default=0.1,
-                                 help='Mosaic affine translate fraction ±')
-        self.parser.add_argument('--mosaic_scale_lo',  type=float, default=0.5,
-                                 help='Mosaic affine min scale')
-        self.parser.add_argument('--mosaic_scale_hi',  type=float, default=1.5,
-                                 help='Mosaic affine max scale')
-        self.parser.add_argument('--mosaic_max_cached',type=int,   default=50,
-                                 help='Mosaic image cache size')
-        # PhotoDistort
-        self.parser.add_argument('--photodistort_prob',type=float, default=0.5,
-                                 help='probability of photometric distortion per sample')
-        # ZoomOut
-        self.parser.add_argument('--zoomout_max_scale',type=float, default=4.0,
-                                 help='RandomZoomOut max canvas scale factor')
-        # IoUCrop
-        self.parser.add_argument('--iou_crop_prob',    type=float, default=0.8,
-                                 help='probability of SSD IoU crop per sample')
-        # Schedule
-        self.parser.add_argument('--stop_epoch',       type=int,   default=48,
-                                 help='epoch to disable all strong aug; num_epochs-2')
+        # ---- Augmentation (AMOT / JDE style) ----
+        self.parser.add_argument('--hsv_fraction', type=float, default=0.5,
+                                 help='HSV S/V scale range: factor in [1-f, 1+f]')
+        self.parser.add_argument('--stop_epoch', type=int, default=-1,
+                                 help='epoch to disable aug (-1 = num_epochs, i.e. always on)')
         self.parser.add_argument('--num_epochs', type=int, default=30)
         self.parser.add_argument('--batch_size', type=int, default=8)
         self.parser.add_argument('--master_batch_size', type=int, default=-1)

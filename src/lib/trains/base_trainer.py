@@ -28,7 +28,6 @@ class BaseTrainer(object):
     def __init__(self, opt, model, optimizer=None, **kwargs):
         self.opt = opt
         self.optimizer = optimizer
-        self.lr_scheduler = kwargs.get('lr_scheduler', None)
         self.loss_stats, self.loss = self._get_losses(opt)
 
         # Subclasses can override _build_model_with_loss for custom wrappers
@@ -124,9 +123,6 @@ class BaseTrainer(object):
                 if (batch_i + 1) % accum == 0 or is_last:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-                    if self.lr_scheduler is not None:
-                        global_iter = (epoch - 1) * num_iters + batch_i
-                        self.lr_scheduler.step(global_iter, self.optimizer)
 
             batch_time.update(time.time() - end)
             end = time.time()

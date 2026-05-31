@@ -18,7 +18,6 @@ from lib.models.data_parallel import DataParallel
 from lib.logger import Logger
 from lib.datasets.dataset_factory import get_dataset
 from lib.trains.train_factory import train_factory
-from lib.optim import FlatCosineLRScheduler
 
 
 def build_optimizer(model, opt):
@@ -64,32 +63,6 @@ def build_optimizer(model, opt):
         weight_decay=weight_decay,
     )
     return optimizer
-
-
-def build_lr_scheduler(optimizer, opt, iter_per_epoch):
-    """
-    FlatCosineLRScheduler if --lr_scheduler=flatcosine, else None (step-decay handled in epoch loop).
-    """
-    if opt.lr_scheduler != 'flatcosine':
-        return None
-
-    flat_epochs    = opt.flat_epoch if opt.flat_epoch >= 0 else max(1, opt.num_epochs // 5)
-    no_aug_epochs  = opt.no_aug_epochs
-    warmup_iter    = min(opt.warmup_iter, 3 * iter_per_epoch)
-
-    print(
-        f'FlatCosineLRScheduler: lr={opt.lr}, lr_gamma={opt.lr_gamma}, '
-        f'warmup_iter={warmup_iter}, flat_epochs={flat_epochs}, no_aug_epochs={no_aug_epochs}'
-    )
-    return FlatCosineLRScheduler(
-        optimizer,
-        lr_gamma      = opt.lr_gamma,
-        iter_per_epoch= iter_per_epoch,
-        total_epochs  = opt.num_epochs,
-        warmup_iter   = warmup_iter,
-        flat_epochs   = flat_epochs,
-        no_aug_epochs = no_aug_epochs,
-    )
 
 
 def run(opt):
@@ -145,10 +118,6 @@ def run(opt):
     trainer = Trainer(opt=opt, model=model, optimizer=optimizer)
     trainer.set_device(opt.gpus, opt.chunk_sizes, opt.device)
 
-    # Build lr_scheduler AFTER trainer.__init__ so add_param_group (loss params) is already done
-    lr_scheduler = build_lr_scheduler(optimizer, opt, iter_per_epoch=len(train_loader))
-    trainer.lr_scheduler = lr_scheduler
-
     for epoch in range(start_epoch + 1, opt.num_epochs + 1):
         mark = epoch if opt.save_all else 'last'
 
@@ -170,8 +139,7 @@ def run(opt):
                        epoch, model, optimizer)
         logger.write('\n')
 
-        # step-decay fallback (only when not using FlatCosine)
-        if lr_scheduler is None and epoch in opt.lr_step:
+        if epoch in opt.lr_step:
             save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)),
                        epoch, model, optimizer)
             lr = opt.lr * (0.1 ** (opt.lr_step.index(epoch) + 1))

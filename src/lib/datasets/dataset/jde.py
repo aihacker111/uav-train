@@ -14,10 +14,7 @@ import torch
 from collections import OrderedDict, defaultdict
 from lib.utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 from lib.tracker.multitracker import id2cls
-from lib.datasets.augment import (
-    MosaicAugmentor, photometric_distort,
-    random_zoom_out, random_iou_crop, sanitize_boxes,
-)
+from lib.datasets.augment import augment_hsv, cxcywh_to_xyxy
 
 # ImageNet mean/std (matching EdgeCrafter's Normalize op)
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -538,26 +535,14 @@ class JointDataset(LoadImagesAndLabels):  # for training
         self.augment = augment
         self.transforms = transforms
 
-        # ---- EdgeCrafter-style augmentation schedule ----
-        self.cur_epoch         = 0
-        self.mosaic_prob       = getattr(opt, 'mosaic_prob',       0.5)
-        self.mosaic_epoch      = getattr(opt, 'mosaic_epoch',      25)
-        self.stop_epoch        = getattr(opt, 'stop_epoch',        48)
-        self.photodistort_prob = getattr(opt, 'photodistort_prob', 0.5)
-        self.zoomout_max_scale = getattr(opt, 'zoomout_max_scale', 4.0)
-        self.iou_crop_prob     = getattr(opt, 'iou_crop_prob',     0.8)
-
-        tile_size = min(self.height, self.width) // 2
-        self.mosaic_augmentor = MosaicAugmentor(
-            output_size = tile_size,
-            max_cached  = getattr(opt, 'mosaic_max_cached',  50),
-            random_pop  = True,
-            rotation    = getattr(opt, 'mosaic_rotation',    10.0),
-            translation = (getattr(opt, 'mosaic_translate',  0.1),) * 2,
-            scaling     = (getattr(opt, 'mosaic_scale_lo',   0.5),
-                           getattr(opt, 'mosaic_scale_hi',   1.5)),
-            fill        = 114,
-        )
+        # ---- AMOT-style augmentation (optional epoch cutoff) ----
+        self.cur_epoch    = 0
+        stop_epoch        = getattr(opt, 'stop_epoch', -1)
+        self.stop_epoch   = opt.num_epochs if stop_epoch < 0 else stop_epoch
+        self.hsv_fraction = getattr(opt, 'hsv_fraction', 0.5)
+        self.affine_degrees    = (-5, 5)
+        self.affine_translate  = (0.10, 0.10)
+        self.affine_scale      = (0.50, 1.20)
 
         print('dataset summary')
         print(self.tid_num)
@@ -614,10 +599,40 @@ class JointDataset(LoadImagesAndLabels):  # for training
         out[:, 3] = (labels[:, 3] * orig_h * ratio + pad_h) / self.height
         out[:, 4] = labels[:, 4] * orig_w * ratio / self.width
         out[:, 5] = labels[:, 5] * orig_h * ratio / self.height
-        return sanitize_boxes(out, self.width, self.height)
+        return out
+
+    def _affine_labels(self, img, labels):
+        """Random affine on letterboxed image; labels are cxcywh normalized."""
+        if len(labels) == 0:
+            img = random_affine(
+                img, None,
+                degrees=self.affine_degrees,
+                translate=self.affine_translate,
+                scale=self.affine_scale,
+            )
+            return img, labels
+
+        targets = labels.copy()
+        targets[:, 2:6] = cxcywh_to_xyxy(labels[:, 2:6], self.width, self.height)
+        img, targets, _ = random_affine(
+            img, targets,
+            degrees=self.affine_degrees,
+            translate=self.affine_translate,
+            scale=self.affine_scale,
+        )
+        if len(targets) == 0:
+            return img, targets
+
+        out = targets.copy()
+        out[:, 2:6] = xyxy2xywh(targets[:, 2:6].copy())
+        out[:, 2] /= self.width
+        out[:, 3] /= self.height
+        out[:, 4] /= self.width
+        out[:, 5] /= self.height
+        return img, out
 
     # ------------------------------------------------------------------
-    # Main __getitem__ with EdgeCrafter augmentation schedule
+    # Main __getitem__ with AMOT augmentation (HSV → letterbox → affine → flip)
     # ------------------------------------------------------------------
 
     def __getitem__(self, idx):
@@ -633,48 +648,21 @@ class JointDataset(LoadImagesAndLabels):  # for training
         img, labels = self._load_raw(img_path, label_path)
         orig_h, orig_w = img.shape[:2]
 
-        # NOTE: do NOT remap track IDs here.  The MosaicAugmentor caches raw
-        # (img, labels) tuples; if we remapped before pushing to the cache,
-        # tiles replayed from the cache in future calls would be remapped a
-        # second time by the block below, corrupting every ReID target.
-        # The single authoritative remap happens AFTER all augmentation.
+        # NOTE: do NOT remap track IDs here.  Remap once after all augmentation.
 
-        epoch       = self.cur_epoch
-        with_mosaic = (self.augment and
-                       self.mosaic_prob > 0 and
-                       epoch < self.mosaic_epoch and
-                       random.random() < self.mosaic_prob)
-
-        if not self.augment:
-            # ---- validation / no-aug path ----
-            mosaic_dstags = None
-
-        elif with_mosaic:
-            # ---- Mosaic path ----
-            # Pass `ds` so the augmentor can tag each cached tile with its origin
-            # dataset key. The returned ds_tags tells us the correct start_idx for
-            # every surviving label row, even when tiles come from other sub-datasets.
-            img, labels, mosaic_dstags = self.mosaic_augmentor(img, labels, ds=ds)
-            img            = photometric_distort(img, p=self.photodistort_prob)
-            orig_h, orig_w = img.shape[:2]
-
-        elif epoch < self.stop_epoch:
-            # ---- Strong aug path (no mosaic) ----
-            mosaic_dstags  = None   # no cross-dataset mixing in this path
-            img            = photometric_distort(img, p=self.photodistort_prob)
-            img, labels    = random_zoom_out(img, labels, fill=114,
-                                             max_scale=self.zoomout_max_scale)
-            img, labels    = random_iou_crop(img, labels, p=self.iou_crop_prob)
-            orig_h, orig_w = img.shape[:2]
-
-        # else: epoch >= stop_epoch → clean path, no augmentation
+        do_aug = self.augment and self.cur_epoch < self.stop_epoch
+        if do_aug:
+            augment_hsv(img, fraction=self.hsv_fraction)
 
         # ---- letterbox to network input size ----
         img, ratio, pad_w, pad_h = letterbox(img, height=self.height, width=self.width)
         labels = self._letterbox_labels(labels, orig_w, orig_h, ratio, pad_w, pad_h)
 
+        if do_aug:
+            img, labels = self._affine_labels(img, labels)
+
         # ---- random horizontal flip ----
-        if self.augment and random.random() > 0.5:
+        if do_aug and random.random() > 0.5:
             img = np.fliplr(img)
             if len(labels) > 0:
                 labels[:, 2] = 1 - labels[:, 2]
@@ -685,14 +673,10 @@ class JointDataset(LoadImagesAndLabels):  # for training
         img = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
 
         # ---- remap track IDs to global offsets (single, authoritative remap) ----
-        # Applied once here, after all augmentation and letterboxing.
-        # For mosaic samples, labels may contain rows from different sub-datasets;
-        # mosaic_dstags carries the correct dataset key for each row.
-        # For all other paths every row belongs to `ds`.
         if self.opt.id_weight > 0 and len(labels) > 0:
             for i in range(len(labels)):
                 if labels[i, 1] > -1:
-                    row_ds    = mosaic_dstags[i] if mosaic_dstags is not None else ds
+                    row_ds    = ds
                     cls_id    = int(labels[i][0])
                     start_idx = self.tid_start_idx_of_cls_ids[row_ds].get(cls_id, 0)
                     labels[i, 1] += start_idx
@@ -705,7 +689,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
                     )
 
         # ---- pack DETR-format targets ----
-        num_objs       = min(len(labels), self.max_objs)   # mosaic can exceed K
+        num_objs       = min(len(labels), self.max_objs)
         detr_boxes     = np.zeros((self.max_objs, 4), dtype=np.float32)
         detr_labels    = np.full((self.max_objs,), -1, dtype=np.int64)
         detr_track_ids = np.full((self.max_objs,), -1, dtype=np.int64)
