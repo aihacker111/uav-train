@@ -422,7 +422,7 @@ class ViTAdapter(nn.Module):
             raise ValueError(f"Unknown model name: {self.name}. Available: {list(self.ecvit_url)}")
         url = self.ecvit_url[self.name]
         
-        if weights_path is None:
+        if not weights_path:
             print(
                 "="*80 + "\n",
                 "❌❌❌ WARNING: Pretrained ViT weights not loaded! ❌❌❌\n"
