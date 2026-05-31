@@ -1,5 +1,3 @@
-# encoding=utf-8
-
 import os
 import copy
 import numpy as np
@@ -357,21 +355,36 @@ def gen_track_dataset(src_root, dst_root, viz_root=None):
     print('Total {:d} frames'.format(frame_cnt))
 
 if __name__ == '__main__':
-    # gen_track_dataset(src_root='/media/jianbo/ioe/UVAdata/visdrone2019/VisDrone2019-MOT-train',
-    #                   dst_root='/media/jianbo/ioe/UVAdata/VisDrone2019',
-    # #                   viz_root=None)
-    # gen_track_dataset(src_root='/media/jianbo/ioe/UAVdata/visdrone2019/VisDrone2019-MOT-val',
-    #                   dst_root='/media/jianbo/ioe/UAVdata/VisDrone2019/val111',
-    #                   viz_root='/media/jianbo/ioe/UAVdata/VisDrone2019_vis/val')
-    gen_track_dataset(src_root='/media/jianbo/ioe/UAVdata/visdrone2019/VisDrone2019-MOT-test-dev',
-                      dst_root='/media/jianbo/ioe/UAVdata/VisDrone2019/test_dev111',
-                      viz_root='/media/jianbo/ioe/UAVdata/VisDrone2019_vis/test_dev')
-    # gen_track_dataset(src_root='/media/jianbo/ioe/UVAdata/visdrone2019/VisDrone2019-MOT-test-challenge',
-    #                   dst_root='/media/jianbo/ioe/UVAdata/VisDrone2019/test_challenge',
-    #                   viz_root=None)
-    # gen_dot_train_file(data_root='/media/jianbo/ioe/UVAdata/', rel_path='VisDrone2019/train/images',
-    #                   out_root='/media/jianbo/ioe/UVAdata/', f_name='VisDrone.train')
-    # gen_dot_train_file(data_root='/media/jianbo/ioe/UVAdata/', rel_path='VisDrone2019/val/images',
-    #                    out_root='/media/jianbo/ioe/UVAdata/', f_name='VisDrone.val')
-    # gen_dot_train_file(data_root='/media/jianbo/ioe/UVAdata/', rel_path='VisDrone2019/test_dev/images',
-    #                    out_root='/media/jianbo/ioe/UVAdata/', f_name='VisDrone.test')
+    DATASET_ROOT   = '/mnt/hps/tinvna_workspace/public-datasets/visdrone2019'
+    CONVERTED_ROOT = '/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019'
+
+    # Step 1: Convert train set  → CONVERTED_ROOT/train/images/ + labels_with_ids/
+    gen_track_dataset(
+        src_root=f'{DATASET_ROOT}/VisDrone2019-MOT-train',
+        dst_root=f'{CONVERTED_ROOT}/train',
+        viz_root=None,
+    )
+
+    # Step 2: Convert val set    → CONVERTED_ROOT/val/images/ + labels_with_ids/
+    gen_track_dataset(
+        src_root=f'{DATASET_ROOT}/VisDrone2019-MOT-val',
+        dst_root=f'{CONVERTED_ROOT}/val',
+        viz_root=None,
+    )
+
+    # Step 3: Generate index files
+    # Lines in .train will be:  train/images/<seq>/<frame>.jpg
+    # Full path = root (from JSON) + '/' + line = CONVERTED_ROOT/train/images/<seq>/<frame>.jpg
+    gen_dot_train_file(
+        data_root=f'{CONVERTED_ROOT}/',   # trailing slash — used as strip prefix
+        rel_path='train/images',          # no leading slash
+        out_root=CONVERTED_ROOT,
+        f_name='VisDrone.train',
+    )
+
+    gen_dot_train_file(
+        data_root=f'{CONVERTED_ROOT}/',
+        rel_path='val/images',
+        out_root=CONVERTED_ROOT,
+        f_name='VisDrone.val',
+    )
