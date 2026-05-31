@@ -633,14 +633,11 @@ class JointDataset(LoadImagesAndLabels):  # for training
         img, labels = self._load_raw(img_path, label_path)
         orig_h, orig_w = img.shape[:2]
 
-        # Remap track IDs to global offsets BEFORE mosaic so that cached tiles
-        # from other sub-datasets carry the correct IDs when they are replayed.
-        if self.opt.id_weight > 0 and len(labels) > 0:
-            for i in range(len(labels)):
-                if labels[i, 1] > -1:
-                    cls_id    = int(labels[i][0])
-                    start_idx = self.tid_start_idx_of_cls_ids[ds].get(cls_id, 0)
-                    labels[i, 1] += start_idx
+        # NOTE: do NOT remap track IDs here.  The MosaicAugmentor caches raw
+        # (img, labels) tuples; if we remapped before pushing to the cache,
+        # tiles replayed from the cache in future calls would be remapped a
+        # second time by the block below, corrupting every ReID target.
+        # The single authoritative remap happens AFTER all augmentation.
 
         epoch       = self.cur_epoch
         with_mosaic = (self.augment and
@@ -650,16 +647,20 @@ class JointDataset(LoadImagesAndLabels):  # for training
 
         if not self.augment:
             # ---- validation / no-aug path ----
-            pass
+            mosaic_dstags = None
 
         elif with_mosaic:
             # ---- Mosaic path ----
-            img, labels    = self.mosaic_augmentor(img, labels)
+            # Pass `ds` so the augmentor can tag each cached tile with its origin
+            # dataset key. The returned ds_tags tells us the correct start_idx for
+            # every surviving label row, even when tiles come from other sub-datasets.
+            img, labels, mosaic_dstags = self.mosaic_augmentor(img, labels, ds=ds)
             img            = photometric_distort(img, p=self.photodistort_prob)
             orig_h, orig_w = img.shape[:2]
 
         elif epoch < self.stop_epoch:
             # ---- Strong aug path (no mosaic) ----
+            mosaic_dstags  = None   # no cross-dataset mixing in this path
             img            = photometric_distort(img, p=self.photodistort_prob)
             img, labels    = random_zoom_out(img, labels, fill=114,
                                              max_scale=self.zoomout_max_scale)
@@ -683,13 +684,25 @@ class JointDataset(LoadImagesAndLabels):  # for training
         img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
         img = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
 
-        # ---- remap track IDs to global offsets ----
+        # ---- remap track IDs to global offsets (single, authoritative remap) ----
+        # Applied once here, after all augmentation and letterboxing.
+        # For mosaic samples, labels may contain rows from different sub-datasets;
+        # mosaic_dstags carries the correct dataset key for each row.
+        # For all other paths every row belongs to `ds`.
         if self.opt.id_weight > 0 and len(labels) > 0:
             for i in range(len(labels)):
                 if labels[i, 1] > -1:
+                    row_ds    = mosaic_dstags[i] if mosaic_dstags is not None else ds
                     cls_id    = int(labels[i][0])
-                    start_idx = self.tid_start_idx_of_cls_ids[ds].get(cls_id, 0)
+                    start_idx = self.tid_start_idx_of_cls_ids[row_ds].get(cls_id, 0)
                     labels[i, 1] += start_idx
+                    # Sanity check: remapped ID must be within the known pool
+                    assert labels[i, 1] <= self.nID_dict.get(cls_id, 0), (
+                        f"Remapped track id {int(labels[i, 1])} exceeds "
+                        f"nID_dict[{cls_id}]={self.nID_dict.get(cls_id, 0)} "
+                        f"(row_ds={row_ds}, raw_tid={int(labels[i,1]) - start_idx}, "
+                        f"start_idx={start_idx})"
+                    )
 
         # ---- pack DETR-format targets ----
         num_objs       = min(len(labels), self.max_objs)   # mosaic can exceed K

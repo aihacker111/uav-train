@@ -182,8 +182,16 @@ class MosaicAugmentor:
     Each tile is letterboxed to `output_size × output_size` and arranged in a 2×2 grid.
     An affine transform (rotation, translate, scale) is applied on the combined canvas.
 
-    img: numpy BGR uint8 (H, W, 3)
-    labels: (N, 6) [cls, tid, cx, cy, w, h] normalized
+    img    : numpy BGR uint8 (H, W, 3)
+    labels : (N, 6) [cls, tid, cx, cy, w, h] normalized  — raw (un-remapped) IDs
+    ds     : dataset-key string for the current sample
+
+    Returns
+    -------
+    canvas     : (2s, 2s, 3) uint8
+    all_labels : (M, 6) float32  — still raw IDs; caller does the single remap
+    ds_tags    : list[str] length M  — dataset key per surviving label row so the
+                 caller can apply the correct per-dataset start_idx offset
     """
 
     def __init__(self, output_size=304, max_cached=50, random_pop=True,
@@ -195,7 +203,8 @@ class MosaicAugmentor:
         self.translation = translation
         self.scaling     = scaling
         self.fill        = fill
-        self.cache       = []          # list of (img_s×s, labels_norm)
+        # each entry: (tile img s×s, labels_norm (N,6), ds_key str)
+        self.cache       = []
 
     # ------------------------------------------------------------------
 
@@ -221,7 +230,12 @@ class MosaicAugmentor:
         return tile, labels
 
     def _affine(self, img, labels):
-        """RandomAffine on the mosaic canvas (matching EdgeCrafter params)."""
+        """RandomAffine on the mosaic canvas (matching EdgeCrafter params).
+
+        Returns (img, labels, keep_indices) where keep_indices is an int array
+        of the original row positions that survived sanitize_boxes, so callers
+        can propagate per-row metadata (e.g. ds_tags) through the filter.
+        """
         h, w = img.shape[:2]
         angle = random.uniform(-self.rotation, self.rotation)
         scale = random.uniform(*self.scaling)
@@ -234,6 +248,7 @@ class MosaicAugmentor:
         img = cv2.warpAffine(img, R, (w, h), flags=cv2.INTER_LINEAR,
                               borderValue=(self.fill,) * 3)
 
+        keep_indices = np.arange(len(labels), dtype=np.int64)  # default: all kept
         if len(labels) > 0:
             boxes = cxcywh_to_xyxy(labels[:, 2:6], w, h)
             n = len(boxes)
@@ -247,37 +262,60 @@ class MosaicAugmentor:
             new_boxes = np.stack([xs.min(1), ys.min(1), xs.max(1), ys.max(1)], axis=1)
             out = labels.copy()
             out[:, 2:6] = xyxy_to_cxcywh(new_boxes, w, h)
-            labels = sanitize_boxes(out, w, h)
 
-        return img, labels
+            # Replicate sanitize_boxes logic but track which rows survive
+            tmp_boxes = cxcywh_to_xyxy(out[:, 2:6], w, h)
+            np.clip(tmp_boxes[:, [0, 2]], 0, w, out=tmp_boxes[:, [0, 2]])
+            np.clip(tmp_boxes[:, [1, 3]], 0, h, out=tmp_boxes[:, [1, 3]])
+            bw = tmp_boxes[:, 2] - tmp_boxes[:, 0]
+            bh = tmp_boxes[:, 3] - tmp_boxes[:, 1]
+            keep_mask = (bw >= 2) & (bh >= 2)
+            keep_indices = np.where(keep_mask)[0]
+
+            if keep_mask.any():
+                out = out[keep_mask].copy()
+                out[:, 2:6] = xyxy_to_cxcywh(tmp_boxes[keep_mask], w, h)
+                labels = out
+            else:
+                labels = np.zeros((0, labels.shape[1]), dtype=labels.dtype)
+
+        return img, labels, keep_indices
 
     # ------------------------------------------------------------------
 
-    def __call__(self, img, labels):
+    def __call__(self, img, labels, ds=''):
         s = self.output_size
         ncols = labels.shape[1] if len(labels) else 6
 
-        # letterbox current sample → push to cache
+        # letterbox current sample → push to cache (raw IDs, original ds tag)
         tile, tile_lbl = self._letterbox_to_tile(img, labels)
-        self.cache.append((tile.copy(), tile_lbl.copy() if len(tile_lbl) else tile_lbl))
+        self.cache.append((
+            tile.copy(),
+            tile_lbl.copy() if len(tile_lbl) else tile_lbl,
+            ds,               # ← store the dataset key alongside each cached tile
+        ))
         if len(self.cache) > self.max_cached:
             idx = random.randint(0, len(self.cache) - 2) if self.random_pop else 0
             self.cache.pop(idx)
 
-        # sample 3 others from cache
-        idxs  = random.choices(range(len(self.cache)), k=3)
-        tiles  = [(tile, tile_lbl)] + [
-            (self.cache[i][0].copy(),
-             self.cache[i][1].copy() if len(self.cache[i][1]) else self.cache[i][1])
+        # sample 3 others from cache; each entry is (tile_img, tile_lbl, tile_ds)
+        idxs = random.choices(range(len(self.cache)), k=3)
+        tiles = [(tile, tile_lbl, ds)] + [
+            (
+                self.cache[i][0].copy(),
+                self.cache[i][1].copy() if len(self.cache[i][1]) else self.cache[i][1],
+                self.cache[i][2],         # ← pass through the original ds key
+            )
             for i in idxs
         ]
 
         # build 2×2 canvas
-        canvas  = np.full((s * 2, s * 2, 3), self.fill, dtype=np.uint8)
-        offsets = [(0, 0), (s, 0), (0, s), (s, s)]   # (x_off, y_off)
-        merged  = []
+        canvas       = np.full((s * 2, s * 2, 3), self.fill, dtype=np.uint8)
+        offsets      = [(0, 0), (s, 0), (0, s), (s, s)]   # (x_off, y_off)
+        merged       = []
+        merged_dstag = []   # one ds string per label row, parallel to merged rows
 
-        for (x_off, y_off), (t_img, t_lbl) in zip(offsets, tiles):
+        for (x_off, y_off), (t_img, t_lbl, t_ds) in zip(offsets, tiles):
             canvas[y_off:y_off + s, x_off:x_off + s] = t_img
             if len(t_lbl) > 0:
                 lbl = t_lbl.copy()
@@ -286,9 +324,22 @@ class MosaicAugmentor:
                 lbl[:, 4] /= 2
                 lbl[:, 5] /= 2
                 merged.append(lbl)
+                merged_dstag.extend([t_ds] * len(lbl))
 
         all_labels = (np.concatenate(merged) if merged
                       else np.zeros((0, ncols), dtype=np.float32))
+        # _affine returns keep_indices: positions in all_labels that survived
+        canvas, all_labels, keep_indices = self._affine(canvas, all_labels)
 
-        canvas, all_labels = self._affine(canvas, all_labels)
-        return canvas, all_labels
+        # propagate ds_tags through the affine row filter
+        if len(merged_dstag) > 0:
+            all_dstags = [merged_dstag[k] for k in keep_indices]
+        else:
+            all_dstags = []
+
+        # safety: lengths must match
+        assert len(all_dstags) == len(all_labels), (
+            f"ds_tags length {len(all_dstags)} != labels length {len(all_labels)}"
+        )
+
+        return canvas, all_labels, all_dstags

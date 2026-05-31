@@ -633,6 +633,15 @@ class JointDataset(LoadImagesAndLabels):  # for training
         img, labels = self._load_raw(img_path, label_path)
         orig_h, orig_w = img.shape[:2]
 
+        # Remap track IDs to global offsets BEFORE mosaic so that cached tiles
+        # from other sub-datasets carry the correct IDs when they are replayed.
+        if self.opt.id_weight > 0 and len(labels) > 0:
+            for i in range(len(labels)):
+                if labels[i, 1] > -1:
+                    cls_id    = int(labels[i][0])
+                    start_idx = self.tid_start_idx_of_cls_ids[ds].get(cls_id, 0)
+                    labels[i, 1] += start_idx
+
         epoch       = self.cur_epoch
         with_mosaic = (self.augment and
                        self.mosaic_prob > 0 and
