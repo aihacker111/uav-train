@@ -111,6 +111,8 @@ class opts(object):
         # loss
         self.parser.add_argument('--id_weight', type=float, default=1.0,
                                  help='weight for ReID loss (0 = detection only)')
+        self.parser.add_argument('--mse_loss', action='store_true',
+                                 help='use MSE (MSRA) gaussian for heatmap; default is CornerNet gaussian')
         self.parser.add_argument('--tri', action='store_true',
                                  help='add triplet loss to ReID')
 
