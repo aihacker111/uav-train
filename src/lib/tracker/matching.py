@@ -627,10 +627,11 @@ def fuse_motion(kf,
 
 def reid_motion_lost_det(track, id_feature, reg,
                          h_out, w_out, height, width):
-    # ECDetJDE stores sparse reid dicts; return track's own center so dist=0 (IOU still gates re-activation)
+    # ECDetJDE stores sparse reid dicts; spatial-attention motion not available.
+    # Return a large distance to fail the dist<=3 check so lost tracks are NOT
+    # re-activated via this path — they time out through max_time_lost instead.
     if len(id_feature) < 2 or isinstance(id_feature[-1], dict):
-        x, y, w, h = track.tlwh
-        return np.array([[x + w / 2.0, y + h / 2.0]], dtype=np.float32)
+        return np.array([[1e9, 1e9]], dtype=np.float32)
     track_id = torch.from_numpy(track.curr_feat)[None, :].to(id_feature[-1].device)
     past_feature_map = reid_attention(track_id, id_feature[-1][0])
     past_to_curr = return_position(past_feature_map, reg[-1], h_out, w_out, height, width)

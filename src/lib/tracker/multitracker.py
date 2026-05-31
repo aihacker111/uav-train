@@ -577,37 +577,33 @@ class MCJDETracker(object):
                     removed_tracks_dict[cls_id].append(track)
                     continue
 
-                center_pred, size_curr = MCTrack.tlwh_to_center(track.tlwh)
+                # ECDetJDE-aligned re-activation:
+                # Use ReID cosine similarity (from pred_reid) + IoU (from pred_boxes)
+                # instead of CenterNet spatial attention on dense feature maps.
+                if len(cls_detects) > 0:
+                    reid_costs = matching.embedding_distance([track], cls_detects)  # (1, M) cosine dist
+                    iou_costs  = matching.iou_distance([track], cls_detects)        # (1, M) 1-iou
 
-                pred_off = matching.reid_motion_lost_det(
-                    track, self.past_id_feature, self.past_reg, h_out, w_out, height, width
-                )
+                    best_idx       = int(reid_costs[0].argmin())
+                    best_reid_cost = reid_costs[0, best_idx]          # low  = same object
+                    best_iou_score = 1.0 - iou_costs[0, best_idx]    # high = good spatial overlap
+                    max_iou_any    = 1.0 - iou_costs[0].min()        # max iou with any det
 
-                dist = np.sqrt(np.sum((center_pred - pred_off) ** 2))
-                if dist <= 3                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   :
-                    if len(cls_detects) > 0:
-                        iou_dist_1 = 1 - matching.iou_distance([track], cls_detects)
-                        min_dist_1 = iou_dist_1.max()
-                    else:
-                        min_dist_1 = 0
-
-                    if len(cls_detects_second) > 0:
-                        iou_dist_2 = 1 - matching.iou_distance([track], cls_detects_second)
-                        min_dist_2 = iou_dist_2.max()
-                    else:
-                        min_dist_2 = 0
-
-                    if min_dist_1 <= 0.2 and min_dist_2 <= 0.2:  # max IOU with any det < 0.2
-                        # print(dist, min_dist_1, min_dist_2)
+                    if best_reid_cost < 0.4 and best_iou_score > 0.0:
+                        # Strong appearance match + some spatial proximity → re-associate
+                        track.re_activate(cls_detects[best_idx], self.frame_id, new_id=False)
+                        refined_tracks_dict[cls_id].append(track)
+                    elif max_iou_any <= 0.2:
+                        # No detection overlaps this region → object occluded → propagate Kalman
                         track.update_retrack(track.tlwh, self.frame_id)
                         activated_tracks_dict[cls_id].append(track)
-
                     else:
                         track.mark_lost()
                         lost_tracks_dict[cls_id].append(track)
                 else:
-                    track.mark_lost()
-                    lost_tracks_dict[cls_id].append(track)
+                    # No unmatched detections → object likely occluded → keep alive
+                    track.update_retrack(track.tlwh, self.frame_id)
+                    activated_tracks_dict[cls_id].append(track)
 
             '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
             cls_detects = [cls_detects[i] for i in u_detection]

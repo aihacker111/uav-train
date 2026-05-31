@@ -22,11 +22,12 @@ class ECDetJDEPostProcessor(nn.Module):
     """
 
     def __init__(self, num_classes: int, conf_thres: float = 0.3,
-                 num_top_queries: int = 300):
+                 num_top_queries: int = 300, nms_thres: float = 0.45):
         super().__init__()
-        self.num_classes   = num_classes
-        self.conf_thres    = conf_thres
+        self.num_classes     = num_classes
+        self.conf_thres      = conf_thres
         self.num_top_queries = num_top_queries
+        self.nms_thres       = nms_thres
 
     def forward(self, outputs: dict, orig_hw: tuple, net_hw: tuple = None):
         """
@@ -81,10 +82,10 @@ class ECDetJDEPostProcessor(nn.Module):
             bw_orig = bw * orig_w
             bh_orig = bh * orig_h
 
-        x1 = cx_orig - bw_orig * 0.5
-        y1 = cy_orig - bh_orig * 0.5
-        x2 = cx_orig + bw_orig * 0.5
-        y2 = cy_orig + bh_orig * 0.5
+        x1 = (cx_orig - bw_orig * 0.5).clamp(min=0, max=orig_w)
+        y1 = (cy_orig - bh_orig * 0.5).clamp(min=0, max=orig_h)
+        x2 = (cx_orig + bw_orig * 0.5).clamp(min=0, max=orig_w)
+        y2 = (cy_orig + bh_orig * 0.5).clamp(min=0, max=orig_h)
         boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)  # (N, 4)
 
         # L2-normalize ReID embeddings
@@ -100,9 +101,16 @@ class ECDetJDEPostProcessor(nn.Module):
                 reid_dict[cls_id] = torch.zeros((0, reid.shape[-1]), device=logits.device)
                 continue
 
-            cls_boxes  = boxes_xyxy[keep]               # (M, 4)
+            cls_boxes    = boxes_xyxy[keep]             # (M, 4)
             cls_scores_f = cls_scores[keep]             # (M,)
-            cls_reid   = reid_norm[keep]                # (M, reid_dim)
+            cls_reid     = reid_norm[keep]              # (M, reid_dim)
+
+            # NMS per class — removes redundant overlapping predictions
+            nms_keep = torchvision.ops.nms(cls_boxes, cls_scores_f, self.nms_thres)
+            cls_boxes    = cls_boxes[nms_keep]
+            cls_scores_f = cls_scores_f[nms_keep]
+            cls_reid     = cls_reid[nms_keep]
+
             cls_id_col = torch.full((cls_scores_f.shape[0], 1), cls_id,
                                     dtype=cls_scores_f.dtype, device=logits.device)
 

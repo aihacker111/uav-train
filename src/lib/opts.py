@@ -99,7 +99,7 @@ class opts(object):
         self.parser.add_argument('--conf_thres', type=float, default=0.4,
                                  help='detection confidence threshold')
         self.parser.add_argument('--det_thres',  type=float, default=0.3)
-        self.parser.add_argument('--nms_thres',  type=float, default=0.4)
+        self.parser.add_argument('--nms_thres',  type=float, default=0.45)
         self.parser.add_argument('--track_buffer', type=int, default=30)
         self.parser.add_argument('--min-box-area', type=float, default=100,
                                  help='filter out boxes smaller than this area')
