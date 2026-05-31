@@ -72,6 +72,12 @@ class opts(object):
         self.parser.add_argument('--weight_decay', type=float, default=1e-4)
         self.parser.add_argument('--lr_step', type=str, default='10,20',
                                  help='epochs to drop LR by 10x')
+        self.parser.add_argument('--warmup_iters', type=int, default=2000,
+                                 help='linear LR warmup steps (0 = disabled)')
+        self.parser.add_argument('--clip_max_norm', type=float, default=0.1,
+                                 help='gradient clipping max norm (0 = disabled)')
+        self.parser.add_argument('--use_amp', action='store_true', default=False,
+                                 help='enable AMP mixed-precision training')
 
         # ---- Augmentation (AMOT / JDE style) ----
         self.parser.add_argument('--hsv_fraction', type=float, default=0.5,

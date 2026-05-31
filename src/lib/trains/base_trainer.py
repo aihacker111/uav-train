@@ -71,26 +71,24 @@ class BaseTrainer(object):
 
 
     # Train an epoch
-    def run_epoch(self, phase, epoch, data_loader):
-        """
-        :param phase:
-        :param epoch:
-        :param data_loader:
-        :return:
-        """
+    def run_epoch(self, phase, epoch, data_loader, scheduler=None):
         model_with_loss = self.model_with_loss
 
         if phase == 'train':
-            model_with_loss.train()  # train phase
+            model_with_loss.train()
         else:
             if len(self.opt.gpus) > 1:
                 model_with_loss = self.model_with_loss.module
-
-            model_with_loss.eval()  # test phase
+            model_with_loss.eval()
             torch.cuda.empty_cache()
 
         opt = self.opt
-        accum = max(1, getattr(opt, 'grad_accum', 1))
+        accum          = max(1, getattr(opt, 'grad_accum', 1))
+        clip_max_norm  = getattr(opt, 'clip_max_norm', 0.1)
+        use_amp        = getattr(opt, 'use_amp', False) and phase == 'train'
+
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
         results = {}
         data_time, batch_time = AverageMeter(), AverageMeter()
         avg_loss_stats = {l: AverageMeter() for l in self.loss_stats}
@@ -112,17 +110,25 @@ class BaseTrainer(object):
                     continue
                 batch[k] = batch[k].to(device=opt.device, non_blocking=True)
 
-            # Forward
-            output, loss, loss_stats = model_with_loss.forward(batch)
+            # Forward (with optional AMP)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                output, loss, loss_stats = model_with_loss.forward(batch)
 
-            # Backwards with gradient accumulation
             loss = loss.mean()
             if phase == 'train':
-                (loss / accum).backward()
+                scaler.scale(loss / accum).backward()
                 is_last = (batch_i + 1 == num_iters)
                 if (batch_i + 1) % accum == 0 or is_last:
-                    self.optimizer.step()
+                    # Gradient clipping (critical for DETR convergence)
+                    if clip_max_norm > 0:
+                        scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            model_with_loss.parameters(), clip_max_norm)
+                    scaler.step(self.optimizer)
+                    scaler.update()
                     self.optimizer.zero_grad()
+                    if scheduler is not None:
+                        scheduler.step()
 
             batch_time.update(time.time() - end)
             end = time.time()
@@ -177,5 +183,5 @@ class BaseTrainer(object):
     def val(self, epoch, data_loader):
         return self.run_epoch('val', epoch, data_loader)
 
-    def train(self, epoch, data_loader):
-        return self.run_epoch('train', epoch, data_loader)
+    def train(self, epoch, data_loader, scheduler=None):
+        return self.run_epoch('train', epoch, data_loader, scheduler=scheduler)

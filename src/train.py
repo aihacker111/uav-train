@@ -2,6 +2,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import math
 import os
 import re
 import json
@@ -65,6 +66,20 @@ def build_optimizer(model, opt):
     return optimizer
 
 
+def build_scheduler(optimizer, opt, steps_per_epoch: int):
+    """Linear warmup → cosine decay, matching EdgeCrafter's flatcosine schedule."""
+    warmup_iters  = getattr(opt, 'warmup_iters', 2000)
+    total_iters   = opt.num_epochs * steps_per_epoch
+
+    def lr_lambda(current_iter: int):
+        if warmup_iters > 0 and current_iter < warmup_iters:
+            return float(current_iter + 1) / float(warmup_iters)
+        progress = float(current_iter - warmup_iters) / float(max(1, total_iters - warmup_iters))
+        return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def run(opt):
     torch.manual_seed(opt.seed)
     torch.backends.cudnn.benchmark = not opt.not_cuda_benchmark and not opt.test
@@ -118,13 +133,19 @@ def run(opt):
     trainer = Trainer(opt=opt, model=model, optimizer=optimizer)
     trainer.set_device(opt.gpus, opt.chunk_sizes, opt.device)
 
+    scheduler = build_scheduler(optimizer, opt, steps_per_epoch=len(train_loader))
+    # fast-forward scheduler state if resuming mid-training
+    if start_epoch > 0:
+        for _ in range(start_epoch * len(train_loader)):
+            scheduler.step()
+
     for epoch in range(start_epoch + 1, opt.num_epochs + 1):
         mark = epoch if opt.save_all else 'last'
 
         # notify dataset of current epoch (0-indexed, matching EdgeCrafter convention)
         train_loader.dataset.set_epoch(epoch - 1)
 
-        log_dict_train, _ = trainer.train(epoch, train_loader)
+        log_dict_train, _ = trainer.train(epoch, train_loader, scheduler=scheduler)
 
         logger.write('epoch: {} |'.format(epoch))
         for k, v in log_dict_train.items():
@@ -142,10 +163,6 @@ def run(opt):
         if epoch in opt.lr_step:
             save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)),
                        epoch, model, optimizer)
-            lr = opt.lr * (0.1 ** (opt.lr_step.index(epoch) + 1))
-            print('Drop LR to', lr)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
 
         if epoch % 5 == 0 or epoch >= 25:
             save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)),
