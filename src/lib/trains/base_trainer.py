@@ -87,7 +87,7 @@ class BaseTrainer(object):
         clip_max_norm  = getattr(opt, 'clip_max_norm', 0.1)
         use_amp        = getattr(opt, 'use_amp', False) and phase == 'train'
 
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
         results = {}
         data_time, batch_time = AverageMeter(), AverageMeter()
@@ -111,7 +111,7 @@ class BaseTrainer(object):
                 batch[k] = batch[k].to(device=opt.device, non_blocking=True)
 
             # Forward (with optional AMP)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 output, loss, loss_stats = model_with_loss.forward(batch)
 
             loss = loss.mean()
