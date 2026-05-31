@@ -1,0 +1,16 @@
+{
+    "root":"/workspace/VisDrone2019",
+    "train":
+    {
+        "visdrone_train":"/workspace/VisDrone2019/VisDrone.train",
+        "visdrone_val":"/workspace/VisDrone2019/VisDrone.val"
+    },
+    "test_emb":
+    {
+        "visdrone":"/workspace/VisDrone2019/VisDrone.train"
+    },
+    "test":
+    {
+        "visdrone":"/workspace/VisDrone2019/VisDrone.train"
+    }
+}

@@ -6,22 +6,20 @@ import random
 import copy
 import time
 import warnings
-
+import matplotlib.pyplot as plt
 import cv2
+# import json
 import numpy as np
 import torch
 
 from collections import OrderedDict, defaultdict
+# from torch.utils.data import Dataset
+# from torchvision.transforms import transforms as T
+# from cython_bbox import bbox_overlaps as bbox_ious
+# from lib.opts import opts
+from lib.utils.image import gaussian_radius, draw_umich_gaussian, draw_msra_gaussian
 from lib.utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 from lib.tracker.multitracker import id2cls
-from lib.datasets.augment import (
-    MosaicAugmentor, photometric_distort,
-    random_zoom_out, random_iou_crop, sanitize_boxes,
-)
-
-# ImageNet mean/std (matching EdgeCrafter's Normalize op)
-_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 # for inference
@@ -191,7 +189,7 @@ class LoadImagesAndLabels:  # for training
         label_path = self.label_files[files_index]
         return self.get_data(img_path, label_path)
 
-    def get_data(self, img_path, label_path, width=None, height=None):
+    def get_data(self, img_path, label_path, random_seed=None, width=None, height=None):
         """
         图像数据格式转换, 增强; 标签格式化
         :param img_path:
@@ -200,6 +198,9 @@ class LoadImagesAndLabels:  # for training
         :param width:
         :return:
         """
+        if random_seed is not None:
+            random.seed(random_seed)
+            np.random.seed(random_seed)
         # 输入网络的图像分辨率
         if height is None or width is None:
             height = self.height
@@ -432,9 +433,6 @@ def collate_fn(batch):
         labels_len[i] = isize
 
     return imgs, filled_labels, paths, sizes, labels_len.unsqueeze(1)
-
-
-
 # ----------
 
 class JointDataset(LoadImagesAndLabels):  # for training
@@ -465,7 +463,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
         self.label_files = OrderedDict()
         self.tid_num = OrderedDict()
         self.tid_start_index = OrderedDict()
-        self.num_classes = len(opt.reid_cls_ids.split(','))  # C5: car, bicycle, person, cyclist, tricycle
+        self.num_classes = len(opt.reid_cls_ids.split(','))
 
         # make sure img_size equal to opt.input_wh
         if opt.input_wh[0] != img_size[0] or opt.input_wh[1] != img_size[1]:
@@ -531,33 +529,12 @@ class JointDataset(LoadImagesAndLabels):  # for training
             for k, v in last_idx_dict.items():
                 self.nID_dict[k] = int(v)  # 每个类别的tack ids数量
 
-        self.nds = [len(x) for x in self.img_files.values()]
-        self.cds = [sum(self.nds[:i]) for i in range(len(self.nds))]
-        self.nF = sum(self.nds)
-        self.max_objs = opt.K
+        self.nds = [len(x) for x in self.img_files.values()]  # 每个子训练集(MOT15, MOT20...)的图片数
+        self.cds = [sum(self.nds[:i]) for i in range(len(self.nds))]  # 当前子数据集前面累计图片总数?
+        self.nF = sum(self.nds)  # 用于训练的所有子训练集的图片总数
+        self.max_objs = opt.K  # 每张图最多检测跟踪的目标个数
         self.augment = augment
         self.transforms = transforms
-
-        # ---- EdgeCrafter-style augmentation schedule ----
-        self.cur_epoch         = 0
-        self.mosaic_prob       = getattr(opt, 'mosaic_prob',       0.5)
-        self.mosaic_epoch      = getattr(opt, 'mosaic_epoch',      25)
-        self.stop_epoch        = getattr(opt, 'stop_epoch',        48)
-        self.photodistort_prob = getattr(opt, 'photodistort_prob', 0.5)
-        self.zoomout_max_scale = getattr(opt, 'zoomout_max_scale', 4.0)
-        self.iou_crop_prob     = getattr(opt, 'iou_crop_prob',     0.8)
-
-        tile_size = min(self.height, self.width) // 2
-        self.mosaic_augmentor = MosaicAugmentor(
-            output_size = tile_size,
-            max_cached  = getattr(opt, 'mosaic_max_cached',  50),
-            random_pop  = True,
-            rotation    = getattr(opt, 'mosaic_rotation',    10.0),
-            translation = (getattr(opt, 'mosaic_translate',  0.1),) * 2,
-            scaling     = (getattr(opt, 'mosaic_scale_lo',   0.5),
-                           getattr(opt, 'mosaic_scale_hi',   1.5)),
-            fill        = 114,
-        )
 
         print('dataset summary')
         print(self.tid_num)
@@ -573,141 +550,211 @@ class JointDataset(LoadImagesAndLabels):  # for training
                     print('Start index of dataset {} class {:d} is {:d}'
                           .format(k, int(cls_id), int(start_idx)))
 
-    # ------------------------------------------------------------------
-    # Epoch-aware augmentation schedule (call once per epoch in train loop)
-    # ------------------------------------------------------------------
-
-    def set_epoch(self, epoch: int):
-        """Set current epoch (0-indexed) for augmentation schedule."""
-        self.cur_epoch = epoch
-
-    # ------------------------------------------------------------------
-    # Raw loader — no augmentation, returns cxcywh-norm labels
-    # ------------------------------------------------------------------
-
-    def _load_raw(self, img_path, label_path):
-        """Load raw BGR image + normalized cxcywh labels. No resize, no aug."""
-        img = cv2.imread(img_path)
-        if img is None:
-            raise ValueError(f'File corrupt {img_path}')
-
-        labels = np.zeros((0, 6), dtype=np.float32)
-        if os.path.isfile(label_path):
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                raw = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 6)
-                if len(raw) > 0:
-                    labels = raw   # [cls, tid, cx, cy, w, h] already normalized
-
-        return img, labels
-
-    # ------------------------------------------------------------------
-    # Letterbox helper (adjusts labels for the added padding/scaling)
-    # ------------------------------------------------------------------
-
-    def _letterbox_labels(self, labels, orig_w, orig_h, ratio, pad_w, pad_h):
-        """Adjust cxcywh-norm labels from original image to letterboxed image."""
-        if len(labels) == 0:
-            return labels
-        out = labels.copy()
-        out[:, 2] = (labels[:, 2] * orig_w * ratio + pad_w) / self.width
-        out[:, 3] = (labels[:, 3] * orig_h * ratio + pad_h) / self.height
-        out[:, 4] = labels[:, 4] * orig_w * ratio / self.width
-        out[:, 5] = labels[:, 5] * orig_h * ratio / self.height
-        return sanitize_boxes(out, self.width, self.height)
-
-    # ------------------------------------------------------------------
-    # Main __getitem__ with EdgeCrafter augmentation schedule
-    # ------------------------------------------------------------------
-
     def __getitem__(self, idx):
-        # locate sub-dataset
+        # 为子训练集计算起始index
         for i, c in enumerate(self.cds):
             if idx >= c:
-                ds          = list(self.label_files.keys())[i]
+                ds = list(self.label_files.keys())[i]
                 start_index = c
 
-        img_path   = self.img_files[ds][idx - start_index]
+        img_path = self.img_files[ds][idx - start_index]
         label_path = self.label_files[ds][idx - start_index]
 
-        img, labels = self._load_raw(img_path, label_path)
-        orig_h, orig_w = img.shape[:2]
+        # 定义增强策略中的随机参数
+        seed = random.randint(0,999999)
 
-        # Remap track IDs to global offsets BEFORE mosaic so that cached tiles
-        # from other sub-datasets carry the correct IDs when they are replayed.
-        if self.opt.id_weight > 0 and len(labels) > 0:
-            for i in range(len(labels)):
+        # 获取图像数据和标签
+        imgs, labels, img_path, (input_h, input_w) = self.get_data(img_path, label_path, random_seed = seed)
+
+        # 生成前一帧的图像路径
+        img_index_for_pre_id = img_path.split('/')[-1].split(".jpg")[0]
+        str_count = len(img_index_for_pre_id)
+        pre_id = max(1, int(img_index_for_pre_id) - random.randint(5, 10))
+        pre_image_id = f"{{0:0{str_count}d}}".format(pre_id)
+
+        video_path = img_path.split('/')[-4:-1]
+        ann_path = label_path.split('/')[-4:-1]
+        og_path = img_path.split('/' + ann_path[0])
+
+        pre_img_path = os.path.join(og_path[0], video_path[0], video_path[1], video_path[2], pre_image_id + '.jpg')
+        pre_label_path = os.path.join(og_path[0], ann_path[0], ann_path[1], ann_path[2], pre_image_id + '.txt')
+
+        if not os.path.isfile(pre_img_path):
+            pre_label_path = label_path
+            pre_img_path = img_path
+            pre_imgs = imgs
+            pre_labels = labels
+        else:
+            pre_imgs, pre_labels, pre_img_path, (pre_input_h, pre_input_w) = self.get_data(pre_img_path, pre_label_path, random_seed = seed)
+
+        # 存在多个子训练集时, 为每个子训练集合(视频seq)计算正确的起始index
+        # @even: for MCMOT training
+        if self.opt.id_weight > 0:
+            for i, _ in enumerate(labels):
                 if labels[i, 1] > -1:
-                    cls_id    = int(labels[i][0])
-                    start_idx = self.tid_start_idx_of_cls_ids[ds].get(cls_id, 0)
+                    cls_id = int(labels[i][0])
+                    start_idx = self.tid_start_idx_of_cls_ids[ds][cls_id]
                     labels[i, 1] += start_idx
 
-        epoch       = self.cur_epoch
-        with_mosaic = (self.augment and
-                       self.mosaic_prob > 0 and
-                       epoch < self.mosaic_epoch and
-                       random.random() < self.mosaic_prob)
+        output_h = imgs.shape[1] // self.opt.down_ratio  # 向下取整除法
+        output_w = imgs.shape[2] // self.opt.down_ratio
 
-        if not self.augment:
-            # ---- validation / no-aug path ----
-            pass
+        draw_gaussian = draw_msra_gaussian if self.opt.mse_loss else draw_umich_gaussian
+        # draw_gaussian_reid = draw_msra_gaussian
+        pre_num_objs = pre_labels.shape[0]
+        # --- GT of detection
+        pre_hm = np.zeros((self.num_classes, output_h, output_w), dtype=np.float32)  # C×H×W: heat-map通道数即类别数
+        pre_wh = np.zeros((self.max_objs, 2), dtype=np.float32)
+        pre_reg = np.zeros((self.max_objs, 2), dtype=np.float32)
+        pre_ind = np.zeros((self.max_objs,), dtype=np.int64)  # K个object
+        pre_reg_mask = np.zeros((self.max_objs,), dtype=np.uint8)  # 只计算feature map有目标的像素的reg loss
 
-        elif with_mosaic:
-            # ---- Mosaic path ----
-            img, labels    = self.mosaic_augmentor(img, labels)
-            img            = photometric_distort(img, p=self.photodistort_prob)
-            orig_h, orig_w = img.shape[:2]
+        pre_reid_hm = np.zeros((self.max_objs, output_h, output_w), dtype=np.float32)
 
-        elif epoch < self.stop_epoch:
-            # ---- Strong aug path (no mosaic) ----
-            img            = photometric_distort(img, p=self.photodistort_prob)
-            img, labels    = random_zoom_out(img, labels, fill=114,
-                                             max_scale=self.zoomout_max_scale)
-            img, labels    = random_iou_crop(img, labels, p=self.iou_crop_prob)
-            orig_h, orig_w = img.shape[:2]
+        if self.opt.id_weight > 0:
+            # --- GT of ReID
+            pre_ids = np.zeros((self.max_objs,), dtype=np.int64)  # 一张图最多检测并ReID K个目标, 都初始化id为0
 
-        # else: epoch >= stop_epoch → clean path, no augmentation
+            # @even: 每个目标类别都对应一组track ids
+            pre_cls_tr_ids = np.full((self.num_classes, output_h, output_w), -1,dtype=np.int64)
+            # @even, class id map: 每个(x, y)处的目标类别, 都初始化为-1
+            pre_cls_id_map = np.full((1, output_h, output_w), -1, dtype=np.int64)  # 1×H×W
+            pre_id_mask = np.full((self.max_objs), -1, dtype=np.int64)
 
-        # ---- letterbox to network input size ----
-        img, ratio, pad_w, pad_h = letterbox(img, height=self.height, width=self.width)
-        labels = self._letterbox_labels(labels, orig_w, orig_h, ratio, pad_w, pad_h)
+        # 遍历每一个ground truth检测目标
+        for k in range(pre_num_objs):  # 图片中实际的目标个数
+            pre_label = pre_labels[k]
 
-        # ---- random horizontal flip ----
-        if self.augment and random.random() > 0.5:
-            img = np.fliplr(img)
-            if len(labels) > 0:
-                labels[:, 2] = 1 - labels[:, 2]
+            # 计算bbox的经过网络的输出GT值
+            #                               0        1        2       3
+            pre_bbox = pre_label[2:]  # center_x, center_y, bbox_w, bbox_h
 
-        # ---- BGR → RGB, normalize (ImageNet mean/std) ----
-        img = img[:, :, ::-1].astype(np.float32) / 255.0
-        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
-        img = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
+            # 检测目标的类别(索引从0开始, 0代表背景类别)
+            pre_cls_id = int(pre_label[0])
 
-        # ---- remap track IDs to global offsets ----
-        if self.opt.id_weight > 0 and len(labels) > 0:
-            for i in range(len(labels)):
-                if labels[i, 1] > -1:
-                    cls_id    = int(labels[i][0])
-                    start_idx = self.tid_start_idx_of_cls_ids[ds].get(cls_id, 0)
-                    labels[i, 1] += start_idx
+            pre_bbox[[0, 2]] = pre_bbox[[0, 2]] * output_w
+            pre_bbox[[1, 3]] = pre_bbox[[1, 3]] * output_h
+            pre_bbox[0] = np.clip(pre_bbox[0], 0, output_w - 1)
+            pre_bbox[1] = np.clip(pre_bbox[1], 0, output_h - 1)
 
-        # ---- pack DETR-format targets ----
-        num_objs       = min(len(labels), self.max_objs)   # mosaic can exceed K
-        detr_boxes     = np.zeros((self.max_objs, 4), dtype=np.float32)
-        detr_labels    = np.full((self.max_objs,), -1, dtype=np.int64)
-        detr_track_ids = np.full((self.max_objs,), -1, dtype=np.int64)
+            pre_w, pre_h = pre_bbox[2], pre_bbox[3]
 
-        for k in range(num_objs):
-            lb = labels[k]
-            detr_boxes[k]     = lb[2:6]
-            detr_labels[k]    = int(lb[0])
-            detr_track_ids[k] = int(lb[1]) - 1   # 1-indexed → 0-indexed
+            if pre_h > 0 and pre_w > 0:
+                # heat-map radius
+                pre_radius = gaussian_radius((math.ceil(pre_h), math.ceil(pre_w)))
+                pre_radius = max(0, int(pre_radius))  # radius >= 0
+                pre_radius = self.opt.hm_gauss if self.opt.mse_loss else pre_radius
 
-        return {
-            'input':          img,
-            'detr_boxes':     detr_boxes,
-            'detr_labels':    detr_labels,
-            'detr_track_ids': detr_track_ids,
-            'detr_num_objs':  np.array(num_objs, dtype=np.int64),
-        }
+                # bbox center coordinate
+                pre_ct = np.array([pre_bbox[0], pre_bbox[1]], dtype=np.float32)
+                pre_ct_int = pre_ct.astype(np.int32)  # floor int
+
+
+                # draw gauss weight for heat-map
+                draw_gaussian(pre_hm[pre_cls_id], pre_ct_int, pre_radius)  # hm
+                draw_gaussian(pre_reid_hm[k], pre_ct_int, pre_radius)
+
+                # --- GT of detection
+                pre_wh[k] = float(pre_w), float(pre_h)
+
+                # 记录feature map上有目标的坐标索引
+                pre_ind[k] = pre_ct_int[1] * output_w + pre_ct_int[0]  # feature map index:y*w+x
+                pre_reg[k] = pre_ct - pre_ct_int  # [x,y]
+                pre_reg_mask[k] = 1
+
+                if self.opt.id_weight > 0:
+                    if pre_cls_id_map[0][pre_ct_int[1], pre_ct_int[0]] == -1:
+                        pre_cls_id_map[0][pre_ct_int[1], pre_ct_int[0]] = pre_cls_id  # 1×H×W
+                        pre_id_mask[k] = pre_cls_id
+                        pre_ids[k] = pre_label[1] - 1
+                        pre_cls_tr_ids[pre_cls_id][pre_ct_int[1]][pre_ct_int[0]] = pre_label[1] - 1  # track id从1开始的, 转换成从0开始
+
+        num_objs = labels.shape[0]
+
+        hm = np.zeros((self.num_classes, output_h, output_w), dtype=np.float32)  # C×H×W: heat-map通道数即类别数
+        wh = np.zeros((self.max_objs, 2), dtype=np.float32)
+        reg = np.zeros((self.max_objs, 2), dtype=np.float32)
+        ind = np.zeros((self.max_objs,), dtype=np.int64)  # K个object
+
+        reg_mask = np.zeros((self.max_objs,), dtype=np.uint8)  # 只计算feature map有目标的像素的reg loss
+        reid_hm = np.zeros((self.max_objs, output_h, output_w), dtype=np.float32)  # 只计算feature map有目标的像素的reg loss
+
+        ids = np.zeros((self.max_objs,), dtype=np.int64)  # 一张图最多检测并ReID K个目标, 都初始化id为0
+        cls_tr_ids = np.full((self.num_classes, output_h, output_w), -1, dtype=np.int64)
+        cls_id_map = np.full((1, output_h, output_w), -1, dtype=np.int64)  # 1×H×W
+
+        id_mask = np.full((self.max_objs), -1, dtype=np.int64)
+        # 遍历每一个ground truth检测目标
+
+        for k in range(num_objs):  # 图片中实际的目标个数
+
+            label = labels[k]
+            bbox = label[2:]  # center_x, center_y, bbox_w, bbox_h
+
+            cls_id = int(label[0])
+
+            bbox[[0, 2]] = bbox[[0, 2]] * output_w
+            bbox[[1, 3]] = bbox[[1, 3]] * output_h
+            bbox[0] = np.clip(bbox[0], 0, output_w - 1)
+            bbox[1] = np.clip(bbox[1], 0, output_h - 1)
+
+            w, h = bbox[2], bbox[3]
+
+            if h > 0 and w > 0:
+                # heat-map radius
+                radius = gaussian_radius((math.ceil(h), math.ceil(w)))
+                radius = max(0, int(radius))  # radius >= 0
+                radius = self.opt.hm_gauss if self.opt.mse_loss else radius
+
+                # bbox center coordinate, (W,H) (X,Y)
+                ct = np.array([bbox[0], bbox[1]], dtype=np.float32)  # 真实目标中心，
+                ct_int = ct.astype(np.int32)  # floor int
+
+                # draw gauss weight for heat-map
+                draw_gaussian(hm[cls_id], ct_int, radius)  # hm
+                draw_gaussian(reid_hm[k], ct_int, radius)
+
+                # --- GT of detection
+                wh[k] = float(w), float(h)
+                # 记录feature map上有目标的坐标索引
+                ind[k] = ct_int[1] * output_w + ct_int[0]  # feature map index:y*w+x
+                reg[k] = ct - ct_int
+                reg_mask[k] = 1
+                # --- GT of ReID
+                if self.opt.id_weight > 0:
+                    # @even: 取output feature map的每个(y, x)处的目标类别
+                    if cls_id_map[0][ct_int[1], ct_int[0]] == -1:
+                        cls_id_map[0][ct_int[1], ct_int[0]] = cls_id  # 1×H×W
+                        id_mask[k] = cls_id
+                        cls_tr_ids[cls_id][ct_int[1]][ct_int[0]] = label[1] - 1  # track id从1开始的, 转换成从0开始
+                        ids[k] = label[1] - 1  # 分类的idx: track id - 1
+
+
+        ret = {'input': imgs,
+               'hm': hm,
+               'reg': reg,
+               'wh': wh,
+               'ind': ind,
+               'reg_mask': reg_mask,
+               'ids': ids,
+               'cls_id_map': cls_id_map,  # feature map上每个(x, y)处的目标类别id
+               'cls_tr_ids': cls_tr_ids,
+               'id_mask':id_mask,
+               'reid_hm': reid_hm,
+
+               'pre_input': pre_imgs,
+               'pre_hm': pre_hm,
+               'pre_reg': pre_reg,
+               'pre_wh': pre_wh,
+               'pre_ind': pre_ind,
+               'pre_reg_mask': pre_reg_mask,
+               'pre_ids': pre_ids,
+               'pre_cls_id_map': pre_cls_id_map,  # feature map上每个(x, y)处的目标类别id
+               'pre_cls_tr_ids': pre_cls_tr_ids,
+
+               'pre_reid_hm': pre_reid_hm,
+               'pre_id_mask': pre_id_mask,
+               }
+
+        return ret
 
