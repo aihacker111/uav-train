@@ -44,6 +44,8 @@ class opts(object):
         # model
         self.parser.add_argument('--arch', default='ecdet_jde',
                                  help='ecdet_jde (ECViT + HybridEncoder + ECTransformer)')
+        self.parser.add_argument('--down_ratio', type=int, default=1,
+                                 help='output stride divisor (1 for DETR models, 4 for CenterNet)')
 
         # ECDetJDE — paths and runtime settings only
         # Architecture params (nhead, dim_ff, hidden_dim, num_layers, etc.) are
