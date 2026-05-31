@@ -683,7 +683,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
                     labels[i, 1] += start_idx
 
         # ---- pack DETR-format targets ----
-        num_objs       = len(labels)
+        num_objs       = min(len(labels), self.max_objs)   # mosaic can exceed K
         detr_boxes     = np.zeros((self.max_objs, 4), dtype=np.float32)
         detr_labels    = np.full((self.max_objs,), -1, dtype=np.int64)
         detr_track_ids = np.full((self.max_objs,), -1, dtype=np.int64)
