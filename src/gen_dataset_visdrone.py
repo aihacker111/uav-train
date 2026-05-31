@@ -355,8 +355,8 @@ def gen_track_dataset(src_root, dst_root, viz_root=None):
     print('Total {:d} frames'.format(frame_cnt))
 
 if __name__ == '__main__':
-    DATASET_ROOT   = '/mnt/hps/tinvna_workspace/public-datasets/visdrone2019'
-    CONVERTED_ROOT = '/mnt/hps/tinvna_workspace/public-datasets/VisDrone2019'
+    DATASET_ROOT   = '/workspace'
+    CONVERTED_ROOT = '/workspace/VisDrone2019'
 
     # Step 1: Convert train set  → CONVERTED_ROOT/train/images/ + labels_with_ids/
     gen_track_dataset(
