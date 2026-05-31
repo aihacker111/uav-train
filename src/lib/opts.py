@@ -45,19 +45,15 @@ class opts(object):
         self.parser.add_argument('--arch', default='ecdet_jde',
                                  help='ecdet_jde (ECViT + HybridEncoder + ECTransformer)')
 
-        # ECDetJDE backbone / encoder / decoder
+        # ECDetJDE — paths and runtime settings only
+        # Architecture params (nhead, dim_ff, hidden_dim, num_layers, etc.) are
+        # hardcoded per variant in models/ecdet_jde/model.py::_ECVIT_CONFIGS.
         self.parser.add_argument('--ecvit_name', default='ecvitt',
-                                 help='ecvitt | ecvittplus | ecvits | ecvitsplus')
+                                 help='variant: ecvitt | ecvittplus | ecvits | ecvitsplus')
         self.parser.add_argument('--ecvit_weights', default='',
-                                 help='path to ECViT backbone-only weights (.pth)')
+                                 help='path to ECViT backbone weights (.pth)')
         self.parser.add_argument('--ecdet_pretrained', default='',
-                                 help='path to full ECDet COCO checkpoint')
-        self.parser.add_argument('--num_queries', type=int, default=300,
-                                 help='number of DETR object queries')
-        self.parser.add_argument('--ecdet_hidden_dim', type=int, default=192)
-        self.parser.add_argument('--ecdet_num_layers', type=int, default=4)
-        self.parser.add_argument('--ecdet_nhead', type=int, default=8)
-        self.parser.add_argument('--ecdet_dim_ff', type=int, default=512)
+                                 help='path to full ECDet COCO checkpoint (.pth)')
         self.parser.add_argument('--eval_spatial_size', type=int, nargs=2,
                                  default=[608, 1088], help='[H, W] for anchor pre-generation')
         self.parser.add_argument('--down_ratio', type=int, default=4,
