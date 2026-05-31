@@ -6,7 +6,7 @@ import random
 import copy
 import time
 import warnings
-
+import matplotlib.pyplot as plt
 import cv2
 # import json
 import numpy as np
@@ -189,7 +189,7 @@ class LoadImagesAndLabels:  # for training
         label_path = self.label_files[files_index]
         return self.get_data(img_path, label_path)
 
-    def get_data(self, img_path, label_path, width=None, height=None):
+    def get_data(self, img_path, label_path, random_seed=None, width=None, height=None):
         """
         图像数据格式转换, 增强; 标签格式化
         :param img_path:
@@ -198,6 +198,9 @@ class LoadImagesAndLabels:  # for training
         :param width:
         :return:
         """
+        if random_seed is not None:
+            random.seed(random_seed)
+            np.random.seed(random_seed)
         # 输入网络的图像分辨率
         if height is None or width is None:
             height = self.height
@@ -430,9 +433,6 @@ def collate_fn(batch):
         labels_len[i] = isize
 
     return imgs, filled_labels, paths, sizes, labels_len.unsqueeze(1)
-
-
-
 # ----------
 
 class JointDataset(LoadImagesAndLabels):  # for training
@@ -463,7 +463,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
         self.label_files = OrderedDict()
         self.tid_num = OrderedDict()
         self.tid_start_index = OrderedDict()
-        self.num_classes = len(opt.reid_cls_ids.split(','))  # C5: car, bicycle, person, cyclist, tricycle
+        self.num_classes = len(opt.reid_cls_ids.split(','))
 
         # make sure img_size equal to opt.input_wh
         if opt.input_wh[0] != img_size[0] or opt.input_wh[1] != img_size[1]:
@@ -560,9 +560,32 @@ class JointDataset(LoadImagesAndLabels):  # for training
         img_path = self.img_files[ds][idx - start_index]
         label_path = self.label_files[ds][idx - start_index]
 
-        # Get image data and label
-        imgs, labels, img_path, (input_h, input_w) = self.get_data(img_path, label_path)
-        # print('input_h, input_w: %d %d' % (input_h, input_w))
+        # 定义增强策略中的随机参数
+        seed = random.randint(0,999999)
+
+        # 获取图像数据和标签
+        imgs, labels, img_path, (input_h, input_w) = self.get_data(img_path, label_path, random_seed = seed)
+
+        # 生成前一帧的图像路径
+        img_index_for_pre_id = img_path.split('/')[-1].split(".jpg")[0]
+        str_count = len(img_index_for_pre_id)
+        pre_id = max(1, int(img_index_for_pre_id) - random.randint(5, 10))
+        pre_image_id = f"{{0:0{str_count}d}}".format(pre_id)
+
+        video_path = img_path.split('/')[-4:-1]
+        ann_path = label_path.split('/')[-4:-1]
+        og_path = img_path.split('/' + ann_path[0])
+
+        pre_img_path = os.path.join(og_path[0], video_path[0], video_path[1], video_path[2], pre_image_id + '.jpg')
+        pre_label_path = os.path.join(og_path[0], ann_path[0], ann_path[1], ann_path[2], pre_image_id + '.txt')
+
+        if not os.path.isfile(pre_img_path):
+            pre_label_path = label_path
+            pre_img_path = img_path
+            pre_imgs = imgs
+            pre_labels = labels
+        else:
+            pre_imgs, pre_labels, pre_img_path, (pre_input_h, pre_input_w) = self.get_data(pre_img_path, pre_label_path, random_seed = seed)
 
         # 存在多个子训练集时, 为每个子训练集合(视频seq)计算正确的起始index
         # @even: for MCMOT training
@@ -575,42 +598,99 @@ class JointDataset(LoadImagesAndLabels):  # for training
 
         output_h = imgs.shape[1] // self.opt.down_ratio  # 向下取整除法
         output_w = imgs.shape[2] // self.opt.down_ratio
-        # print('output_h, output_w: %d %d' % (output_h, output_w))
 
-        # num_classes = self.num_classes
+        draw_gaussian = draw_msra_gaussian if self.opt.mse_loss else draw_umich_gaussian
+        # draw_gaussian_reid = draw_msra_gaussian
+        pre_num_objs = pre_labels.shape[0]
+        # --- GT of detection
+        pre_hm = np.zeros((self.num_classes, output_h, output_w), dtype=np.float32)  # C×H×W: heat-map通道数即类别数
+        pre_wh = np.zeros((self.max_objs, 2), dtype=np.float32)
+        pre_reg = np.zeros((self.max_objs, 2), dtype=np.float32)
+        pre_ind = np.zeros((self.max_objs,), dtype=np.int64)  # K个object
+        pre_reg_mask = np.zeros((self.max_objs,), dtype=np.uint8)  # 只计算feature map有目标的像素的reg loss
 
-        # 图片中实际标注的目标数
+        pre_reid_hm = np.zeros((self.max_objs, output_h, output_w), dtype=np.float32)
+
+        if self.opt.id_weight > 0:
+            # --- GT of ReID
+            pre_ids = np.zeros((self.max_objs,), dtype=np.int64)  # 一张图最多检测并ReID K个目标, 都初始化id为0
+
+            # @even: 每个目标类别都对应一组track ids
+            pre_cls_tr_ids = np.full((self.num_classes, output_h, output_w), -1,dtype=np.int64)
+            # @even, class id map: 每个(x, y)处的目标类别, 都初始化为-1
+            pre_cls_id_map = np.full((1, output_h, output_w), -1, dtype=np.int64)  # 1×H×W
+            pre_id_mask = np.full((self.max_objs), -1, dtype=np.int64)
+
+        # 遍历每一个ground truth检测目标
+        for k in range(pre_num_objs):  # 图片中实际的目标个数
+            pre_label = pre_labels[k]
+
+            # 计算bbox的经过网络的输出GT值
+            #                               0        1        2       3
+            pre_bbox = pre_label[2:]  # center_x, center_y, bbox_w, bbox_h
+
+            # 检测目标的类别(索引从0开始, 0代表背景类别)
+            pre_cls_id = int(pre_label[0])
+
+            pre_bbox[[0, 2]] = pre_bbox[[0, 2]] * output_w
+            pre_bbox[[1, 3]] = pre_bbox[[1, 3]] * output_h
+            pre_bbox[0] = np.clip(pre_bbox[0], 0, output_w - 1)
+            pre_bbox[1] = np.clip(pre_bbox[1], 0, output_h - 1)
+
+            pre_w, pre_h = pre_bbox[2], pre_bbox[3]
+
+            if pre_h > 0 and pre_w > 0:
+                # heat-map radius
+                pre_radius = gaussian_radius((math.ceil(pre_h), math.ceil(pre_w)))
+                pre_radius = max(0, int(pre_radius))  # radius >= 0
+                pre_radius = self.opt.hm_gauss if self.opt.mse_loss else pre_radius
+
+                # bbox center coordinate
+                pre_ct = np.array([pre_bbox[0], pre_bbox[1]], dtype=np.float32)
+                pre_ct_int = pre_ct.astype(np.int32)  # floor int
+
+
+                # draw gauss weight for heat-map
+                draw_gaussian(pre_hm[pre_cls_id], pre_ct_int, pre_radius)  # hm
+                draw_gaussian(pre_reid_hm[k], pre_ct_int, pre_radius)
+
+                # --- GT of detection
+                pre_wh[k] = float(pre_w), float(pre_h)
+
+                # 记录feature map上有目标的坐标索引
+                pre_ind[k] = pre_ct_int[1] * output_w + pre_ct_int[0]  # feature map index:y*w+x
+                pre_reg[k] = pre_ct - pre_ct_int  # [x,y]
+                pre_reg_mask[k] = 1
+
+                if self.opt.id_weight > 0:
+                    if pre_cls_id_map[0][pre_ct_int[1], pre_ct_int[0]] == -1:
+                        pre_cls_id_map[0][pre_ct_int[1], pre_ct_int[0]] = pre_cls_id  # 1×H×W
+                        pre_id_mask[k] = pre_cls_id
+                        pre_ids[k] = pre_label[1] - 1
+                        pre_cls_tr_ids[pre_cls_id][pre_ct_int[1]][pre_ct_int[0]] = pre_label[1] - 1  # track id从1开始的, 转换成从0开始
+
         num_objs = labels.shape[0]
 
-        # --- GT of detection
         hm = np.zeros((self.num_classes, output_h, output_w), dtype=np.float32)  # C×H×W: heat-map通道数即类别数
         wh = np.zeros((self.max_objs, 2), dtype=np.float32)
         reg = np.zeros((self.max_objs, 2), dtype=np.float32)
         ind = np.zeros((self.max_objs,), dtype=np.int64)  # K个object
+
         reg_mask = np.zeros((self.max_objs,), dtype=np.uint8)  # 只计算feature map有目标的像素的reg loss
+        reid_hm = np.zeros((self.max_objs, output_h, output_w), dtype=np.float32)  # 只计算feature map有目标的像素的reg loss
 
-        if self.opt.id_weight > 0:
-            # --- GT of ReID
-            ids = np.zeros((self.max_objs,), dtype=np.int64)  # 一张图最多检测并ReID K个目标, 都初始化id为0
+        ids = np.zeros((self.max_objs,), dtype=np.int64)  # 一张图最多检测并ReID K个目标, 都初始化id为0
+        cls_tr_ids = np.full((self.num_classes, output_h, output_w), -1, dtype=np.int64)
+        cls_id_map = np.full((1, output_h, output_w), -1, dtype=np.int64)  # 1×H×W
 
-            # @even: 每个目标类别都对应一组track ids
-            cls_tr_ids = np.zeros((self.num_classes, output_h, output_w), dtype=np.int64)
-
-            # @even, class id map: 每个(x, y)处的目标类别, 都初始化为-1
-            cls_id_map = np.full((1, output_h, output_w), -1, dtype=np.int64)  # 1×H×W
-
-        # Gauss function definition
-        draw_gaussian = draw_msra_gaussian if self.opt.mse_loss else draw_umich_gaussian
-
+        id_mask = np.full((self.max_objs), -1, dtype=np.int64)
         # 遍历每一个ground truth检测目标
-        for k in range(num_objs):  # 图片中实际的目标个数
-            label = labels[k]
 
-            # 计算bbox的经过网络的输出GT值
-            #                       0        1        2       3
+        for k in range(num_objs):  # 图片中实际的目标个数
+
+            label = labels[k]
             bbox = label[2:]  # center_x, center_y, bbox_w, bbox_h
 
-            # 检测目标的类别(索引从0开始, 0代表背景类别)
             cls_id = int(label[0])
 
             bbox[[0, 2]] = bbox[[0, 2]] * output_w
@@ -626,68 +706,55 @@ class JointDataset(LoadImagesAndLabels):  # for training
                 radius = max(0, int(radius))  # radius >= 0
                 radius = self.opt.hm_gauss if self.opt.mse_loss else radius
 
-                # bbox center coordinate
-                ct = np.array([bbox[0], bbox[1]], dtype=np.float32)
+                # bbox center coordinate, (W,H) (X,Y)
+                ct = np.array([bbox[0], bbox[1]], dtype=np.float32)  # 真实目标中心，
                 ct_int = ct.astype(np.int32)  # floor int
 
                 # draw gauss weight for heat-map
                 draw_gaussian(hm[cls_id], ct_int, radius)  # hm
+                draw_gaussian(reid_hm[k], ct_int, radius)
 
                 # --- GT of detection
                 wh[k] = float(w), float(h)
-
                 # 记录feature map上有目标的坐标索引
                 ind[k] = ct_int[1] * output_w + ct_int[0]  # feature map index:y*w+x
-
-                # offset regression
                 reg[k] = ct - ct_int
                 reg_mask[k] = 1
-
                 # --- GT of ReID
                 if self.opt.id_weight > 0:
                     # @even: 取output feature map的每个(y, x)处的目标类别
-                    cls_id_map[0][ct_int[1], ct_int[0]] = cls_id  # 1×H×W
+                    if cls_id_map[0][ct_int[1], ct_int[0]] == -1:
+                        cls_id_map[0][ct_int[1], ct_int[0]] = cls_id  # 1×H×W
+                        id_mask[k] = cls_id
+                        cls_tr_ids[cls_id][ct_int[1]][ct_int[0]] = label[1] - 1  # track id从1开始的, 转换成从0开始
+                        ids[k] = label[1] - 1  # 分类的idx: track id - 1
 
-                    # @even: 记录该类别对应的track ids
-                    cls_tr_ids[cls_id][ct_int[1]][ct_int[0]] = label[1] - 1  # track id从1开始的, 转换成从0开始
 
-                    ids[k] = label[1] - 1  # 分类的idx: track id - 1
+        ret = {'input': imgs,
+               'hm': hm,
+               'reg': reg,
+               'wh': wh,
+               'ind': ind,
+               'reg_mask': reg_mask,
+               'ids': ids,
+               'cls_id_map': cls_id_map,  # feature map上每个(x, y)处的目标类别id
+               'cls_tr_ids': cls_tr_ids,
+               'id_mask':id_mask,
+               'reid_hm': reid_hm,
 
-        # --- DETR-format targets (padded to max_objs for DataLoader collation)
-        detr_boxes     = np.zeros((self.max_objs, 4), dtype=np.float32)   # cxcywh normalized
-        detr_labels    = np.full((self.max_objs,), -1, dtype=np.int64)    # class id, -1=pad
-        detr_track_ids = np.full((self.max_objs,), -1, dtype=np.int64)    # global track id
-        for k in range(num_objs):
-            lb = labels[k]
-            detr_boxes[k]     = lb[2:6]        # already cxcywh normalized
-            detr_labels[k]    = int(lb[0])
-            detr_track_ids[k] = int(lb[1])
+               'pre_input': pre_imgs,
+               'pre_hm': pre_hm,
+               'pre_reg': pre_reg,
+               'pre_wh': pre_wh,
+               'pre_ind': pre_ind,
+               'pre_reg_mask': pre_reg_mask,
+               'pre_ids': pre_ids,
+               'pre_cls_id_map': pre_cls_id_map,  # feature map上每个(x, y)处的目标类别id
+               'pre_cls_tr_ids': pre_cls_tr_ids,
 
-        if self.opt.id_weight > 0:
-            ret = {'input': imgs,
-                   'hm': hm,
-                   'reg': reg,
-                   'wh': wh,
-                   'ind': ind,
-                   'reg_mask': reg_mask,
-                   'ids': ids,
-                   'cls_id_map': cls_id_map,
-                   'cls_tr_ids': cls_tr_ids,
-                   'detr_boxes': detr_boxes,
-                   'detr_labels': detr_labels,
-                   'detr_track_ids': detr_track_ids,
-                   'detr_num_objs': np.array(num_objs, dtype=np.int64)}
-        else:
-            ret = {'input': imgs,
-                   'hm': hm,
-                   'reg': reg,
-                   'wh': wh,
-                   'ind': ind,
-                   'reg_mask': reg_mask,
-                   'detr_boxes': detr_boxes,
-                   'detr_labels': detr_labels,
-                   'detr_track_ids': detr_track_ids,
-                   'detr_num_objs': np.array(num_objs, dtype=np.int64)}
+               'pre_reid_hm': pre_reid_hm,
+               'pre_id_mask': pre_id_mask,
+               }
 
         return ret
 

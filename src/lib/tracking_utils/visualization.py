@@ -353,7 +353,7 @@ def plot_detections(image, tlbrs, scores=None, color=(255, 0, 0), ids=None):
     text_scale = max(1, image.shape[1] / 800.)
     thickness = 2 if text_scale > 1.3 else 1
     for i, det in enumerate(tlbrs):
-        x1, y1, x2, y2 = np.asarray(det[:4], dtype=np.int64)
+        x1, y1, x2, y2 = np.asarray(det[:4], dtype=np.int)
         if len(det) >= 7:
             label = 'det' if det[5] > 0 else 'trk'
             if ids is not None:
