@@ -67,8 +67,8 @@ class opts(object):
         self.parser.add_argument('--input_res', type=int, default=-1)
         self.parser.add_argument('--input_h',   type=int, default=-1)
         self.parser.add_argument('--input_w',   type=int, default=-1)
-        self.parser.add_argument('--input-wh', type=tuple, default=(1088, 608),
-                                 help='default net input resolution (W, H)')
+        self.parser.add_argument('--input-wh', type=int, nargs=2, default=[1088, 608],
+                                 help='default net input resolution W H (e.g. 1088 608)')
 
         # train
         self.parser.add_argument('--lr', type=float, default=7e-4)
