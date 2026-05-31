@@ -229,7 +229,8 @@ class ECDetJDECriterion(nn.Module):
             return {}
 
         pred_reid = outputs['pred_reid']   # (B, N_det, reid_dim)
-        reid_loss = torch.zeros(1, device=pred_reid.device, requires_grad=False).squeeze()
+        dev = pred_reid.device
+        reid_loss = torch.zeros(1, device=dev, requires_grad=False).squeeze()
 
         for cls_id, nid in self.nid_dict.items():
             all_emb, all_ids = [], []
@@ -237,15 +238,21 @@ class ECDetJDECriterion(nn.Module):
                 if len(src_idx) == 0:
                     continue
                 t = targets[b_idx]
+                # Ensure indices are on the same device as target tensors.
+                # src_idx/tgt_idx come from the matcher (GPU); track_ids may
+                # still be on CPU if the dataloader didn't move it to GPU.
+                tgt_idx_dev = tgt_idx.to(dev)
+                src_idx_dev = src_idx.to(dev)
+
                 # filter to this class
-                cls_mask  = (t['labels'][tgt_idx] == cls_id)
+                cls_mask  = (t['labels'].to(dev)[tgt_idx_dev] == cls_id)
                 if cls_mask.sum() == 0:
                     continue
-                track_ids = t['track_ids'][tgt_idx[cls_mask]]  # (M,)
+                track_ids = t['track_ids'].to(dev)[tgt_idx_dev[cls_mask]]  # (M,)
                 valid     = track_ids >= 0
                 if valid.sum() == 0:
                     continue
-                emb = pred_reid[b_idx][src_idx[cls_mask][valid]]   # (M, reid_dim)
+                emb = pred_reid[b_idx][src_idx_dev[cls_mask][valid]]   # (M, reid_dim)
                 emb = F.normalize(emb) * self.emb_scale_dict[cls_id]
                 all_emb.append(emb)
                 all_ids.append(track_ids[valid])
