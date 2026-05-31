@@ -597,7 +597,7 @@ class MCJDETracker(object):
                     else:
                         min_dist_2 = 0
 
-                    if min_dist_1 <= 2 and min_dist_2 <= 2:  # IOU < 0.2
+                    if min_dist_1 <= 0.2 and min_dist_2 <= 0.2:  # max IOU with any det < 0.2
                         # print(dist, min_dist_1, min_dist_2)
                         track.update_retrack(track.tlwh, self.frame_id)
                         activated_tracks_dict[cls_id].append(track)
