@@ -65,9 +65,21 @@ class opts(object):
                                  help='default net input resolution W H (e.g. 1088 608)')
 
         # train
-        self.parser.add_argument('--lr', type=float, default=7e-4)
+        self.parser.add_argument('--lr', type=float, default=5e-4,
+                                 help='base learning rate (AdamW)')
+        self.parser.add_argument('--weight_decay', type=float, default=1e-4)
         self.parser.add_argument('--lr_step', type=str, default='10,20',
-                                 help='epochs to drop LR by 10x')
+                                 help='epochs to drop LR by 10x (only used when --lr_scheduler=step)')
+        self.parser.add_argument('--lr_scheduler', default='flatcosine',
+                                 help='flatcosine | step')
+        self.parser.add_argument('--lr_gamma', type=float, default=0.5,
+                                 help='FlatCosine: min_lr = base_lr * lr_gamma')
+        self.parser.add_argument('--warmup_iter', type=int, default=2000,
+                                 help='FlatCosine: linear warmup iterations')
+        self.parser.add_argument('--flat_epoch', type=int, default=-1,
+                                 help='FlatCosine: epochs at peak LR (-1 = use mosaic_epoch from dataset)')
+        self.parser.add_argument('--no_aug_epochs', type=int, default=2,
+                                 help='FlatCosine: trailing epochs at min_lr')
         self.parser.add_argument('--num_epochs', type=int, default=30)
         self.parser.add_argument('--batch_size', type=int, default=8)
         self.parser.add_argument('--master_batch_size', type=int, default=-1)

@@ -69,8 +69,8 @@ class ECDetJDEWithLoss(nn.Module):
 
 
 class MotTrainer(BaseTrainer):
-    def __init__(self, opt, model, optimizer=None):
-        super().__init__(opt, model, optimizer=optimizer)
+    def __init__(self, opt, model, optimizer=None, **kwargs):
+        super().__init__(opt, model, optimizer=optimizer, **kwargs)
 
     def _get_losses(self, opt):
         loss_states = ['loss', 'loss_mal', 'loss_bbox', 'loss_giou', 'loss_fgl', 'loss_reid']

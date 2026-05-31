@@ -25,9 +25,10 @@ class ModleWithLoss(torch.nn.Module):
 
 
 class BaseTrainer(object):
-    def __init__(self, opt, model, optimizer=None):
+    def __init__(self, opt, model, optimizer=None, **kwargs):
         self.opt = opt
         self.optimizer = optimizer
+        self.lr_scheduler = kwargs.get('lr_scheduler', None)
         self.loss_stats, self.loss = self._get_losses(opt)
 
         # Subclasses can override _build_model_with_loss for custom wrappers
@@ -123,12 +124,18 @@ class BaseTrainer(object):
                 if (batch_i + 1) % accum == 0 or is_last:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                    if self.lr_scheduler is not None:
+                        global_iter = (epoch - 1) * num_iters + batch_i
+                        self.lr_scheduler.step(global_iter, self.optimizer)
 
             batch_time.update(time.time() - end)
             end = time.time()
 
-            Bar.suffix = '{phase}: [{0}][{1}/{2}]|Tot: {total:} |ETA: {eta:} '.format(
+            is_step_iter = phase == 'train' and (
+                (batch_i + 1) % accum == 0 or (batch_i + 1) == num_iters)
+            Bar.suffix = '{phase}: [{0}][{1}/{2}]{step}|Tot: {total:} |ETA: {eta:} '.format(
                 epoch, batch_i, num_iters, phase=phase,
+                step='*' if is_step_iter else ' ',
                 total=bar.elapsed_td, eta=bar.eta_td)
             for l in avg_loss_stats:
                 avg_loss_stats[l].update(loss_stats[l].mean().item(), batch['input'].size(0))
