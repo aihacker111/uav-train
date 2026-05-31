@@ -608,7 +608,10 @@ class JointDataset(LoadImagesAndLabels):  # for training
 
             # 计算bbox的经过网络的输出GT值
             #                       0        1        2       3
-            bbox = label[2:]  # center_x, center_y, bbox_w, bbox_h
+            # .copy() breaks the numpy view so that the in-place pixel-scale
+            # conversion below does NOT mutate labels[k], which must stay
+            # normalized [0,1] for the DETR targets read after this loop.
+            bbox = label[2:].copy()  # center_x, center_y, bbox_w, bbox_h
 
             # 检测目标的类别(索引从0开始, 0代表背景类别)
             cls_id = int(label[0])
