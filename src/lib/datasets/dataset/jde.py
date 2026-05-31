@@ -579,9 +579,12 @@ class JointDataset(LoadImagesAndLabels):  # for training
         detr_track_ids = np.full((self.max_objs,),    -1, dtype=np.int64)
         for k in range(num_objs):
             lb = labels[k]
-            detr_boxes[k]     = lb[2:6]   # cxcywh normalized [0,1]
-            detr_labels[k]    = int(lb[0])
-            detr_track_ids[k] = int(lb[1])
+            detr_boxes[k]  = lb[2:6]   # cxcywh normalized [0,1]
+            detr_labels[k] = int(lb[0])
+            # lb[1] is 1-indexed (label files start from 1); convert to 0-indexed
+            # for the CE classifier. If unlabeled (lb[1]==-1), stays negative
+            # and gets filtered in loss_reid by `valid = track_ids >= 0`.
+            detr_track_ids[k] = int(lb[1]) - 1
 
         return {
             'input':          imgs,
