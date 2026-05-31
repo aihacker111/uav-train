@@ -140,12 +140,14 @@ def run(opt):
         drop_last=True,
     )
 
-    lr_scheduler = build_lr_scheduler(optimizer, opt, iter_per_epoch=len(train_loader))
-
     print('Starting training...')
     Trainer = train_factory[opt.task]
-    trainer = Trainer(opt=opt, model=model, optimizer=optimizer, lr_scheduler=lr_scheduler)
+    trainer = Trainer(opt=opt, model=model, optimizer=optimizer)
     trainer.set_device(opt.gpus, opt.chunk_sizes, opt.device)
+
+    # Build lr_scheduler AFTER trainer.__init__ so add_param_group (loss params) is already done
+    lr_scheduler = build_lr_scheduler(optimizer, opt, iter_per_epoch=len(train_loader))
+    trainer.lr_scheduler = lr_scheduler
 
     for epoch in range(start_epoch + 1, opt.num_epochs + 1):
         mark = epoch if opt.save_all else 'last'
