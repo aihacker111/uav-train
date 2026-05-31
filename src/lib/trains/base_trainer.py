@@ -90,6 +90,7 @@ class BaseTrainer(object):
             torch.cuda.empty_cache()
 
         opt = self.opt
+        accum = max(1, getattr(opt, 'grad_accum', 1))
         results = {}
         data_time, batch_time = AverageMeter(), AverageMeter()
         avg_loss_stats = {l: AverageMeter() for l in self.loss_stats}
@@ -97,8 +98,9 @@ class BaseTrainer(object):
         bar = Bar('{}/{}'.format(opt.task, opt.exp_id), max=num_iters)
         end = time.time()
 
-        # train each batch
-        # print('Total {} batches in en epoch.'.format(len(data_loader) + 1))
+        if phase == 'train':
+            self.optimizer.zero_grad()
+
         for batch_i, batch in enumerate(data_loader):
             if batch_i >= num_iters:
                 break
@@ -113,12 +115,14 @@ class BaseTrainer(object):
             # Forward
             output, loss, loss_stats = model_with_loss.forward(batch)
 
-            # Backwards
+            # Backwards with gradient accumulation
             loss = loss.mean()
             if phase == 'train':
-                self.optimizer.zero_grad()  # 优化器梯度清零
-                loss.backward()  # 梯度反传
-                self.optimizer.step()  # 优化器依据反传的梯度, 更新网络权重
+                (loss / accum).backward()
+                is_last = (batch_i + 1 == num_iters)
+                if (batch_i + 1) % accum == 0 or is_last:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
 
             batch_time.update(time.time() - end)
             end = time.time()

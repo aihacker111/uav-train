@@ -71,6 +71,8 @@ class opts(object):
         self.parser.add_argument('--num_epochs', type=int, default=30)
         self.parser.add_argument('--batch_size', type=int, default=8)
         self.parser.add_argument('--master_batch_size', type=int, default=-1)
+        self.parser.add_argument('--grad_accum', type=int, default=1,
+                                 help='gradient accumulation steps; effective batch = batch_size * grad_accum')
         self.parser.add_argument('--num_iters', type=int, default=-1)
         self.parser.add_argument('--val_intervals', type=int, default=5)
         self.parser.add_argument('--trainval', action='store_true')
