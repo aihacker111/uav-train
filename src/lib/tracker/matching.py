@@ -447,6 +447,9 @@ def reid_motion_unconfirmed(tracks, dets, id_feature, reg,
     cost_matrix = np.zeros((len(tracks), len(dets)), dtype=np.float64)
     if cost_matrix.size == 0:
         return cost_matrix
+    # ECDetJDE stores sparse reid dicts; spatial-attention motion not applicable
+    if len(id_feature) < 2 or isinstance(id_feature[-1], dict):
+        return np.ones((len(tracks), len(dets)), dtype=np.float64)
     else:
 
         tracks_id = torch.from_numpy(np.array([track.curr_feat if track.state == 1 else track.smooth_feat
@@ -488,6 +491,9 @@ def reid_motion(tracks, dets, id_feature, reg,
     cost_matrix = np.zeros((len(tracks), len(dets)), dtype=np.float64)
     if cost_matrix.size == 0:
         return cost_matrix
+    # ECDetJDE stores sparse reid dicts; spatial-attention motion not applicable
+    if len(id_feature) < 2 or isinstance(id_feature[-1], dict):
+        return np.ones((len(tracks), len(dets)), dtype=np.float64)
     else:
 
         tracks_id = torch.from_numpy(np.array([track.curr_feat if track.state == 1 else track.smooth_feat
@@ -621,6 +627,10 @@ def fuse_motion(kf,
 
 def reid_motion_lost_det(track, id_feature, reg,
                          h_out, w_out, height, width):
+    # ECDetJDE stores sparse reid dicts; return track's own center so dist=0 (IOU still gates re-activation)
+    if len(id_feature) < 2 or isinstance(id_feature[-1], dict):
+        x, y, w, h = track.tlwh
+        return np.array([[x + w / 2.0, y + h / 2.0]], dtype=np.float32)
     track_id = torch.from_numpy(track.curr_feat)[None, :].to(id_feature[-1].device)
     past_feature_map = reid_attention(track_id, id_feature[-1][0])
     past_to_curr = return_position(past_feature_map, reg[-1], h_out, w_out, height, width)
