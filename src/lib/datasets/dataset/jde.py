@@ -8,17 +8,20 @@ import time
 import warnings
 
 import cv2
-# import json
 import numpy as np
 import torch
 
 from collections import OrderedDict, defaultdict
-# from torch.utils.data import Dataset
-# from torchvision.transforms import transforms as T
-# from cython_bbox import bbox_overlaps as bbox_ious
-# from lib.opts import opts
 from lib.utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 from lib.tracker.multitracker import id2cls
+from lib.datasets.augment import (
+    MosaicAugmentor, photometric_distort,
+    random_zoom_out, random_iou_crop, sanitize_boxes,
+)
+
+# ImageNet mean/std (matching EdgeCrafter's Normalize op)
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 # for inference
@@ -528,12 +531,33 @@ class JointDataset(LoadImagesAndLabels):  # for training
             for k, v in last_idx_dict.items():
                 self.nID_dict[k] = int(v)  # 每个类别的tack ids数量
 
-        self.nds = [len(x) for x in self.img_files.values()]  # 每个子训练集(MOT15, MOT20...)的图片数
-        self.cds = [sum(self.nds[:i]) for i in range(len(self.nds))]  # 当前子数据集前面累计图片总数?
-        self.nF = sum(self.nds)  # 用于训练的所有子训练集的图片总数
-        self.max_objs = opt.K  # 每张图最多检测跟踪的目标个数
+        self.nds = [len(x) for x in self.img_files.values()]
+        self.cds = [sum(self.nds[:i]) for i in range(len(self.nds))]
+        self.nF = sum(self.nds)
+        self.max_objs = opt.K
         self.augment = augment
         self.transforms = transforms
+
+        # ---- EdgeCrafter-style augmentation schedule ----
+        self.cur_epoch         = 0
+        self.mosaic_prob       = getattr(opt, 'mosaic_prob',       0.5)
+        self.mosaic_epoch      = getattr(opt, 'mosaic_epoch',      25)
+        self.stop_epoch        = getattr(opt, 'stop_epoch',        48)
+        self.photodistort_prob = getattr(opt, 'photodistort_prob', 0.5)
+        self.zoomout_max_scale = getattr(opt, 'zoomout_max_scale', 4.0)
+        self.iou_crop_prob     = getattr(opt, 'iou_crop_prob',     0.8)
+
+        tile_size = min(self.height, self.width) // 2
+        self.mosaic_augmentor = MosaicAugmentor(
+            output_size = tile_size,
+            max_cached  = getattr(opt, 'mosaic_max_cached',  50),
+            random_pop  = True,
+            rotation    = getattr(opt, 'mosaic_rotation',    10.0),
+            translation = (getattr(opt, 'mosaic_translate',  0.1),) * 2,
+            scaling     = (getattr(opt, 'mosaic_scale_lo',   0.5),
+                           getattr(opt, 'mosaic_scale_hi',   1.5)),
+            fill        = 114,
+        )
 
         print('dataset summary')
         print(self.tid_num)
@@ -549,45 +573,129 @@ class JointDataset(LoadImagesAndLabels):  # for training
                     print('Start index of dataset {} class {:d} is {:d}'
                           .format(k, int(cls_id), int(start_idx)))
 
+    # ------------------------------------------------------------------
+    # Epoch-aware augmentation schedule (call once per epoch in train loop)
+    # ------------------------------------------------------------------
+
+    def set_epoch(self, epoch: int):
+        """Set current epoch (0-indexed) for augmentation schedule."""
+        self.cur_epoch = epoch
+
+    # ------------------------------------------------------------------
+    # Raw loader — no augmentation, returns cxcywh-norm labels
+    # ------------------------------------------------------------------
+
+    def _load_raw(self, img_path, label_path):
+        """Load raw BGR image + normalized cxcywh labels. No resize, no aug."""
+        img = cv2.imread(img_path)
+        if img is None:
+            raise ValueError(f'File corrupt {img_path}')
+
+        labels = np.zeros((0, 6), dtype=np.float32)
+        if os.path.isfile(label_path):
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                raw = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 6)
+                if len(raw) > 0:
+                    labels = raw   # [cls, tid, cx, cy, w, h] already normalized
+
+        return img, labels
+
+    # ------------------------------------------------------------------
+    # Letterbox helper (adjusts labels for the added padding/scaling)
+    # ------------------------------------------------------------------
+
+    def _letterbox_labels(self, labels, orig_w, orig_h, ratio, pad_w, pad_h):
+        """Adjust cxcywh-norm labels from original image to letterboxed image."""
+        if len(labels) == 0:
+            return labels
+        out = labels.copy()
+        out[:, 2] = (labels[:, 2] * orig_w * ratio + pad_w) / self.width
+        out[:, 3] = (labels[:, 3] * orig_h * ratio + pad_h) / self.height
+        out[:, 4] = labels[:, 4] * orig_w * ratio / self.width
+        out[:, 5] = labels[:, 5] * orig_h * ratio / self.height
+        return sanitize_boxes(out, self.width, self.height)
+
+    # ------------------------------------------------------------------
+    # Main __getitem__ with EdgeCrafter augmentation schedule
+    # ------------------------------------------------------------------
+
     def __getitem__(self, idx):
-        # 为子训练集计算起始index
+        # locate sub-dataset
         for i, c in enumerate(self.cds):
             if idx >= c:
-                ds = list(self.label_files.keys())[i]
+                ds          = list(self.label_files.keys())[i]
                 start_index = c
 
-        img_path = self.img_files[ds][idx - start_index]
+        img_path   = self.img_files[ds][idx - start_index]
         label_path = self.label_files[ds][idx - start_index]
 
-        # Get image data and label
-        imgs, labels, img_path, (input_h, input_w) = self.get_data(img_path, label_path)
-        # print('input_h, input_w: %d %d' % (input_h, input_w))
+        img, labels = self._load_raw(img_path, label_path)
+        orig_h, orig_w = img.shape[:2]
 
-        # Remap track IDs to global offsets across sub-datasets
-        if self.opt.id_weight > 0:
-            for i, _ in enumerate(labels):
+        epoch       = self.cur_epoch
+        with_mosaic = (self.augment and
+                       self.mosaic_prob > 0 and
+                       epoch < self.mosaic_epoch and
+                       random.random() < self.mosaic_prob)
+
+        if not self.augment:
+            # ---- validation / no-aug path ----
+            pass
+
+        elif with_mosaic:
+            # ---- Mosaic path ----
+            img, labels    = self.mosaic_augmentor(img, labels)
+            img            = photometric_distort(img, p=self.photodistort_prob)
+            orig_h, orig_w = img.shape[:2]
+
+        elif epoch < self.stop_epoch:
+            # ---- Strong aug path (no mosaic) ----
+            img            = photometric_distort(img, p=self.photodistort_prob)
+            img, labels    = random_zoom_out(img, labels, fill=114,
+                                             max_scale=self.zoomout_max_scale)
+            img, labels    = random_iou_crop(img, labels, p=self.iou_crop_prob)
+            orig_h, orig_w = img.shape[:2]
+
+        # else: epoch >= stop_epoch → clean path, no augmentation
+
+        # ---- letterbox to network input size ----
+        img, ratio, pad_w, pad_h = letterbox(img, height=self.height, width=self.width)
+        labels = self._letterbox_labels(labels, orig_w, orig_h, ratio, pad_w, pad_h)
+
+        # ---- random horizontal flip ----
+        if self.augment and random.random() > 0.5:
+            img = np.fliplr(img)
+            if len(labels) > 0:
+                labels[:, 2] = 1 - labels[:, 2]
+
+        # ---- BGR → RGB, normalize (ImageNet mean/std) ----
+        img = img[:, :, ::-1].astype(np.float32) / 255.0
+        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
+        img = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
+
+        # ---- remap track IDs to global offsets ----
+        if self.opt.id_weight > 0 and len(labels) > 0:
+            for i in range(len(labels)):
                 if labels[i, 1] > -1:
                     cls_id    = int(labels[i][0])
-                    start_idx = self.tid_start_idx_of_cls_ids[ds][cls_id]
+                    start_idx = self.tid_start_idx_of_cls_ids[ds].get(cls_id, 0)
                     labels[i, 1] += start_idx
 
-        num_objs = labels.shape[0]
-
-        # DETR-format targets: cxcywh normalized, padded to max_objs
+        # ---- pack DETR-format targets ----
+        num_objs       = len(labels)
         detr_boxes     = np.zeros((self.max_objs, 4), dtype=np.float32)
-        detr_labels    = np.full((self.max_objs,),    -1, dtype=np.int64)
-        detr_track_ids = np.full((self.max_objs,),    -1, dtype=np.int64)
+        detr_labels    = np.full((self.max_objs,), -1, dtype=np.int64)
+        detr_track_ids = np.full((self.max_objs,), -1, dtype=np.int64)
+
         for k in range(num_objs):
             lb = labels[k]
-            detr_boxes[k]  = lb[2:6]   # cxcywh normalized [0,1]
-            detr_labels[k] = int(lb[0])
-            # lb[1] is 1-indexed (label files start from 1); convert to 0-indexed
-            # for the CE classifier. If unlabeled (lb[1]==-1), stays negative
-            # and gets filtered in loss_reid by `valid = track_ids >= 0`.
-            detr_track_ids[k] = int(lb[1]) - 1
+            detr_boxes[k]     = lb[2:6]
+            detr_labels[k]    = int(lb[0])
+            detr_track_ids[k] = int(lb[1]) - 1   # 1-indexed → 0-indexed
 
         return {
-            'input':          imgs,
+            'input':          img,
             'detr_boxes':     detr_boxes,
             'detr_labels':    detr_labels,
             'detr_track_ids': detr_track_ids,

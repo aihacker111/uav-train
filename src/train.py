@@ -152,6 +152,9 @@ def run(opt):
     for epoch in range(start_epoch + 1, opt.num_epochs + 1):
         mark = epoch if opt.save_all else 'last'
 
+        # notify dataset of current epoch (0-indexed, matching EdgeCrafter convention)
+        train_loader.dataset.set_epoch(epoch - 1)
+
         log_dict_train, _ = trainer.train(epoch, train_loader)
 
         logger.write('epoch: {} |'.format(epoch))
