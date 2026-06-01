@@ -632,8 +632,11 @@ class JointDataset(LoadImagesAndLabels):  # for training
         return img, out
 
     # ------------------------------------------------------------------
-    # Main __getitem__ — EdgeCrafter aug order (no mosaic):
-    # PhotometricDistort → ZoomOut → IoUCrop → sanitize → letterbox → flip → sanitize
+    # Main __getitem__:
+    # letterbox → PhotometricDistort → ZoomOut → IoUCrop → sanitize
+    #           → letterbox(re-fit) → flip → sanitize
+    # Spatial augs run on the SMALL letterboxed image (~1088×608) not the raw
+    # large image, so intermediate arrays are 10-20× smaller → fast data loading.
     # ------------------------------------------------------------------
 
     def __getitem__(self, idx):
@@ -653,36 +656,42 @@ class JointDataset(LoadImagesAndLabels):  # for training
         do_aug = self.augment and self.cur_epoch < self.stop_epoch
 
         # ----------------------------------------------------------------
-        # Augmentation pipeline (mirrors EdgeCrafter ecdet.yml, no mosaic)
-        # Order: PhotometricDistort → ZoomOut → IoUCrop → sanitize
-        #        → letterbox → flip → sanitize
+        # Step 1: Letterbox to network size FIRST.
+        # Labels are normalized [0,1] so letterbox just re-scales them.
+        # Everything after this point operates on a small fixed-size image
+        # (e.g. 1088×608) instead of the raw 1920×1080+ source — this is
+        # the key speed win for data loading.
         # ----------------------------------------------------------------
-        if do_aug:
-            # 1. Color distortion (full photometric, not just S/V)
-            img = random_photometric_distort(img)
-
-            # 2. Scale out — creates small-object diversity for UAV scenes
-            img, labels = random_zoom_out(img, labels, max_scale=2.0, p=0.5)
-
-            # 3. SSD-style IoU crop (p=0.8, matches EdgeCrafter RandomIoUCrop)
-            img, labels = random_iou_crop(img, labels, min_scale=0.3, p=0.8)
-
-            # 4. Sanitize after spatial ops — clip to image, drop degenerate boxes
-            labels = sanitize_boxes(labels, img.shape[1], img.shape[0])
-
-        # ---- letterbox to network input size ----
         pre_lb_h, pre_lb_w = img.shape[:2]
         img, ratio, pad_w, pad_h = letterbox(img, height=self.height, width=self.width)
         labels = self._letterbox_labels(labels, pre_lb_w, pre_lb_h, ratio, pad_w, pad_h)
 
         if do_aug:
-            # 5. Random horizontal flip
+            # 2. Color distortion (operates on whatever size, fast)
+            img = random_photometric_distort(img)
+
+            # 3. ZoomOut on small image (max 2× of 1088×608 = 2176×1216, not raw size)
+            img, labels = random_zoom_out(img, labels, max_scale=2.0, p=0.5)
+
+            # 4. IoU crop — bring image back toward target size
+            img, labels = random_iou_crop(img, labels, min_scale=0.3, p=0.8)
+
+            # 5. Sanitize before second letterbox
+            labels = sanitize_boxes(labels, img.shape[1], img.shape[0])
+
+            # 6. Second letterbox: re-fit variable-size output of zoom/crop to target.
+            #    Cheap because image is already close to target size.
+            pre_lb2_h, pre_lb2_w = img.shape[:2]
+            img, ratio2, pad_w2, pad_h2 = letterbox(img, height=self.height, width=self.width)
+            labels = self._letterbox_labels(labels, pre_lb2_w, pre_lb2_h, ratio2, pad_w2, pad_h2)
+
+            # 7. Horizontal flip
             if random.random() > 0.5:
                 img = np.fliplr(img)
                 if len(labels) > 0:
                     labels[:, 2] = 1 - labels[:, 2]
 
-            # 6. Sanitize again after letterbox + flip
+            # 8. Final sanitize
             labels = sanitize_boxes(labels, self.width, self.height)
 
         # ---- BGR → RGB, normalize (ImageNet mean/std) ----

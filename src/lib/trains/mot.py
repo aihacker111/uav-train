@@ -76,7 +76,7 @@ class MotTrainer(BaseTrainer):
         super().__init__(opt, model, optimizer=optimizer, **kwargs)
 
     def _get_losses(self, opt):
-        loss_states = ['loss', 'loss_mal', 'loss_bbox', 'loss_giou', 'loss_fgl', 'loss_ddf', 'loss_reid']
+        loss_states = ['loss_main', 'loss_mal', 'loss_bbox', 'loss_giou', 'loss_fgl', 'loss_ddf', 'loss_reid']
         criterion = _build_criterion(opt)
         return loss_states, criterion
 

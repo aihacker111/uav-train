@@ -556,5 +556,13 @@ class ECDetJDECriterion(nn.Module):
             losses.update({k: v * self.id_weight for k, v in reid_dict.items()})
 
         losses = {k: torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}
-        losses['loss'] = sum(losses.values())
+
+        # loss_main: main-output det+reid only — used for progress bar display.
+        # loss (full sum of all aux heads) — used for backward, not displayed.
+        _main_keys = {'loss_mal', 'loss_bbox', 'loss_giou', 'loss_fgl',
+                      'loss_ddf', 'loss_reid'}
+        losses['loss_main'] = sum(
+            losses[k] for k in _main_keys if k in losses)
+        losses['loss'] = sum(v for k, v in losses.items()
+                             if k != 'loss_main')
         return losses
