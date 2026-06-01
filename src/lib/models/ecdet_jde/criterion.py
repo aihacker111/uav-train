@@ -469,7 +469,6 @@ class ECDetJDECriterion(nn.Module):
     # ------------------------------------------------------------------
     def forward(self, outputs, targets):
         outputs_no_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
-        self._clear_cache()
 
         # ----------------------------------------------------------------
         # PHASE 1: All matcher calls upfront (before any loss computation).
