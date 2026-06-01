@@ -34,6 +34,45 @@ from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 from .matcher import HungarianMatcher
 
 
+import math as _math
+
+def _smooth_ln(x: torch.Tensor, sigma: float = 0.5) -> torch.Tensor:
+    """Piecewise smooth_ln from the Repulsion Loss paper (Wang et al. CVPR 2018).
+
+    For x in [0, sigma]:  -log(1 - x)          (standard log penalty)
+    For x in (sigma, 1):  (x-sigma)/(1-sigma) - log(1-sigma)  (linear tail)
+
+    The linear tail prevents -log(1-x) → ∞ causing gradient explosion when
+    two boxes nearly fully overlap (common in dense UAV scenes).
+    """
+    return torch.where(
+        x <= sigma,
+        -torch.log((1.0 - x).clamp(min=1e-7)),
+        (x - sigma) / (1.0 - sigma) - _math.log(1.0 - sigma),
+    )
+
+
+def _iog(box_g: torch.Tensor, box_p: torch.Tensor) -> torch.Tensor:
+    """Intersection over Ground-truth area (IoG).
+
+    box_g: (N, 4) xyxy — the GT boxes we must NOT trespass into
+    box_p: (N, 4) xyxy — predicted boxes
+    Returns: (N,) ∈ [0, 1]
+
+    Unlike IoU, IoG measures how much of the GT box is covered by pred.
+    Used for RepGT: we want pred to stay OUT of non-assigned GT boxes.
+    """
+    inter_x1 = torch.max(box_g[:, 0], box_p[:, 0])
+    inter_y1 = torch.max(box_g[:, 1], box_p[:, 1])
+    inter_x2 = torch.min(box_g[:, 2], box_p[:, 2])
+    inter_y2 = torch.min(box_g[:, 3], box_p[:, 3])
+    inter = (torch.clamp(inter_x2 - inter_x1, min=0) *
+             torch.clamp(inter_y2 - inter_y1, min=0))
+    area_g = ((box_g[:, 2] - box_g[:, 0]) *
+              (box_g[:, 3] - box_g[:, 1])).clamp(min=1e-6)
+    return inter / area_g
+
+
 def _get_world_size():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_world_size()
@@ -183,6 +222,95 @@ class ECDetJDECriterion(nn.Module):
             'loss_giou': loss_giou.sum() / num_boxes,
         }
 
+    def loss_repulsion(self, outputs, targets, indices, num_boxes):
+        """Repulsion Loss — faithful adaptation of Wang et al. CVPR 2018
+        to the DETR one-to-one matching context.
+
+        RepGT:
+          For each matched prediction P (assigned to GT_i), find the GT box
+          with the second-highest IoU to P (call it GT_j, j ≠ i).
+          Penalise IoG(GT_j, P) = intersection(GT_j, P) / area(GT_j).
+          → Metric is IoG (not IoU) so we penalise how much of GT_j is
+            covered by P, regardless of P's size.  Mirrors original paper.
+          Skip images with only 1 GT (no second GT exists).
+
+        RepBox:
+          For each image, compute IoU between all matched predictions
+          (upper-triangle, per-image to avoid cross-image pairs).
+          Penalise smooth_ln(IoU) and normalise by number of overlapping pairs.
+          → In DETR, 1-to-1 Hungarian means one prediction per GT, so no
+            random sampling is needed (unlike anchor-based original).
+
+        smooth_ln (piecewise, σ=0.5):
+          x ≤ σ: -log(1-x)
+          x > σ: (x-σ)/(1-σ) - log(1-σ)   [linear tail, avoids ∞]
+        """
+        idx       = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]   # (M_total, 4) cxcywh norm
+        zero      = src_boxes.sum() * 0          # scalar zero with grad
+
+        rep_gt_sum,  n_rep_gt  = zero, 0
+        rep_box_sum, n_rep_box = zero, 0
+
+        offset = 0
+        for b_idx, (src_i, tgt_i) in enumerate(indices):
+            m = len(src_i)
+            if m == 0:
+                offset += m
+                continue
+
+            all_gt   = targets[b_idx]['boxes']           # (N_gt, 4) cxcywh
+            n_gt     = len(all_gt)
+            pred_b   = src_boxes[offset:offset + m]      # (m, 4) cxcywh
+            dev      = pred_b.device
+            tgt_i_d  = tgt_i.to(dev)
+
+            # ---- RepGT ----
+            # Only meaningful when there are ≥2 GT boxes in the image.
+            if n_gt >= 2:
+                pred_xyxy = box_cxcywh_to_xyxy(pred_b)           # (m, 4)
+                gt_xyxy   = box_cxcywh_to_xyxy(all_gt.to(dev))   # (N_gt, 4)
+
+                # IoU between each prediction and ALL GT boxes: (m, N_gt)
+                with torch.no_grad():
+                    iou_p2gt, _ = box_iou(pred_xyxy, gt_xyxy)
+
+                # Mask out the assigned GT for each prediction → find 2nd-best
+                iou_masked = iou_p2gt.clone()
+                iou_masked[torch.arange(m, device=dev), tgt_i_d] = -1.0
+                _, sec_gt_idx = iou_masked.max(dim=1)            # (m,)
+
+                # IoG(second_GT, pred): how much of the second GT is covered
+                iog_vals = _iog(gt_xyxy[sec_gt_idx], pred_xyxy)  # (m,)
+
+                # smooth_ln penalty, averaged over this image's predictions
+                rep_gt_sum = rep_gt_sum + _smooth_ln(iog_vals).mean() * m
+                n_rep_gt  += m
+
+            # ---- RepBox (per-image) ----
+            # Compute IoU between matched predictions within this image only.
+            if m >= 2:
+                pred_xyxy = box_cxcywh_to_xyxy(pred_b)
+                with torch.no_grad():
+                    iou_bb, _ = box_iou(pred_xyxy, pred_xyxy)  # (m, m)
+
+                # Upper-triangle, exclude diagonal (self = 1.0)
+                iou_bb = iou_bb.triu(diagonal=1)
+                active = iou_bb > 0
+                if active.any():
+                    n_pairs     = active.float().sum().clamp(min=1.0)
+                    rep_box_sum = rep_box_sum + _smooth_ln(iou_bb[active]).sum() / n_pairs
+                    n_rep_box  += 1   # count images that contributed
+
+            offset += m
+
+        # Normalise consistent with other losses (per GT box)
+        denom = max(num_boxes, 1.0)
+        rep_gt_term  = (rep_gt_sum  / n_rep_gt)  if n_rep_gt  > 0 else zero
+        rep_box_term = (rep_box_sum / n_rep_box) if n_rep_box > 0 else zero
+
+        return {'loss_rep': (rep_gt_term + 0.5 * rep_box_term)}
+
 
     # ------------------------------------------------------------------
     # ReID loss — vectorized: one GPU gather per image (not per class×image)
@@ -307,12 +435,14 @@ class ECDetJDECriterion(nn.Module):
         return {
             'focal': {},                       # focal loss: no IoU dependency
             'boxes': {'boxes_weight': iou},    # GIoU-weighted L1
+            'rep':   {},                       # repulsion: no extra kwargs needed
         }
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'focal': self.loss_labels_focal,
             'boxes': self.loss_boxes,
+            'rep':   self.loss_repulsion,
         }
         assert loss in loss_map, f'Unknown loss: {loss}'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -476,7 +606,7 @@ class ECDetJDECriterion(nn.Module):
 
         # loss_main: main output det+reid only (for display).
         # loss: full sum across all aux heads (for backward).
-        _main_keys = {'loss_cls', 'loss_bbox', 'loss_giou', 'loss_reid'}
+        _main_keys = {'loss_cls', 'loss_bbox', 'loss_giou', 'loss_rep', 'loss_reid'}
         losses['loss_main'] = sum(losses[k] for k in _main_keys if k in losses)
         losses['loss']      = sum(v for k, v in losses.items() if k != 'loss_main')
         return losses

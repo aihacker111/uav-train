@@ -21,9 +21,10 @@ def _build_criterion(opt) -> ECDetJDECriterion:
     # Weight dict from EdgeCrafter ecdet.yml (base config)
     # RF-DETR style: focal + L1 + GIoU (no MAL, no FGL/DDF)
     weight_dict = {
-        'loss_cls':  2.0,   # focal classification (raised from 1.0)
+        'loss_cls':  2.0,   # focal classification
         'loss_bbox': 5.0,   # L1 box regression
         'loss_giou': 2.0,   # GIoU box regression
+        'loss_rep':  1.0,   # Repulsion Loss (Wang et al. CVPR 2018)
     }
     return ECDetJDECriterion(
         matcher            = matcher,
@@ -31,7 +32,7 @@ def _build_criterion(opt) -> ECDetJDECriterion:
         nid_dict           = opt.nID_dict,
         reid_dim           = getattr(opt, 'reid_dim', 128),
         weight_dict        = weight_dict,
-        losses             = ('focal', 'boxes'),
+        losses             = ('focal', 'boxes', 'rep'),
         gamma              = 2.0,   # focal γ (standard RetinaNet value)
         alpha              = 0.25,  # focal α (standard RetinaNet value)
         boxes_weight_format= 'iou',
@@ -74,7 +75,7 @@ class MotTrainer(BaseTrainer):
         super().__init__(opt, model, optimizer=optimizer, **kwargs)
 
     def _get_losses(self, opt):
-        loss_states = ['loss_main', 'loss_cls', 'loss_bbox', 'loss_giou', 'loss_reid']
+        loss_states = ['loss_main', 'loss_cls', 'loss_bbox', 'loss_giou', 'loss_rep', 'loss_reid']
         criterion = _build_criterion(opt)
         return loss_states, criterion
 
