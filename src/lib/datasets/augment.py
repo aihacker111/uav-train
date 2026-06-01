@@ -145,67 +145,78 @@ def random_zoom_out(img, labels, max_scale=2.0, fill_value=0, p=0.5):
 # 3. Random IoU crop (EdgeCrafter: RandomIoUCrop, p=0.8, min_scale=0.3)
 # ---------------------------------------------------------------------------
 
-_IOU_THRESHOLDS = (0.0, 0.1, 0.3, 0.5, 0.7, 0.9)
+def random_bias_crop(img, labels,
+                     min_scale=0.25, max_scale=0.85,
+                     beta_alpha=2.0, beta_beta=5.0,
+                     p=0.5):
+    """Scale-biased random crop for UAV small-object detection.
 
-def random_iou_crop(img, labels,
-                    min_scale=0.3, max_scale=1.0,
-                    min_ar=0.5, max_ar=2.0,
-                    trials=15, p=0.8):
-    """SSD-style random crop with minimum Jaccard overlap constraint.
+    Replaces SSD-style IoU crop which was slow (IoU threshold 0.7/0.9 almost
+    never satisfied → all trials wasted).
 
-    labels: (N, 6) [cls, tid, cx, cy, w, h] normalized cxcywh.
-    A crop is accepted when at least one GT box has IoU >= sampled threshold.
-    Boxes whose centre falls inside the crop are kept and re-normalized.
+    Scale is sampled from Beta(α, β) mapped to [min_scale, max_scale]:
+      Beta(2, 5)  → mean ≈ 0.29  → effective crop ≈ 25–50% of image area
+      This zooms INTO the scene, making small UAV objects (10px) appear
+      larger (~30-40px) → easier for the model to learn early on.
+
+    Acceptance: first crop whose centre contains ≥1 GT box is used.
+    No trials loop — crop is placed to guarantee an object is inside,
+    so it always succeeds in O(1).
+
+    Args:
+        img:        (H, W, 3) BGR uint8 numpy array
+        labels:     (N, 6) [cls, tid, cx, cy, w, h] normalized cxcywh
+        min_scale:  minimum crop side as fraction of image side
+        max_scale:  maximum crop side as fraction of image side
+        beta_alpha: Beta distribution α  (< β biases toward smaller scales)
+        beta_beta:  Beta distribution β
+        p:          probability of applying the crop
     """
-    if random.random() > p or len(labels) == 0:
+    if random.random() >= p or len(labels) == 0:
         return img, labels
 
-    h, w   = img.shape[:2]
-    iou_thr = random.choice(_IOU_THRESHOLDS)
-    boxes_px = cxcywh_to_xyxy(labels[:, 2:6], w, h)   # (N, 4) pixel xyxy
+    h, w = img.shape[:2]
 
-    for _ in range(trials):
-        scale = random.uniform(min_scale, max_scale)
-        ar    = random.uniform(min_ar, max_ar)
-        cw    = max(1, min(int(w * scale * (ar ** 0.5)), w))
-        ch    = max(1, min(int(h * scale / (ar ** 0.5)), h))
+    # Sample scale from Beta distribution → biased toward smaller crops
+    raw   = float(np.random.beta(beta_alpha, beta_beta))
+    scale = min_scale + raw * (max_scale - min_scale)
 
-        left = random.randint(0, w - cw)
-        top  = random.randint(0, h - ch)
+    crop_h = max(32, int(h * scale))
+    crop_w = max(32, int(w * scale))
 
-        # Jaccard overlap between crop and each GT box
-        ix1 = np.maximum(boxes_px[:, 0], left)
-        iy1 = np.maximum(boxes_px[:, 1], top)
-        ix2 = np.minimum(boxes_px[:, 2], left + cw)
-        iy2 = np.minimum(boxes_px[:, 3], top  + ch)
-        inter = np.maximum(0, ix2 - ix1) * np.maximum(0, iy2 - iy1)
-        box_area = ((boxes_px[:, 2] - boxes_px[:, 0]) *
-                    (boxes_px[:, 3] - boxes_px[:, 1])).clip(min=1e-6)
-        iou = inter / box_area
+    # Pixel centres of all GT boxes
+    cx_px = (labels[:, 2] * w).astype(np.float32)
+    cy_px = (labels[:, 3] * h).astype(np.float32)
 
-        if iou.max() < iou_thr:
-            continue
+    # Pick a random GT box as the anchor — crop is placed so its centre
+    # is guaranteed inside the crop window.  No rejection loop needed.
+    anchor_idx = random.randint(0, len(labels) - 1)
+    ax, ay     = cx_px[anchor_idx], cy_px[anchor_idx]
 
-        # Keep boxes whose centre is inside the crop
-        cx_px = (boxes_px[:, 0] + boxes_px[:, 2]) / 2
-        cy_px = (boxes_px[:, 1] + boxes_px[:, 3]) / 2
-        keep  = ((cx_px >= left) & (cx_px < left + cw) &
-                 (cy_px >= top)  & (cy_px < top  + ch))
-        if not keep.any():
-            continue
+    # Crop origin: anchor centre must be inside [left, left+crop_w)
+    left_min = max(0, int(ax) - crop_w + 1)
+    left_max = min(w - crop_w, int(ax))
+    left     = random.randint(left_min, max(left_min, left_max))
 
-        img_crop = img[top:top + ch, left:left + cw]
+    top_min  = max(0, int(ay) - crop_h + 1)
+    top_max  = min(h - crop_h, int(ay))
+    top      = random.randint(top_min, max(top_min, top_max))
 
-        new_px = boxes_px[keep].copy()
-        new_px[:, [0, 2]] = np.clip(new_px[:, [0, 2]] - left, 0, cw)
-        new_px[:, [1, 3]] = np.clip(new_px[:, [1, 3]] - top,  0, ch)
+    # Keep all boxes whose centre is inside the crop
+    keep = ((cx_px >= left) & (cx_px < left + crop_w) &
+            (cy_px >= top)  & (cy_px < top  + crop_h))
 
-        new_labels = labels[keep].copy()
-        new_labels[:, 2:6] = xyxy_to_cxcywh(new_px, cw, ch)
+    img_crop  = img[top:top + crop_h, left:left + crop_w]
 
-        return img_crop, new_labels
+    boxes_px  = cxcywh_to_xyxy(labels[:, 2:6], w, h)
+    new_px    = boxes_px[keep].copy()
+    new_px[:, [0, 2]] = np.clip(new_px[:, [0, 2]] - left, 0, crop_w)
+    new_px[:, [1, 3]] = np.clip(new_px[:, [1, 3]] - top,  0, crop_h)
 
-    return img, labels
+    new_labels         = labels[keep].copy()
+    new_labels[:, 2:6] = xyxy_to_cxcywh(new_px, crop_w, crop_h)
+
+    return img_crop, new_labels
 
 
 # ---------------------------------------------------------------------------

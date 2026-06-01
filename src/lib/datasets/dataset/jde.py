@@ -16,7 +16,7 @@ from lib.utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 from lib.tracker.multitracker import id2cls
 from lib.datasets.augment import (
     augment_hsv, cxcywh_to_xyxy,
-    random_photometric_distort, random_zoom_out, random_iou_crop, sanitize_boxes,
+    random_photometric_distort, random_zoom_out, random_bias_crop, sanitize_boxes,
 )
 
 # ImageNet mean/std (matching EdgeCrafter's Normalize op)
@@ -676,8 +676,8 @@ class JointDataset(LoadImagesAndLabels):  # for training
             # 3. ZoomOut on small image (max 2× of 1088×608 = 2176×1216, not raw size)
             img, labels = random_zoom_out(img, labels, max_scale=2.0, p=0.5)
 
-            # 4. IoU crop — bring image back toward target size
-            img, labels = random_iou_crop(img, labels, min_scale=0.3, p=0.8)
+            # 4. Scale-biased crop — zoom into small objects (Beta(2,5) biased)
+            img, labels = random_bias_crop(img, labels, p=0.5)
 
             # 5. Sanitize before second letterbox
             labels = sanitize_boxes(labels, img.shape[1], img.shape[0])
