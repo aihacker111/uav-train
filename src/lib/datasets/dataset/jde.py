@@ -662,7 +662,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
             img = random_photometric_distort(img)
 
             # 2. Scale out — creates small-object diversity for UAV scenes
-            img, labels = random_zoom_out(img, labels, max_scale=4.0, p=0.5)
+            img, labels = random_zoom_out(img, labels, max_scale=2.0, p=0.5)
 
             # 3. SSD-style IoU crop (p=0.8, matches EdgeCrafter RandomIoUCrop)
             img, labels = random_iou_crop(img, labels, min_scale=0.3, p=0.8)

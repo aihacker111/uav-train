@@ -292,6 +292,7 @@ class ECDetJDECriterion(nn.Module):
                 cls_emb[cls_id].append(emb)
                 cls_ids[cls_id].append(ids_all[mask])
 
+        n_active = 0
         for cls_id in self.nid_dict:
             if not cls_emb[cls_id]:
                 continue
@@ -301,6 +302,12 @@ class ECDetJDECriterion(nn.Module):
             reid_loss = reid_loss + self.ce_loss(pred, ids_cat)
             if self.use_triplet and emb_cat.shape[0] >= 2:
                 reid_loss = reid_loss + self.triplet(emb_cat, ids_cat)
+            n_active += 1
+
+        # Average across active classes so loss_reid ≈ CE of one class (~log(nIDs))
+        # regardless of how many classes appear in the batch.
+        if n_active > 1:
+            reid_loss = reid_loss / n_active
 
         return {'loss_reid': reid_loss}
 

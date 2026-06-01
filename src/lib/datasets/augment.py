@@ -111,7 +111,7 @@ def random_photometric_distort(img,
 # 2. Random zoom out (EdgeCrafter: RandomZoomOut, fill=0)
 # ---------------------------------------------------------------------------
 
-def random_zoom_out(img, labels, max_scale=4.0, fill_value=0, p=0.5):
+def random_zoom_out(img, labels, max_scale=2.0, fill_value=0, p=0.5):
     """Place the image on a larger canvas (zoom out), then adjust labels.
 
     labels: (N, 6) [cls, tid, cx, cy, w, h] normalized cxcywh.
@@ -150,7 +150,7 @@ _IOU_THRESHOLDS = (0.0, 0.1, 0.3, 0.5, 0.7, 0.9)
 def random_iou_crop(img, labels,
                     min_scale=0.3, max_scale=1.0,
                     min_ar=0.5, max_ar=2.0,
-                    trials=40, p=0.8):
+                    trials=15, p=0.8):
     """SSD-style random crop with minimum Jaccard overlap constraint.
 
     labels: (N, 6) [cls, tid, cx, cy, w, h] normalized cxcywh.
