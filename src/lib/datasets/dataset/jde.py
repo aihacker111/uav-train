@@ -322,7 +322,10 @@ def letterbox(img,
     img = cv2.resize(img, new_shape, interpolation=cv2.INTER_AREA)
     img = cv2.copyMakeBorder(img, top, bottom, left, right,
                              cv2.BORDER_CONSTANT, value=color)  # padded rectangular
-    return img, ratio, dw, dh
+    # Return the ACTUAL integer pixel offsets applied to the image (left, top),
+    # not the fractional dw/dh — _letterbox_labels must use these exact values
+    # to avoid up-to-0.5px bbox drift from rounding mismatch.
+    return img, ratio, left, top
 
 
 def random_affine(img, targets=None,

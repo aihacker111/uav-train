@@ -513,13 +513,18 @@ class ECDetJDECriterion(nn.Module):
         # ----------------------------------------------------------------
         losses = {}
 
+        # Losses applied at every decoder layer (focal + boxes).
+        # 'rep' is excluded here — computed ONCE on main output below
+        # (same pattern as loss_reid) to avoid 10× redundant Python loops.
+        _per_layer_losses = [l for l in self.losses if l != 'rep']
+
         def _apply_losses(out, idx_main, idx_go, nb, nb_go, suffix=''):
             # focal: always use per-layer indices (no union needed)
             # boxes: use union indices (idx_go) for more stable regression
             meta_go   = self._get_shared_meta(out, targets, idx_go)
             meta_main = self._get_shared_meta(out, targets, idx_main)
 
-            for loss in self.losses:
+            for loss in _per_layer_losses:
                 use_go = self.use_uni_set and loss == 'boxes'
                 idx_in = idx_go   if use_go else idx_main
                 nb_in  = nb_go    if use_go else nb
@@ -533,6 +538,13 @@ class ECDetJDECriterion(nn.Module):
 
         # Main output
         _apply_losses(outputs, indices, indices_go, num_boxes, num_boxes_go)
+
+        # Repulsion loss — ONCE on main output only (like loss_reid).
+        # Running it through _apply_losses would call it 10× per forward
+        # (all aux/enc/dn heads) with Python loops → major speed regression.
+        if 'rep' in self.losses:
+            rep_dict = self.loss_repulsion(outputs, targets, indices, num_boxes)
+            losses.update({k: v * self.weight_dict.get(k, 1.0) for k, v in rep_dict.items()})
 
         # Aux decoder layers
         for i, aux in enumerate(outputs.get('aux_outputs', [])):
