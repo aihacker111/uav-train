@@ -192,7 +192,7 @@ if __name__ == '__main__':
                       '''
 
     data_root = os.path.join(opt.data_dir, 'VisDrone2019/test_dev/sequences')
-    seqs      = [seq.strip() for seq in seqs_str.split()]
+    seqs = [seq.strip() for seq in seqs_str.split()]
     print(opt.save_dir_result)
     opt.device = 'cuda:0'
 

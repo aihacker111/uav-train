@@ -188,7 +188,7 @@ if __name__ == '__main__':
     main(opt,
          data_root=data_root,
          seqs=seqs,
-         exp_name= 'save_name',
+         exp_name='save_name',
          show_image=False,
          save_images=True,
          save_videos=False)
