@@ -340,8 +340,9 @@ class MCJDETracker(object):
 
         # ----- ECDetJDE postprocessor
         self.postprocessor = ECDetJDEPostProcessor(
-            num_classes  = opt.num_classes,
-            conf_thres   = opt.conf_thres,
+            num_classes     = opt.num_classes,
+            conf_thres      = opt.conf_thres,
+            low_conf_thres  = getattr(opt, 'low_conf_thres', 0.25),
             num_top_queries = getattr(opt, 'num_queries', 300),
         )
 
@@ -413,15 +414,16 @@ class MCJDETracker(object):
         ''' Step 1: Network forward, get detections & embeddings'''
         with torch.no_grad():
             output = self.model.forward(im_blob)
-            # ECDetJDE postprocessor: returns per-class dets and reid embeddings
-            dets, cls_id_feats_t = self.postprocessor(
+            # ECDetJDE postprocessor: returns high-conf, low-conf dets and reid embeddings
+            high_dets_t, low_dets_t, cls_id_feats_t = self.postprocessor(
                 output,
                 orig_hw=(height, width),
                 net_hw=(net_height, net_width),
             )
 
         # Convert tensors to numpy for downstream tracker
-        dets_np     = {cls_id: d.cpu().numpy() for cls_id, d in dets.items()}
+        dets_np      = {cls_id: d.cpu().numpy() for cls_id, d in high_dets_t.items()}
+        low_dets_np  = {cls_id: d.cpu().numpy() for cls_id, d in low_dets_t.items()}
         cls_id_feats = {cls_id: r.cpu().numpy() for cls_id, r in cls_id_feats_t.items()}
 
         # Keep past features for reid_motion (motion-based re-id offset)
@@ -429,26 +431,19 @@ class MCJDETracker(object):
         self.past_reg.append(None)
         # ----- parse each object class
         for cls_id in range(self.opt.num_classes):
+            # High-conf dets already filtered by postprocessor at conf_thres
             cls_dets = dets_np.get(cls_id, np.zeros((0, 6)))
+            cls_id_feature = cls_id_feats.get(cls_id, np.zeros((0, self.opt.reid_dim)))
 
-            # High-confidence detections (already filtered by postprocessor at conf_thres)
-            remain_inds = cls_dets[:, 4] > self.opt.conf_thres
-
-            # Low-confidence second-pass thresholds per class
+            # Low-conf dets from postprocessor (low_conf_thres <= score < conf_thres)
+            # Class 4 disabled for second-pass (was special-cased before)
             if cls_id == 4:
-                low_thresh = 1.0      # effectively disabled
+                cls_dets_second       = np.zeros((0, 6))
+                cls_id_feature_second = np.zeros((0, self.opt.reid_dim))
             else:
-                low_thresh = 0.3      # uniform second-pass threshold
-
-            inds_low    = cls_dets[:, 4] > low_thresh
-            inds_high   = cls_dets[:, 4] < self.opt.conf_thres
-            inds_second = np.logical_and(inds_low, inds_high)
-
-            cls_dets_second        = cls_dets[inds_second]
-            cls_id_feature_second  = cls_id_feats.get(cls_id, np.zeros((0, self.opt.reid_dim)))[inds_second]
-
-            cls_dets       = cls_dets[remain_inds]
-            cls_id_feature = cls_id_feats.get(cls_id, np.zeros((0, self.opt.reid_dim)))[remain_inds]
+                cls_dets_second = low_dets_np.get(cls_id, np.zeros((0, 6)))
+                # Low-conf dets don't have separate reid; use zero embeddings (IoU-only stage)
+                cls_id_feature_second = np.zeros((len(cls_dets_second), self.opt.reid_dim))
 
             if len(cls_dets) > 0:
                 '''Detections, tlbrs: top left bottom right score'''
@@ -712,3 +707,201 @@ def remove_duplicate_tracks(tracks_a, tracks_b):
     res_b = [t for i, t in enumerate(tracks_b) if not i in dup_b]
 
     return res_a, res_b
+
+
+# ---------------------------------------------------------------------------
+# MCByteTracker: ByteTrack-style multi-class tracker for ECDetJDE
+#
+# Core design differences vs MCJDETracker:
+#   1. No update_retrack ghost path — unmatched tracks go to lost immediately
+#   2. Postprocessor dual-threshold provides a real low-conf secondary pool
+#   3. Stage 1: high-conf dets vs active+lost tracks (ReID+IoU fusion)
+#      Stage 2: low-conf dets vs still-unmatched active tracks (IoU only)
+#   4. Lost tracks survive max_time_lost frames via Kalman for re-ID
+#      but are NEVER emitted in output — eliminating all ghost boxes
+# ---------------------------------------------------------------------------
+class MCByteTracker:
+
+    def __init__(self, opt, frame_rate=30):
+        self.opt = opt
+
+        print('Creating model...')
+        self.model = create_model(opt.arch, opt)
+        self.model = load_model(self.model, opt.load_model)
+        self.model = self.model.to(opt.device)
+        self.model.eval()
+
+        low_conf_thres = getattr(opt, 'low_conf_thres', 0.25)
+        self.postprocessor = ECDetJDEPostProcessor(
+            num_classes     = opt.num_classes,
+            conf_thres      = opt.conf_thres,
+            low_conf_thres  = low_conf_thres,
+            num_top_queries = getattr(opt, 'num_queries', 300),
+        )
+
+        self.tracked_tracks_dict = defaultdict(list)
+        self.lost_tracks_dict    = defaultdict(list)
+        self.removed_tracks_dict = defaultdict(list)
+
+        self.frame_id       = 0
+        self.det_thresh     = opt.conf_thres
+        self.buffer_size    = int(frame_rate / 30.0 * opt.track_buffer)
+        self.max_time_lost  = self.buffer_size
+        self.kalman_filter  = KalmanFilter()
+        self.gmc            = GMC(method='sparseOptFlow', verbose=[None, False])
+
+        self.mean = np.array(opt.mean, dtype=np.float32).reshape(1, 1, 3)
+        self.std  = np.array(opt.std,  dtype=np.float32).reshape(1, 1, 3)
+        self._dummy_feat_cache = {}  # reid_dim → unit vector
+
+    def _dummy_feat(self, reid_dim):
+        if reid_dim not in self._dummy_feat_cache:
+            v = np.ones(reid_dim, dtype=np.float32)
+            self._dummy_feat_cache[reid_dim] = v / np.linalg.norm(v)
+        return self._dummy_feat_cache[reid_dim]
+
+    def update_tracking(self, im_blob, img_0):
+        self.frame_id += 1
+
+        if self.frame_id == 1:
+            MCTrack.init_count(self.opt.num_classes)
+
+        activated_dict = defaultdict(list)
+        refined_dict   = defaultdict(list)
+        lost_dict      = defaultdict(list)
+        removed_dict   = defaultdict(list)
+        output_dict    = defaultdict(list)
+
+        height, width       = img_0.shape[0], img_0.shape[1]
+        net_height, net_width = im_blob.shape[2], im_blob.shape[3]
+
+        with torch.no_grad():
+            raw = self.model(im_blob)
+            high_dets_t, low_dets_t, reid_t = self.postprocessor(
+                raw,
+                orig_hw=(height, width),
+                net_hw=(net_height, net_width),
+            )
+
+        high_np = {c: d.cpu().numpy() for c, d in high_dets_t.items()}
+        low_np  = {c: d.cpu().numpy() for c, d in low_dets_t.items()}
+        reid_np = {c: r.cpu().numpy() for c, r in reid_t.items()}
+
+        # Global motion compensation using all high-conf boxes
+        all_high = np.concatenate([v for v in high_np.values() if len(v)], axis=0) \
+                   if any(len(v) for v in high_np.values()) else np.zeros((0, 6))
+        warp = self.gmc.apply(img_0, all_high)
+
+        for cls_id in range(self.opt.num_classes):
+            h_dets   = high_np.get(cls_id, np.zeros((0, 6)))   # (M1, 6) xyxy+score+cls
+            l_dets   = low_np.get(cls_id,  np.zeros((0, 6)))   # (M2, 6)
+            feats    = reid_np.get(cls_id, np.zeros((0, self.opt.reid_dim)))  # (M1, D)
+            reid_dim = feats.shape[1] if feats.shape[0] > 0 else self.opt.reid_dim
+            dummy    = self._dummy_feat(reid_dim)
+
+            confirmed   = [t for t in self.tracked_tracks_dict[cls_id] if t.is_activated]
+            unconfirmed = [t for t in self.tracked_tracks_dict[cls_id] if not t.is_activated]
+
+            # Kalman predict + GMC for all active + lost
+            track_pool = join_tracks(confirmed, self.lost_tracks_dict[cls_id])
+            MCTrack.multi_predict(track_pool)
+            MCTrack.multi_gmc(track_pool, warp)
+
+            # Build detection objects
+            high_objs = [
+                MCTrack(MCTrack.tlbr_to_tlwh(d[:4]), d[4], feats[i], self.opt.num_classes, cls_id)
+                for i, d in enumerate(h_dets)
+            ] if len(h_dets) > 0 else []
+
+            low_objs = [
+                MCTrack(MCTrack.tlbr_to_tlwh(d[:4]), d[4], dummy, self.opt.num_classes, cls_id)
+                for d in l_dets
+            ] if len(l_dets) > 0 else []
+
+            # ── Stage 1: high-conf dets ↔ confirmed+lost tracks (ReID+IoU) ─────
+            dists_emb = matching.embedding_distance(track_pool, high_objs)
+            dists_iou = matching.iou_distance(track_pool, high_objs)
+            cost1     = matching.fuse_score_three(dists_iou, dists_emb, high_objs)
+            matches1, u_track1, u_det1 = matching.linear_assignment(cost1, thresh=0.55)
+
+            for i_t, i_d in matches1:
+                track = track_pool[i_t]
+                det   = high_objs[i_d]
+                if track.state == TrackState.Tracked:
+                    track.update(det, self.frame_id)
+                    activated_dict[cls_id].append(track)
+                else:
+                    track.re_activate(det, self.frame_id, new_id=False)
+                    refined_dict[cls_id].append(track)
+
+            # ── Stage 2: low-conf dets ↔ unmatched CONFIRMED tracks (IoU only) ─
+            unmatched_confirmed = [track_pool[i] for i in u_track1
+                                   if track_pool[i].state == TrackState.Tracked]
+            dists_iou2 = matching.iou_distance(unmatched_confirmed, low_objs)
+            matches2, u_conf2, _ = matching.linear_assignment(dists_iou2, thresh=0.5)
+
+            for i_t, i_d in matches2:
+                track = unmatched_confirmed[i_t]
+                det   = low_objs[i_d]
+                # update position but don't pollute appearance with low-conf embedding
+                track.update(det, self.frame_id, update_feature=False)
+                activated_dict[cls_id].append(track)
+
+            # Unmatched confirmed tracks → lost immediately (no ghost propagation)
+            for i in u_conf2:
+                track = unmatched_confirmed[i]
+                track.mark_lost()
+                lost_dict[cls_id].append(track)
+
+            # ── Stage 3: unconfirmed tracks ↔ remaining high-conf dets ──────────
+            u_high = [high_objs[i] for i in u_det1]
+            dists_iou3 = matching.iou_distance(unconfirmed, u_high)
+            matches3, u_unconf, u_det3 = matching.linear_assignment(dists_iou3, thresh=0.5)
+
+            for i_t, i_d in matches3:
+                unconfirmed[i_t].update(u_high[i_d], self.frame_id)
+                activated_dict[cls_id].append(unconfirmed[i_t])
+            for i in u_unconf:
+                unconfirmed[i].mark_removed()
+                removed_dict[cls_id].append(unconfirmed[i])
+
+            # ── Stage 4: init new tracks from remaining high-conf dets ───────────
+            for i in u_det3:
+                det = u_high[i]
+                if det.score >= self.det_thresh:
+                    det.activate(self.kalman_filter, self.frame_id)
+                    activated_dict[cls_id].append(det)
+
+            # ── Stage 5: expire long-lost tracks ─────────────────────────────────
+            for track in self.lost_tracks_dict[cls_id]:
+                if self.frame_id - track.end_frame > self.max_time_lost:
+                    track.mark_removed()
+                    removed_dict[cls_id].append(track)
+
+            # State update
+            self.tracked_tracks_dict[cls_id] = [
+                t for t in self.tracked_tracks_dict[cls_id] if t.state == TrackState.Tracked
+            ]
+            self.tracked_tracks_dict[cls_id] = join_tracks(
+                self.tracked_tracks_dict[cls_id], activated_dict[cls_id])
+            self.tracked_tracks_dict[cls_id] = join_tracks(
+                self.tracked_tracks_dict[cls_id], refined_dict[cls_id])
+
+            self.lost_tracks_dict[cls_id] = sub_tracks(
+                self.lost_tracks_dict[cls_id], self.tracked_tracks_dict[cls_id])
+            self.lost_tracks_dict[cls_id].extend(lost_dict[cls_id])
+            self.lost_tracks_dict[cls_id] = sub_tracks(
+                self.lost_tracks_dict[cls_id], self.removed_tracks_dict[cls_id])
+
+            self.removed_tracks_dict[cls_id].extend(removed_dict[cls_id])
+
+            self.tracked_tracks_dict[cls_id], self.lost_tracks_dict[cls_id] = \
+                remove_duplicate_tracks(self.tracked_tracks_dict[cls_id],
+                                        self.lost_tracks_dict[cls_id])
+
+            # Only activated tracks are visible in output — no ghost boxes
+            output_dict[cls_id] = [
+                t for t in self.tracked_tracks_dict[cls_id] if t.is_activated
+            ]
+
+        return output_dict

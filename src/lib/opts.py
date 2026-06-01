@@ -103,7 +103,9 @@ class opts(object):
         self.parser.add_argument('--test_visdrone', default=True)
         self.parser.add_argument('--test_uavdt',    default=False)
         self.parser.add_argument('--conf_thres', type=float, default=0.4,
-                                 help='detection confidence threshold')
+                                 help='detection confidence threshold (high-conf, primary matching)')
+        self.parser.add_argument('--low_conf_thres', type=float, default=0.25,
+                                 help='lower threshold for ByteTrack second-pass matching pool')
         self.parser.add_argument('--det_thres',  type=float, default=0.3)
         self.parser.add_argument('--nms_thres',  type=float, default=0.45)
         self.parser.add_argument('--track_buffer', type=int, default=30)

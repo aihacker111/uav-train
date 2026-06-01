@@ -14,18 +14,19 @@ class ECDetJDEPostProcessor(nn.Module):
     """
     Converts ECTransformer output to tracking-ready detections.
 
-    Output per image (dict):
-      {cls_id: np.ndarray (N, 6)}  where columns = [x1, y1, x2, y2, score, cls_id]
-
-    And reid embeddings per class:
-      {cls_id: np.ndarray (N, reid_dim)}
+    Output per image (dicts):
+      high_dets_dict  {cls_id: Tensor(N, 6)}  score >= conf_thres
+      low_dets_dict   {cls_id: Tensor(M, 6)}  low_conf_thres <= score < conf_thres
+      reid_dict       {cls_id: Tensor(N, D)}  L2-normed embeddings for high-conf dets
     """
 
     def __init__(self, num_classes: int, conf_thres: float = 0.3,
+                 low_conf_thres: float = 0.0,
                  num_top_queries: int = 300, nms_thres: float = 0.45):
         super().__init__()
         self.num_classes     = num_classes
         self.conf_thres      = conf_thres
+        self.low_conf_thres  = low_conf_thres
         self.num_top_queries = num_top_queries
         self.nms_thres       = nms_thres
 
@@ -43,8 +44,9 @@ class ECDetJDEPostProcessor(nn.Module):
                      (only correct when orig aspect ratio == net aspect ratio).
 
         Returns:
-            dets_dict:  {cls_id: Tensor(M, 6)}  xyxy + score + cls in image coords
-            reid_dict:  {cls_id: Tensor(M, reid_dim)}  L2-normalized embeddings
+            high_dets_dict: {cls_id: Tensor(M, 6)}  score >= conf_thres
+            low_dets_dict:  {cls_id: Tensor(K, 6)}  low_conf_thres <= score < conf_thres
+            reid_dict:      {cls_id: Tensor(M, D)}  L2-normalized embeddings for high-conf dets
         """
         logits = outputs['pred_logits'][0]  # (N, num_classes)
         boxes  = outputs['pred_boxes'][0]   # (N, 4) cxcywh norm
@@ -52,31 +54,28 @@ class ECDetJDEPostProcessor(nn.Module):
 
         orig_h, orig_w = orig_hw
         scores_all = logits.sigmoid()       # (N, num_classes)
+        dev = logits.device
+        reid_dim = reid.shape[-1]
 
         # Convert boxes cxcywh (letterbox-normalized) → xyxy in original image coords
         cx, cy, bw, bh = boxes.unbind(-1)
 
         if net_hw is not None:
-            # Inverse letterbox: remove padding then scale to original size
             net_h, net_w = net_hw
             ratio = min(net_h / orig_h, net_w / orig_w)
             new_w = round(orig_w * ratio)
             new_h = round(orig_h * ratio)
-            dw = (net_w - new_w) * 0.5  # x padding in pixels
-            dh = (net_h - new_h) * 0.5  # y padding in pixels
-
-            # Step 1: pixel coords in letterbox image
+            dw = (net_w - new_w) * 0.5
+            dh = (net_h - new_h) * 0.5
             cx_px = cx * net_w
             cy_px = cy * net_h
             bw_px = bw * net_w
             bh_px = bh * net_h
-            # Step 2: remove padding and scale back
             cx_orig = (cx_px - dw) / ratio
             cy_orig = (cy_px - dh) / ratio
             bw_orig = bw_px / ratio
             bh_orig = bh_px / ratio
         else:
-            # Fallback: direct scale (assumes no aspect-ratio mismatch)
             cx_orig = cx * orig_w
             cy_orig = cy * orig_h
             bw_orig = bw * orig_w
@@ -88,33 +87,45 @@ class ECDetJDEPostProcessor(nn.Module):
         y2 = (cy_orig + bh_orig * 0.5).clamp(min=0, max=orig_h)
         boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)  # (N, 4)
 
-        # L2-normalize ReID embeddings
         reid_norm = F.normalize(reid, dim=-1)  # (N, reid_dim)
 
-        dets_dict = {}
-        reid_dict = {}
+        high_dets_dict = {}
+        low_dets_dict  = {}
+        reid_dict      = {}
+
         for cls_id in range(self.num_classes):
-            cls_scores = scores_all[:, cls_id]          # (N,)
-            keep       = cls_scores > self.conf_thres
-            if keep.sum() == 0:
-                dets_dict[cls_id] = torch.zeros((0, 6), device=logits.device)
-                reid_dict[cls_id] = torch.zeros((0, reid.shape[-1]), device=logits.device)
-                continue
+            cls_scores = scores_all[:, cls_id]  # (N,)
 
-            cls_boxes    = boxes_xyxy[keep]             # (M, 4)
-            cls_scores_f = cls_scores[keep]             # (M,)
-            cls_reid     = reid_norm[keep]              # (M, reid_dim)
+            # ── High-confidence detections ──────────────────────────────────────
+            high_keep = cls_scores >= self.conf_thres
+            if high_keep.sum() == 0:
+                high_dets_dict[cls_id] = torch.zeros((0, 6), device=dev)
+                reid_dict[cls_id]      = torch.zeros((0, reid_dim), device=dev)
+            else:
+                h_boxes  = boxes_xyxy[high_keep]
+                h_scores = cls_scores[high_keep]
+                h_reid   = reid_norm[high_keep]
+                nms_idx  = torchvision.ops.nms(h_boxes, h_scores, self.nms_thres)
+                h_boxes, h_scores, h_reid = h_boxes[nms_idx], h_scores[nms_idx], h_reid[nms_idx]
+                cls_col = torch.full((h_scores.shape[0], 1), cls_id,
+                                     dtype=h_scores.dtype, device=dev)
+                high_dets_dict[cls_id] = torch.cat([h_boxes, h_scores.unsqueeze(-1), cls_col], dim=-1)
+                reid_dict[cls_id]      = h_reid
 
-            # NMS per class — removes redundant overlapping predictions
-            nms_keep = torchvision.ops.nms(cls_boxes, cls_scores_f, self.nms_thres)
-            cls_boxes    = cls_boxes[nms_keep]
-            cls_scores_f = cls_scores_f[nms_keep]
-            cls_reid     = cls_reid[nms_keep]
+            # ── Low-confidence detections (second-pass ByteTrack pool) ──────────
+            if self.low_conf_thres > 0:
+                low_keep = (cls_scores >= self.low_conf_thres) & (cls_scores < self.conf_thres)
+                if low_keep.sum() == 0:
+                    low_dets_dict[cls_id] = torch.zeros((0, 6), device=dev)
+                else:
+                    l_boxes  = boxes_xyxy[low_keep]
+                    l_scores = cls_scores[low_keep]
+                    nms_idx  = torchvision.ops.nms(l_boxes, l_scores, self.nms_thres)
+                    l_boxes, l_scores = l_boxes[nms_idx], l_scores[nms_idx]
+                    cls_col = torch.full((l_scores.shape[0], 1), cls_id,
+                                         dtype=l_scores.dtype, device=dev)
+                    low_dets_dict[cls_id] = torch.cat([l_boxes, l_scores.unsqueeze(-1), cls_col], dim=-1)
+            else:
+                low_dets_dict[cls_id] = torch.zeros((0, 6), device=dev)
 
-            cls_id_col = torch.full((cls_scores_f.shape[0], 1), cls_id,
-                                    dtype=cls_scores_f.dtype, device=logits.device)
-
-            dets_dict[cls_id] = torch.cat([cls_boxes, cls_scores_f.unsqueeze(-1), cls_id_col], dim=-1)
-            reid_dict[cls_id] = cls_reid
-
-        return dets_dict, reid_dict
+        return high_dets_dict, low_dets_dict, reid_dict
