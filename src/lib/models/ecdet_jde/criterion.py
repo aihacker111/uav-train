@@ -1,10 +1,20 @@
 """
-ECDetJDE Criterion: EdgeCrafter detection loss (ECCriterion) + ReID loss.
+ECDetJDE Criterion — RF-DETR style: focal + L1 + GIoU + ReID.
 
-Optimizations over the naive port:
+Detection losses (simple, stable early-training):
+  loss_cls   — sigmoid focal loss (α=0.25, γ=2.0), RF-DETR / RetinaNet style
+  loss_bbox  — L1 box regression
+  loss_giou  — GIoU box regression
+ReID loss: CE + optional Triplet on matched queries.
+
+MAL and FGL/DDF are intentionally removed:
+  - MAL ties confidence to IoU → gradient noise when IoU ≈ 0 at init
+  - FGL/DDF (DFL distribution) only helps when boxes are already good (IoU>0.3)
+  → Both hurt convergence in early training and produce noisy confidence scores.
+
+Optimizations:
   1. IoU computed ONCE per (outputs, indices) pair via _get_shared_meta(),
-     then reused by loss_mal, loss_boxes, AND loss_local — eliminates 2 redundant
-     box_iou calls per layer (saves ~2× IoU compute across all aux layers).
+     shared between focal (empty) and boxes (boxes_weight).
   2. All matcher calls batched upfront at the start of forward() so GPU
      cost-matrix kernels can overlap with earlier CPU linear_sum_assignment calls.
   3. enc_targets built with a dict-comprehension shallow copy instead of
@@ -21,7 +31,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
-from .utils import bbox2distance
 from .matcher import HungarianMatcher
 
 
@@ -107,11 +116,9 @@ class ECDetJDECriterion(nn.Module):
         self.use_triplet = use_triplet
 
         self.weight_dict = weight_dict or {
-            'loss_mal':  1.0,
+            'loss_cls':  2.0,
             'loss_bbox': 5.0,
             'loss_giou': 2.0,
-            'loss_fgl':  0.15,
-            'loss_ddf':  1.5,
         }
 
         # Per-class ReID classifiers (CE head)
@@ -124,43 +131,41 @@ class ECDetJDECriterion(nn.Module):
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
         self.triplet = TripletLoss(margin=0.3)
 
-        # FGL/DDF cache (cleared each forward)
-        self.fgl_targets = self.fgl_targets_dn = None
-        self.own_targets = self.own_targets_dn = None
-        self.num_pos = self.num_neg = None
-
     # ------------------------------------------------------------------
-    # Detection losses
+    # Detection losses  (RF-DETR style: focal + L1 + GIoU, no MAL/DFL)
     # ------------------------------------------------------------------
-    def loss_labels_mal(self, outputs, targets, indices, num_boxes, values=None):
-        idx = self._get_src_permutation_idx(indices)
-        if values is None:
-            src_boxes    = outputs['pred_boxes'][idx]
-            target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-            ious, _      = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
-            ious         = torch.diag(ious).detach()
-        else:
-            ious = values
+    def loss_labels_focal(self, outputs, targets, indices, num_boxes):
+        """Sigmoid focal loss (RF-DETR style).
 
-        src_logits       = outputs['pred_logits']
+        Pure focal loss — no IoU weighting, no soft labels.
+        Target = binary one-hot: 1 for matched class, 0 otherwise.
+        Much easier to optimize early in training than MAL because gradient
+        signal does not depend on box quality (IoU ≈ 0 at init).
+        """
+        src_logits       = outputs['pred_logits']                         # (B, Q, C)
+        idx              = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t['labels'][J] for t, (_, J) in zip(targets, indices)])
-        target_classes   = torch.full(src_logits.shape[:2], self.num_classes,
-                                      dtype=torch.int64, device=src_logits.device)
+
+        # Build binary one-hot target: shape (B, Q, C)
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
-        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
+        target_onehot  = torch.zeros(
+            [*src_logits.shape[:2], src_logits.shape[2] + 1],
+            dtype=src_logits.dtype, device=src_logits.device)
+        target_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+        target_onehot = target_onehot[..., :-1]                           # drop no-obj col
 
-        target_score_o      = torch.zeros_like(target_classes, dtype=src_logits.dtype)
-        target_score_o[idx] = ious.to(target_score_o.dtype)
-        target_score        = target_score_o.unsqueeze(-1) * target
+        # Sigmoid focal loss (α=self.alpha, γ=self.gamma)
+        prob    = src_logits.sigmoid()
+        ce_loss = F.binary_cross_entropy_with_logits(src_logits, target_onehot, reduction='none')
+        p_t     = prob * target_onehot + (1 - prob) * (1 - target_onehot)
+        loss    = ce_loss * (1 - p_t).pow(self.gamma)
+        alpha_t = self.alpha * target_onehot + (1 - self.alpha) * (1 - target_onehot)
+        loss    = alpha_t * loss
 
-        pred_score   = F.sigmoid(src_logits).detach()
-        target_score = target_score.pow(self.gamma)
-        weight       = pred_score.pow(self.gamma) * (1 - target) + target
-
-        loss = F.binary_cross_entropy_with_logits(src_logits, target_score,
-                                                   weight=weight, reduction='none')
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
-        return {'loss_mal': loss}
+        return {'loss_cls': loss}
 
     def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None):
         idx       = self._get_src_permutation_idx(indices)
@@ -178,73 +183,6 @@ class ECDetJDECriterion(nn.Module):
             'loss_giou': loss_giou.sum() / num_boxes,
         }
 
-    def loss_local(self, outputs, targets, indices, num_boxes, T=5, values=None):
-        """FGL + DDF. Accepts pre-computed IoU via `values` to skip box_iou recompute."""
-        losses = {}
-        if 'pred_corners' not in outputs:
-            return losses
-
-        idx          = self._get_src_permutation_idx(indices)
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        pred_corners = outputs['pred_corners'][idx].reshape(-1, self.reg_max + 1)
-        ref_points   = outputs['ref_points'][idx].detach()
-
-        with torch.no_grad():
-            if self.fgl_targets_dn is None and 'is_dn' in outputs:
-                self.fgl_targets_dn = bbox2distance(
-                    ref_points, box_cxcywh_to_xyxy(target_boxes),
-                    self.reg_max, outputs['reg_scale'], outputs['up'])
-            if self.fgl_targets is None and 'is_dn' not in outputs:
-                self.fgl_targets = bbox2distance(
-                    ref_points, box_cxcywh_to_xyxy(target_boxes),
-                    self.reg_max, outputs['reg_scale'], outputs['up'])
-
-        target_corners, weight_right, weight_left = (
-            self.fgl_targets_dn if 'is_dn' in outputs else self.fgl_targets)
-
-        # Reuse pre-computed IoU if available (avoids redundant box_iou call)
-        if values is not None:
-            ious = values
-        else:
-            ious = torch.diag(box_iou(
-                box_cxcywh_to_xyxy(outputs['pred_boxes'][idx]),
-                box_cxcywh_to_xyxy(target_boxes))[0])
-
-        weight_targets = ious.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
-
-        losses['loss_fgl'] = self._unimodal_focal(
-            pred_corners, target_corners, weight_right, weight_left,
-            weight_targets, avg_factor=num_boxes)
-
-        if 'teacher_corners' in outputs:
-            pred_corners_all   = outputs['pred_corners'].reshape(-1, self.reg_max + 1)
-            target_corners_all = outputs['teacher_corners'].reshape(-1, self.reg_max + 1)
-            if not torch.equal(pred_corners_all, target_corners_all):
-                weight_tgt = outputs['teacher_logits'].sigmoid().max(dim=-1)[0]
-
-                mask = torch.zeros_like(weight_tgt, dtype=torch.bool)
-                mask[idx] = True
-                mask = mask.unsqueeze(-1).repeat(1, 1, 4).reshape(-1)
-
-                weight_tgt[idx] = ious.reshape_as(weight_tgt[idx]).to(weight_tgt.dtype)
-                weight_tgt = weight_tgt.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
-
-                kl = nn.KLDivLoss(reduction='none')(
-                    F.log_softmax(pred_corners_all / T, dim=1),
-                    F.softmax(target_corners_all.detach() / T, dim=1)).sum(-1)
-                loss_match = weight_tgt * (T ** 2) * kl
-
-                if 'is_dn' not in outputs:
-                    batch_scale  = 8 / outputs['pred_boxes'].shape[0]
-                    self.num_pos = (mask.sum() * batch_scale) ** 0.5
-                    self.num_neg = ((~mask).sum() * batch_scale) ** 0.5
-
-                l1 = loss_match[mask].mean()  if mask.any()  else loss_match.sum() * 0
-                l2 = loss_match[~mask].mean() if (~mask).any() else loss_match.sum() * 0
-                losses['loss_ddf'] = (l1 * self.num_pos + l2 * self.num_neg) / (
-                    self.num_pos + self.num_neg)
-
-        return losses
 
     # ------------------------------------------------------------------
     # ReID loss — vectorized: one GPU gather per image (not per class×image)
@@ -344,16 +282,11 @@ class ECDetJDECriterion(nn.Module):
             results.append((fr.long(), fc.long()))
         return results
 
-    def _clear_cache(self):
-        self.fgl_targets = self.fgl_targets_dn = None
-        self.own_targets = self.own_targets_dn = None
-        self.num_pos = self.num_neg = None
-
     def _get_shared_meta(self, outputs, targets, indices):
-        """Compute IoU ONCE for (outputs, indices) and return per-loss kwargs.
+        """Compute IoU once for boxes weight (GIoU weighting on loss_boxes).
 
-        Replaces calling get_loss_meta_info() separately per loss, which
-        previously triggered 2-3 independent box_iou calls per decoder layer.
+        focal loss does not need IoU — only boxes uses it via boxes_weight.
+        Returns empty dict for focal, iou-weight for boxes.
         """
         if self.boxes_weight_format is None:
             return {loss: {} for loss in self.losses}
@@ -372,25 +305,14 @@ class ECDetJDECriterion(nn.Module):
             raise AttributeError(f'Unknown boxes_weight_format: {self.boxes_weight_format}')
 
         return {
-            'mal':   {'values': iou},
-            'boxes': {'boxes_weight': iou},
-            'local': {'values': iou},   # shared to skip internal box_iou in loss_local
+            'focal': {},                       # focal loss: no IoU dependency
+            'boxes': {'boxes_weight': iou},    # GIoU-weighted L1
         }
-
-    def _unimodal_focal(self, pred, label, w_right, w_left, weight=None, avg_factor=None):
-        dis_left  = label.long()
-        dis_right = dis_left + 1
-        loss = (F.cross_entropy(pred, dis_left,  reduction='none') * w_left.reshape(-1)
-              + F.cross_entropy(pred, dis_right, reduction='none') * w_right.reshape(-1))
-        if weight is not None:
-            loss = loss * weight.float()
-        return (loss.sum() / avg_factor) if avg_factor is not None else loss.sum()
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
-            'mal':   self.loss_labels_mal,
+            'focal': self.loss_labels_focal,
             'boxes': self.loss_boxes,
-            'local': self.loss_local,
         }
         assert loss in loss_map, f'Unknown loss: {loss}'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -456,19 +378,20 @@ class ECDetJDECriterion(nn.Module):
         num_boxes = torch.clamp(num_boxes_t / _get_world_size(), min=1).item()
 
         # ----------------------------------------------------------------
-        # PHASE 2: Compute all losses.
-        # _get_shared_meta() computes IoU once per (outputs, indices) pair
-        # and distributes it to mal + boxes + local — no redundant box_iou.
+        # PHASE 2: Compute all losses (RF-DETR style: focal + boxes only).
+        # No MAL (IoU-gated), no FGL/DDF (DFL distribution).
+        # _get_shared_meta() computes IoU once per layer for boxes_weight.
         # ----------------------------------------------------------------
         losses = {}
 
         def _apply_losses(out, idx_main, idx_go, nb, nb_go, suffix=''):
-            use_go_meta = self.use_uni_set  # go indices used for boxes+local
-            meta_go  = self._get_shared_meta(out, targets, idx_go)  if use_go_meta  else {}
-            meta_main = self._get_shared_meta(out, targets, idx_main) if not use_go_meta else {}
+            # focal: always use per-layer indices (no union needed)
+            # boxes: use union indices (idx_go) for more stable regression
+            meta_go   = self._get_shared_meta(out, targets, idx_go)
+            meta_main = self._get_shared_meta(out, targets, idx_main)
 
             for loss in self.losses:
-                use_go = self.use_uni_set and loss in ('boxes', 'local')
+                use_go = self.use_uni_set and loss == 'boxes'
                 idx_in = idx_go   if use_go else idx_main
                 nb_in  = nb_go    if use_go else nb
                 meta   = meta_go.get(loss, {}) if use_go else meta_main.get(loss, {})
@@ -483,14 +406,11 @@ class ECDetJDECriterion(nn.Module):
         _apply_losses(outputs, indices, indices_go, num_boxes, num_boxes_go)
 
         # Aux decoder layers
-        n_aux_dec = len(outputs.get('aux_outputs', []))
         for i, aux in enumerate(outputs.get('aux_outputs', [])):
-            if 'local' in self.losses:
-                aux['up'], aux['reg_scale'] = outputs['up'], outputs['reg_scale']
             _apply_losses(aux, cached_indices[i], indices_go,
                           num_boxes, num_boxes_go, suffix=f'_aux_{i}')
 
-        # Pre-output (first decoder layer traditional head, D-FINE style)
+        # Pre-output (first decoder layer, D-FINE style)
         if 'pre_outputs' in outputs:
             pre_idx_cache = len(cached_indices) - 1
             aux = outputs['pre_outputs']
@@ -523,15 +443,12 @@ class ECDetJDECriterion(nn.Module):
             if class_agnostic:
                 self.num_classes = orig_nc
 
-        # DN losses
+        # DN losses (denoising groups)
         if 'dn_outputs' in outputs:
             indices_dn = self.get_cdn_matched_indices(outputs['dn_meta'], targets)
             dn_nb      = max(num_boxes * outputs['dn_meta']['dn_num_group'], 1)
 
             for i, aux in enumerate(outputs['dn_outputs']):
-                if 'local' in self.losses:
-                    aux['is_dn'] = True
-                    aux['up'], aux['reg_scale'] = outputs['up'], outputs['reg_scale']
                 meta_dn = self._get_shared_meta(aux, targets, indices_dn)
                 for loss in self.losses:
                     meta   = meta_dn.get(loss, {})
@@ -557,12 +474,9 @@ class ECDetJDECriterion(nn.Module):
 
         losses = {k: torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}
 
-        # loss_main: main-output det+reid only — used for progress bar display.
-        # loss (full sum of all aux heads) — used for backward, not displayed.
-        _main_keys = {'loss_mal', 'loss_bbox', 'loss_giou', 'loss_fgl',
-                      'loss_ddf', 'loss_reid'}
-        losses['loss_main'] = sum(
-            losses[k] for k in _main_keys if k in losses)
-        losses['loss'] = sum(v for k, v in losses.items()
-                             if k != 'loss_main')
+        # loss_main: main output det+reid only (for display).
+        # loss: full sum across all aux heads (for backward).
+        _main_keys = {'loss_cls', 'loss_bbox', 'loss_giou', 'loss_reid'}
+        losses['loss_main'] = sum(losses[k] for k in _main_keys if k in losses)
+        losses['loss']      = sum(v for k, v in losses.items() if k != 'loss_main')
         return losses
