@@ -14,7 +14,10 @@ import torch
 from collections import OrderedDict, defaultdict
 from lib.utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 from lib.tracker.multitracker import id2cls
-from lib.datasets.augment import augment_hsv, cxcywh_to_xyxy
+from lib.datasets.augment import (
+    augment_hsv, cxcywh_to_xyxy,
+    random_photometric_distort, random_zoom_out, random_iou_crop, sanitize_boxes,
+)
 
 # ImageNet mean/std (matching EdgeCrafter's Normalize op)
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -67,12 +70,11 @@ class LoadImages:
         # Padded resize
         img, _, _, _ = letterbox(img_0, height=self.height, width=self.width)
 
-        # Normalize RGB
-        img = img[:, :, ::-1].transpose(2, 0, 1)
-        img = np.ascontiguousarray(img, dtype=np.float32)
-        img /= 255.0
+        # BGR → RGB, /255, ImageNet mean/std (must match JointDataset training norm)
+        img = img[:, :, ::-1].astype(np.float32) / 255.0
+        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
+        img = np.ascontiguousarray(img.transpose(2, 0, 1))
 
-        # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
         return img_path, img, img_0
 
     def __getitem__(self, idx):
@@ -86,10 +88,10 @@ class LoadImages:
         # Padded resize
         img, _, _, _ = letterbox(img_0, height=self.height, width=self.width)
 
-        # Normalize RGB: BGR -> RGB and H×W×C -> C×H×W
-        img = img[:, :, ::-1].transpose(2, 0, 1)
-        img = np.ascontiguousarray(img, dtype=np.float32)
-        img /= 255.0
+        # BGR → RGB, /255, ImageNet mean/std (must match JointDataset training norm)
+        img = img[:, :, ::-1].astype(np.float32) / 255.0
+        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
+        img = np.ascontiguousarray(img.transpose(2, 0, 1))
 
         return img_path, img, img_0
 
@@ -140,13 +142,11 @@ class LoadVideo:  # for inference
         # Padded resize
         img, _, _, _ = letterbox(img_0, height=self.height, width=self.width)
 
-        # Normalize RGB
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR->RGB and HWC->CHW
-        img = np.ascontiguousarray(img, dtype=np.float32)
-        img /= 255.0
+        # BGR → RGB, /255, ImageNet mean/std (must match JointDataset training norm)
+        img = img[:, :, ::-1].astype(np.float32) / 255.0
+        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
+        img = np.ascontiguousarray(img.transpose(2, 0, 1))
 
-        # save letterbox image
-        # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])
         return self.count, img, img_0
 
     def __len__(self):
@@ -632,7 +632,8 @@ class JointDataset(LoadImagesAndLabels):  # for training
         return img, out
 
     # ------------------------------------------------------------------
-    # Main __getitem__ with AMOT augmentation (HSV → letterbox → affine → flip)
+    # Main __getitem__ — EdgeCrafter aug order (no mosaic):
+    # PhotometricDistort → ZoomOut → IoUCrop → sanitize → letterbox → flip → sanitize
     # ------------------------------------------------------------------
 
     def __getitem__(self, idx):
@@ -646,26 +647,43 @@ class JointDataset(LoadImagesAndLabels):  # for training
         label_path = self.label_files[ds][idx - start_index]
 
         img, labels = self._load_raw(img_path, label_path)
-        orig_h, orig_w = img.shape[:2]
 
         # NOTE: do NOT remap track IDs here.  Remap once after all augmentation.
 
         do_aug = self.augment and self.cur_epoch < self.stop_epoch
+
+        # ----------------------------------------------------------------
+        # Augmentation pipeline (mirrors EdgeCrafter ecdet.yml, no mosaic)
+        # Order: PhotometricDistort → ZoomOut → IoUCrop → sanitize
+        #        → letterbox → flip → sanitize
+        # ----------------------------------------------------------------
         if do_aug:
-            augment_hsv(img, fraction=self.hsv_fraction)
+            # 1. Color distortion (full photometric, not just S/V)
+            img = random_photometric_distort(img)
+
+            # 2. Scale out — creates small-object diversity for UAV scenes
+            img, labels = random_zoom_out(img, labels, max_scale=4.0, p=0.5)
+
+            # 3. SSD-style IoU crop (p=0.8, matches EdgeCrafter RandomIoUCrop)
+            img, labels = random_iou_crop(img, labels, min_scale=0.3, p=0.8)
+
+            # 4. Sanitize after spatial ops — clip to image, drop degenerate boxes
+            labels = sanitize_boxes(labels, img.shape[1], img.shape[0])
 
         # ---- letterbox to network input size ----
+        pre_lb_h, pre_lb_w = img.shape[:2]
         img, ratio, pad_w, pad_h = letterbox(img, height=self.height, width=self.width)
-        labels = self._letterbox_labels(labels, orig_w, orig_h, ratio, pad_w, pad_h)
+        labels = self._letterbox_labels(labels, pre_lb_w, pre_lb_h, ratio, pad_w, pad_h)
 
         if do_aug:
-            img, labels = self._affine_labels(img, labels)
+            # 5. Random horizontal flip
+            if random.random() > 0.5:
+                img = np.fliplr(img)
+                if len(labels) > 0:
+                    labels[:, 2] = 1 - labels[:, 2]
 
-        # ---- random horizontal flip ----
-        if do_aug and random.random() > 0.5:
-            img = np.fliplr(img)
-            if len(labels) > 0:
-                labels[:, 2] = 1 - labels[:, 2]
+            # 6. Sanitize again after letterbox + flip
+            labels = sanitize_boxes(labels, self.width, self.height)
 
         # ---- BGR → RGB, normalize (ImageNet mean/std) ----
         img = img[:, :, ::-1].astype(np.float32) / 255.0

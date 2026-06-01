@@ -33,6 +33,9 @@ def _build_criterion(opt) -> ECDetJDECriterion:
         reid_dim           = getattr(opt, 'reid_dim', 128),
         weight_dict        = weight_dict,
         losses             = ('mal', 'boxes', 'local'),
+        # gamma/alpha from EdgeCrafter ecdet.yml ECCriterion block
+        gamma              = 1.5,
+        alpha              = 0.75,
         boxes_weight_format= 'iou',
         use_uni_set        = True,
         id_weight          = getattr(opt, 'id_weight', 1.0),
@@ -73,7 +76,7 @@ class MotTrainer(BaseTrainer):
         super().__init__(opt, model, optimizer=optimizer, **kwargs)
 
     def _get_losses(self, opt):
-        loss_states = ['loss', 'loss_mal', 'loss_bbox', 'loss_giou', 'loss_fgl', 'loss_reid']
+        loss_states = ['loss', 'loss_mal', 'loss_bbox', 'loss_giou', 'loss_fgl', 'loss_ddf', 'loss_reid']
         criterion = _build_criterion(opt)
         return loss_states, criterion
 

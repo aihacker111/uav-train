@@ -283,11 +283,10 @@ class ECDetJDECriterion(nn.Module):
             emb_cat = torch.cat(all_emb, dim=0)
             ids_cat = torch.cat(all_ids, dim=0)
             pred    = self.classifiers[str(cls_id)](emb_cat)
-            n_valid = float(ids_cat.numel())
 
-            reid_loss = reid_loss + self.ce_loss(pred, ids_cat) / n_valid
+            reid_loss = reid_loss + self.ce_loss(pred, ids_cat)
             if self.use_triplet and emb_cat.shape[0] >= 2:
-                reid_loss = reid_loss + self.triplet(emb_cat, ids_cat) / n_valid
+                reid_loss = reid_loss + self.triplet(emb_cat, ids_cat)
 
         return {'loss_reid': reid_loss}
 
