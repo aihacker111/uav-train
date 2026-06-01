@@ -35,7 +35,7 @@ def _build_criterion(opt) -> ECDetJDECriterion:
         losses             = ('focal', 'boxes', 'rep'),
         gamma              = 2.0,   # focal γ (standard RetinaNet value)
         alpha              = 0.25,  # focal α (standard RetinaNet value)
-        boxes_weight_format= 'iou',
+        boxes_weight_format= None,   # RF-DETR style: no IoU gating on L1/GIoU
         use_uni_set        = True,
         id_weight          = getattr(opt, 'id_weight', 1.0),
         use_triplet        = getattr(opt, 'tri', False),
