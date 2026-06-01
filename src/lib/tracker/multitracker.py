@@ -437,10 +437,8 @@ class MCJDETracker(object):
             # Low-confidence second-pass thresholds per class
             if cls_id == 4:
                 low_thresh = 1.0      # effectively disabled
-            elif cls_id in (5, 8):
-                low_thresh = 0.1
             else:
-                low_thresh = 0.2
+                low_thresh = 0.3      # uniform second-pass threshold
 
             inds_low    = cls_dets[:, 4] > low_thresh
             inds_high   = cls_dets[:, 4] < self.opt.conf_thres

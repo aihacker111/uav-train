@@ -79,7 +79,11 @@ def eval_seq(opt,
                 tlwh = track.curr_tlwh
                 t_id = track.track_id
                 score = track.score
-                if tlwh[2] * tlwh[3] > opt.min_box_area:
+                box_area = tlwh[2] * tlwh[3]
+                # Drop tiny boxes and oversized ghost boxes (Kalman drift artifact).
+                # Upper bound = 40% of image area catches drifted ghost tracks.
+                max_area = img0.shape[0] * img0.shape[1] * 0.40
+                if opt.min_box_area < box_area < max_area:
                     online_tlwhs_dict[cls_id].append(tlwh)
                     online_ids_dict[cls_id].append(t_id)
                     online_scores_dict[cls_id].append(score)
