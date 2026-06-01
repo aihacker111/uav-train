@@ -790,7 +790,8 @@ class MCByteTracker:
         # Global motion compensation using all high-conf boxes
         all_high = np.concatenate([v for v in high_np.values() if len(v)], axis=0) \
                    if any(len(v) for v in high_np.values()) else np.zeros((0, 6))
-        warp = self.gmc.apply(img_0, all_high)
+        _gmc_out = self.gmc.apply(img_0, all_high)
+        warp = _gmc_out[0] if isinstance(_gmc_out, tuple) else _gmc_out
 
         for cls_id in range(self.opt.num_classes):
             h_dets   = high_np.get(cls_id, np.zeros((0, 6)))   # (M1, 6) xyxy+score+cls
