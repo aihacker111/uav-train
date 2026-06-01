@@ -140,9 +140,14 @@ class BaseTrainer(object):
                 scaler.step(self.optimizer)
                 scaler.update()
                 self.optimizer.zero_grad()
-                if scheduler is not None:
-                    scheduler.step()
                 step_id += 1
+
+            # Scheduler steps every BATCH (not every optimizer step) so that
+            # warmup_iters=2000 correctly means 2000 batches, matching
+            # EdgeCrafter's design. With GA×4, stepping per optimizer step
+            # would make warmup 4× longer than intended.
+            if phase == 'train' and scheduler is not None:
+                scheduler.step()
 
             batch_time.update(time.time() - end)
             end = time.time()
@@ -177,6 +182,10 @@ class BaseTrainer(object):
 
                 for l in avg_loss_stats:
                     Bar.suffix += '|{} {:.4f} '.format(l, avg_loss_stats[l].avg)
+
+                # Show current LR so warmup/decay is visible
+                cur_lr = self.optimizer.param_groups[-1]['lr']
+                Bar.suffix += '|lr {:.2e} '.format(cur_lr)
 
                 if not opt.hide_data_time:
                     Bar.suffix += '|Data {:.3f}s |Net {:.3f}s'.format(
